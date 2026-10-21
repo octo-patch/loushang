@@ -25,12 +25,13 @@ REASONING = "distinct-original-reasoning"
 FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
 
 
-@pytest.fixture
-def sdk_http(monkeypatch):
+@pytest.fixture(params=["contiguous", "text-between", "tool-between"])
+def sdk_http(monkeypatch, request):
     captured = []
     clients = []
     real_client = openai.AsyncOpenAI
     response_field = {"name": "reasoning_content"}
+    sequence = request.param
 
     def handle(request):
         payload = json.loads(request.content)
@@ -82,6 +83,12 @@ def sdk_http(monkeypatch):
                     {"tool_calls": [{"index": 0, "function": {"arguments": '"cat"}'}}]},
                 ]
             )
+        if first and field is not None and sequence != "contiguous":
+            # Synthetic compatible sequences, not a claim about live MiniMax.
+            deltas[0] = {field: "distinct-"}
+            deltas.pop(1)
+            insert_at = 2 if sequence == "text-between" else len(deltas)
+            deltas.insert(insert_at, {field: "original-reasoning"})
         chunks = [
             {
                 **envelope,
@@ -184,6 +191,7 @@ def test_minimax_real_sdk_preserves_reasoning_through_tool_roundtrip(
     ] * 2
     history = captured[1][1]["messages"]
     replay = next(message for message in history if message["role"] == "assistant")
+    assert set(replay) == {"role", "content", "tool_calls", "reasoning_content"}
     assert replay["reasoning_content"] == REASONING
     assert thinking.thinking_signature == "reasoning_content"
     assert replay["content"] == "working"
@@ -231,7 +239,9 @@ def test_non_minimax_real_sdk_retains_original_field_semantics(sdk_http, field, 
         assert thinking.thinking_signature == field
     else:
         assert not any(isinstance(part, ThinkingPart) for part in assistant.content)
-    assert set(replay) & set(FIELDS) == ({field} if field else set())
+    assert set(replay) == {"role", "content", "tool_calls"} | (
+        {field} if field else set()
+    )
     assert replay["content"] == "working"
     assert replay["tool_calls"][0]["id"] == "call_offline"
     assert all(

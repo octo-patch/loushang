@@ -248,8 +248,9 @@ class OpenAIChatCompletionsAdapter:
                                 },
                             )
                             if reasoning_field is None:
-                                # Emit the replay-field marker once per block,
-                                # not once per SDK chunk (signatures concatenate).
+                                # The assembler retains one thinking accumulator
+                                # for the whole response, even across text/tools.
+                                # Emit its replay-field marker only once.
                                 yield {
                                     "type": "thinking_signature_delta",
                                     "signature": candidate,
@@ -295,7 +296,6 @@ class OpenAIChatCompletionsAdapter:
                                 }
                     text = getattr(delta, "content", None)
                     if isinstance(text, str) and text:
-                        reasoning_field = None
                         emitted_any_text = True
                         _debug(
                             "event",
@@ -354,7 +354,6 @@ class OpenAIChatCompletionsAdapter:
                                 }
                                 if tool_call_index is not None:
                                     start_part["index"] = tool_call_index
-                                reasoning_field = None
                                 yield _raw_part(start_part)
                             elif (
                                 isinstance(tool_call_id, str)

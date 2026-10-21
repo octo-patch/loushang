@@ -64,7 +64,8 @@ Anthropic 0.89.0 的默认客户端会在发送 HTTP 前拒绝这样的非流式
 OpenAI Chat Completions 的 JSON 和 SSE 响应保留 reasoning 文本及来源字段名。
 将返回的 `AssistantMessage` 连同 `ToolResultMessage` 传入下一次调用时，MiniMax 的
 `reasoning_content` 按原值回传；其他兼容服务的 `reasoning` / `reasoning_text` 也保留
-各自字段语义，不需要手动重建 thinking 内容。
+各自字段语义，不需要手动重建 thinking 内容。整条响应共用一个 thinking 累加器，
+因此字段标记在该响应内只记录一次；SSE 中 text/tool 与 reasoning 交错也不会重复标记。
 
 Catalog 的可选字段 `listed: false` 只隐藏普通列表项；显式 `get_model`、完整
 `ModelSelection` 和 `list_models(model_id=...)` 仍能读取旧模型。`listOrder` 只控制
