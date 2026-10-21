@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
@@ -92,7 +92,7 @@ class ScreenSurfaceCommand:
 
 @dataclass(frozen=True, slots=True)
 class ScreenSurfaceForkResult:
-    """Effects produced after a Product forks one selected prompt."""
+    """Effects produced after a Product branches from one selected prompt."""
 
     status: str
     composer_text: str | None = None
@@ -113,6 +113,10 @@ class ScreenSurfaceWorkflowCopy:
     hotkeys_title: str
     settings_title: str
     approval_aborted: str = "Turn stopped"
+    session_activation_cancelled: str = "Resume cancelled"
+    model_selection_recovery_hint: Callable[[Exception], str] = (
+        lambda _error: "Choose another model, or press Esc to keep the current model."
+    )
 
 
 STANDARD_SCREEN_SURFACE_WORKFLOW_COPY = ScreenSurfaceWorkflowCopy(
@@ -128,7 +132,26 @@ STANDARD_SCREEN_SURFACE_WORKFLOW_COPY = ScreenSurfaceWorkflowCopy(
     terminal_title="Terminal",
     hotkeys_title="Hotkeys",
     settings_title="Settings",
+    model_selection_recovery_hint=lambda error: (
+        _image_model_selection_recovery_hint()
+        if _is_image_capability_error(error)
+        else "Choose another model, or press Esc to keep the current model."
+    ),
 )
+
+
+def _is_image_capability_error(error: Exception) -> bool:
+    info = getattr(error, "info", None)
+    details = getattr(info, "details", None)
+    return isinstance(details, Mapping) and details.get("capability") == "image_input"
+
+
+def _image_model_selection_recovery_hint() -> str:
+    return (
+        "To use it: Esc, then /new, or /branch and select the image prompt (or an "
+        "earlier one). /compact works only after the image leaves recent context "
+        "(~32K tokens by default)."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +221,7 @@ class ScreenSurfaceWorkflow:
                 "command": self._handle_command_submit,
                 "settings": self._handle_settings_submit,
                 "session": self._handle_session_submit,
+                "session_cancel": self._handle_session_cancel,
                 "delete": self._handle_delete_submit,
                 "fork": self._handle_fork_submit,
                 "rename": self._handle_rename_submit,
@@ -211,10 +235,10 @@ class ScreenSurfaceWorkflow:
     def current(self) -> ScreenSurfaceView | object | None:
         return self.coordinator.current
 
-    async def handle_intent(self, intent: InputIntent) -> int | None:
+    async def handle_intent(self, intent: InputIntent[str]) -> int | None:
         return await self.coordinator.handle_intent(intent)
 
-    async def handle_surface_intent(self, intent: InputIntent) -> int | None:
+    async def handle_surface_intent(self, intent: InputIntent[str]) -> int | None:
         return await self.handle_intent(intent)
 
     def is_local_command(self, text: str) -> bool:
@@ -344,7 +368,17 @@ class ScreenSurfaceWorkflow:
         try:
             message = await self.ports.select_model(value)
         except Exception as error:
-            self.app.set_status(self.copy.recoverable_error(error))
+            message = self.copy.recoverable_error(error)
+            current = self.current
+            if (
+                close_surface
+                and isinstance(current, ScreenSurfaceView)
+                and current.purpose == "model"
+            ):
+                current.feedback = message
+                current.feedback_hint = self.copy.model_selection_recovery_hint(error)
+                current.preferred_height = max(current.preferred_height or 0, 20)
+            self.app.set_status(message)
             return
         if close_surface:
             self.close()
@@ -490,6 +524,22 @@ class ScreenSurfaceWorkflow:
             self.app.set_statusline_visible(result.statusline_visible)
         if result.refresh_model_label:
             await self.ports.refresh_model_label()
+        self.app.request_render(self.request_render_reason)
+
+    async def _handle_session_cancel(self, _payload: object) -> None:
+        task = self._session_activation_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        # Reset the surface here (not in the activation coroutine): a task
+        # cancelled before its first step never runs, so the coroutine
+        # itself cannot be relied on to clean up the activating state.
+        surface = self.current
+        if isinstance(surface, ScreenSurfaceView):
+            cancel_activation = getattr(surface.content, "cancel_activation", None)
+            if callable(cancel_activation):
+                cancel_activation()
+        self.app.set_status(self.copy.session_activation_cancelled)
         self.app.request_render(self.request_render_reason)
 
     async def _handle_session_submit(self, payload: object) -> None:
@@ -693,6 +743,7 @@ class ScreenSurfaceWorkflow:
         if apply_action is None or not isinstance(payload, str):
             return
         surface = self.current
+        profile_feedback: str | None = None
         try:
             accepted = await apply_action(payload)
         except Exception as error:
@@ -706,17 +757,24 @@ class ScreenSurfaceWorkflow:
             self.app.set_status("Persistent Policy permission revoked.")
         elif payload.startswith("set-profile:"):
             _prefix, scope, profile_id = payload.split(":", 2)
-            self.app.set_status(
+            profile_feedback = (
                 "Permissions updated to "
-                f"{profile_id.replace('_', ' ').title()} ({scope})."
+                f"{profile_id.replace('_', ' ').title()} for this session."
+                + (f" Saved as the {scope} default." if scope != "session" else "")
             )
+            self.app.set_status(profile_feedback)
         else:
             self.app.set_status("Session permission revoked.")
         if (
             self.current is surface
             and self.ports.build_permissions_surface is not None
         ):
-            self.open(self.ports.build_permissions_surface())
+            refreshed = self.ports.build_permissions_surface()
+            if profile_feedback is not None:
+                # The open page owns visible feedback; reopening an overlay
+                # can clear or hide the conversation's transient status line.
+                refreshed.feedback = profile_feedback
+            self.open(refreshed)
         self.app.request_render(self.request_render_reason)
 
     def _resolve_command(self, text: str) -> ScreenSurfaceCommand | None:
@@ -782,7 +840,7 @@ def normalize_standard_conversation_interactive_command(
         return ScreenSurfaceCommand("resume_session")
     if text.strip() == "/delete":
         return ScreenSurfaceCommand("delete_session")
-    if text.strip() == "/fork":
+    if text.strip() == "/branch":
         return ScreenSurfaceCommand("fork_session")
     if text.strip() == "/rename":
         return ScreenSurfaceCommand("rename_session")

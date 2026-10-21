@@ -32,6 +32,7 @@ def _assistant(
     *, total_tokens: int, stop_reason: str = "stop", timestamp: float = 1.0
 ) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text="reply")],
         api="anthropic-messages",
@@ -106,7 +107,11 @@ def test_context_usage_snapshot_consumes_ai_usage_derived_from_raw_parts() -> No
 
     stream = AssistantMessageEventStream()
     assembler = RawAssembler(
-        stream=stream, api="test", provider="test", model="test-model"
+        stream=stream,
+        api="test",
+        provider="test",
+        endpoint="test-endpoint",
+        model="test-model",
     )
     assembler.feed({"type": "response_start", "response_id": "resp-1"})
     assembler.feed({"type": "usage_delta", "input": 80, "output": 10, "cache_read": 1})
@@ -155,8 +160,12 @@ def test_context_usage_snapshot_marks_pre_compaction_usage_stale(tmp_path) -> No
         reserve_tokens=10,
     )
 
-    assert snapshot.tokens is None
+    assert snapshot.tokens is not None
+    assert snapshot.tokens > 0
     assert snapshot.context_window == 100
-    assert snapshot.source == "unknown"
+    assert snapshot.source == "estimated"
+    assert snapshot.authority == "local_estimator"
+    assert snapshot.accuracy == "estimated"
+    assert snapshot.surface_fingerprint is not None
     assert snapshot.stale_after_compaction is True
     assert snapshot.compactable is False

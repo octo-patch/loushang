@@ -8,54 +8,54 @@ from pathlib import Path
 from typing import Any, cast
 
 from loushang.ai.model import Model, ModelSelection, parse_model_selection_reference
-from loushang.ai.types import (
-    AssistantMessage,
-    Message,
-    TextPart,
-    ToolCall,
-    ToolResultMessage,
-    UserMessage,
+from loushang.ai.types import Message
+from loushang.coding._tool_authority import (
+    CODING_EXACT_OWNER_TOOL_NAMES,
+    coding_peer_tool_names,
 )
-from loushang.coding.prompt.defaults import DEFAULT_CODING_SYSTEM_PROMPT
+from loushang.coding.prompt.defaults import CODING_KERNEL_SYSTEM_PROMPT
 from loushang.coding.runtime import AgentSessionRuntime
 from loushang.coding.sandbox import coding_workspace_execution_profile
 from loushang.coding.session import AgentSession
+from loushang.coding.tool_pack import coding_platform_tool_names
 from loushang.harness.approval import (
     ActorBoundApprovalResolver,
     DenyApprovalResolver,
     InteractiveApprovalResolver,
 )
+from loushang.harness.environment import HostEnvironment, LocalHostEnvironmentProbe
 from loushang.harness.multiagent import (
-    AgentCaller,
     AgentInputMessage,
     AgentTypeRegistry,
     AgentTypeSpec,
     DelegatedExecutionProfile,
     ForkedHistory,
     ForkTier,
-    MultiAgentControl,
     SubagentContextPlan,
+    SubagentDisposeResult,
     SubagentRoundResult,
     WorkspaceLease,
     WorkspaceLeasePort,
     WorkspaceLeaseRequest,
     WorkspaceLeaseSnapshot,
 )
-from loushang.harness.multiagent.run_handle import RoundMode, SubagentRoundDriver
+from loushang.harness.multiagent.run_handle import RoundMode
 from loushang.harness.session import BootstrapServices
 from loushang.harness.session.multiagent import (
     AgentInputFacade,
     SessionMultiAgentRuntime,
+    SessionSubagentBinding,
     SessionSubagentFactory,
     SessionSubagentRequest,
+    bind_agent_session_multiagent,
+    build_agent_session_input_facade,
+    install_agent_forked_history,
+    project_agent_round_result,
 )
-from loushang.harness.tools.multiagent import MultiAgentToolPack
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
-from loushang.harness.transcript import ApplicationMessage
 
 _RuntimeBuilder = Callable[..., AgentSessionRuntime]
 _DefaultModelProvider = Callable[[], Model | ModelSelection | None]
-_ALLOWED_HISTORY_TYPES = (UserMessage, AssistantMessage, ToolResultMessage)
 
 _ROLE_PROMPTS: Mapping[str, str] = {
     "explorer": (
@@ -201,8 +201,12 @@ def coding_agent_types(
 
 def coding_multiagent_system_prompt(
     agent_types: AgentTypeRegistry,
+    *,
+    host_environment: HostEnvironment | None = None,
 ) -> str:
     """Describe the admitted Coding collaboration surface to the root model."""
+
+    resolved_host_environment = host_environment or LocalHostEnvironmentProbe().detect()
 
     role_descriptions = {
         "explorer": (
@@ -226,7 +230,8 @@ def coding_multiagent_system_prompt(
     }
     type_lines = "\n".join(
         f"- `{spec.name}`: {role_descriptions.get(spec.name, 'bounded Coding task')}; "
-        f"tools: {', '.join(spec.allowed_tools) or 'none'}; "
+        "tools: "
+        f"{', '.join(coding_platform_tool_names(spec.allowed_tools, resolved_host_environment)) or 'none'}; "
         f"maximum open children: {spec.maximum_children}"
         for spec in agent_types.values()
     )
@@ -234,7 +239,9 @@ def coding_multiagent_system_prompt(
         "## Multi-agent collaboration\n\n"
         "You may delegate focused work to session-owned child agents with "
         "`spawn_agent`. Spawning is asynchronous: use `wait_agent` to wait for "
-        "new collaboration activity, `list_agents` to inspect the visible tree, "
+        "new collaboration activity, `get_agent_result` to read a truncated "
+        "child report using the exact path, incarnation, and round_id from its "
+        "completion notice, `list_agents` to inspect the visible tree, "
         "and `send_message` for a follow-up. Use `interrupt_agent` or "
         "`close_agent` only for agents you own. Child completion notices enter "
         "your system mailbox, separate from editable follow-up and steering input "
@@ -306,6 +313,8 @@ class CodingSubagentFactory(SessionSubagentFactory):
         services: BootstrapServices | None = None,
         approval_resolver: InteractiveApprovalResolver | None = None,
         workspace_leases: WorkspaceLeasePort | None = None,
+        host_environment: HostEnvironment | None = None,
+        selected_exact_tool_names: tuple[str, ...],
     ) -> None:
         resolved_cwd = Path(cwd).expanduser().resolve()
         if not resolved_cwd.is_dir():
@@ -318,11 +327,28 @@ class CodingSubagentFactory(SessionSubagentFactory):
         self._approval_resolver = approval_resolver
         self._runtime_builder = runtime_builder
         self._workspace_leases = workspace_leases
+        self._host_environment = (
+            host_environment or LocalHostEnvironmentProbe().detect()
+        )
+        selected_exact_names = tuple(selected_exact_tool_names)
+        if len(set(selected_exact_names)) != len(selected_exact_names):
+            raise ValueError("selected exact Tool names must not contain duplicates")
+        unknown_exact_names = tuple(
+            name
+            for name in selected_exact_names
+            if name not in CODING_EXACT_OWNER_TOOL_NAMES
+        )
+        if unknown_exact_names:
+            raise ValueError(
+                "selected exact Tool names are not Coding exact-owner identities: "
+                + ", ".join(unknown_exact_names)
+            )
+        self._selected_exact_tool_names = frozenset(selected_exact_names)
 
-    async def create_driver(
+    async def create(
         self,
         request: SessionSubagentRequest,
-    ) -> SubagentRoundDriver:
+    ) -> SessionSubagentBinding:
         workspace_lease: WorkspaceLease | None = None
         runtime: AgentSessionRuntime | None = None
         child_approval_resolver: ActorBoundApprovalResolver | None = None
@@ -344,12 +370,34 @@ class CodingSubagentFactory(SessionSubagentFactory):
                 )
                 child_cwd = Path(workspace_lease.execution_ref)
             plan = request.context_plan
-            allowed_tools = _resolve_allowed_tools(request)
+            allowed_tools = coding_platform_tool_names(
+                _resolve_allowed_tools(request),
+                self._host_environment,
+            )
+            unavailable_exact_tools = tuple(
+                name
+                for name in allowed_tools
+                if name in CODING_EXACT_OWNER_TOOL_NAMES
+                and name not in self._selected_exact_tool_names
+            )
+            if unavailable_exact_tools:
+                raise ValueError(
+                    "Coding child exact-owner tools are not selected: "
+                    + ", ".join(unavailable_exact_tools)
+                )
             model_ref = plan.model if plan is not None else None
             if model_ref is None:
                 model_ref = request.agent_type.default_model
+            selection_registry = getattr(
+                getattr(self._services, "model_registry", None),
+                "ai_registry",
+                None,
+            )
             model: Model | ModelSelection | None = (
-                parse_model_selection_reference(model_ref)
+                parse_model_selection_reference(
+                    model_ref,
+                    registry=selection_registry,
+                )
                 if model_ref is not None
                 else self._default_model_provider()
             )
@@ -367,9 +415,7 @@ class CodingSubagentFactory(SessionSubagentFactory):
                 allowed_tools=allowed_tools,
                 execution_profile_ceiling=coding_workspace_execution_profile(
                     child_cwd,
-                    writable=_sandbox_workspace_is_writable(
-                        request.agent_type.name
-                    ),
+                    writable=_sandbox_workspace_is_writable(request.agent_type.name),
                 ),
                 approval_actor_id=str(request.record.ref),
                 workspace_ref=(
@@ -397,13 +443,17 @@ class CodingSubagentFactory(SessionSubagentFactory):
                 delegated_execution_profile=delegated_execution_profile,
             )
             session = await runtime.create_session(cwd=str(child_cwd))
-            _install_forked_history(session, request)
+            install_agent_forked_history(
+                session,
+                request.context_plan,
+                invalid_message=(
+                    "Coding subagent history must contain canonical Agent messages"
+                ),
+            )
         except BaseException:
             try:
                 if child_approval_resolver is not None:
-                    child_approval_resolver.end_session(
-                        "Child session creation failed"
-                    )
+                    child_approval_resolver.end_session("Child session creation failed")
             finally:
                 try:
                     if runtime is not None:
@@ -415,13 +465,20 @@ class CodingSubagentFactory(SessionSubagentFactory):
                     ):
                         await self._workspace_leases.release(workspace_lease)
             raise
-        return _CodingSubagentDriver(
+        driver = _CodingSubagentDriver(
             runtime=runtime,
             session=session,
             approval_resolver=child_approval_resolver,
             delegated_execution_profile=delegated_execution_profile,
             workspace_lease=workspace_lease,
             workspace_leases=self._workspace_leases,
+        )
+        return SessionSubagentBinding(
+            driver=driver,
+            input_activity=driver.input_facade,
+            workspace_ref=(
+                workspace_lease.workspace_ref if workspace_lease is not None else None
+            ),
         )
 
 
@@ -444,32 +501,17 @@ def install_coding_multiagent_session(
 
     if getattr(session, "multiagent_runtime", None) is not None:
         raise RuntimeError("Coding multi-agent runtime is already installed")
-    input_facade: AgentInputFacade[object] = AgentInputFacade(
-        queue=session.runtime.queue.input_queue,
-        build_payload=_coding_input_payload,
-        submit_mailbox=_mailbox_submitter(session),
-    )
-    runtime = SessionMultiAgentRuntime(
-        control=MultiAgentControl(agent_types=agent_types),
+    return bind_agent_session_multiagent(
+        session,
         child_factory=child_factory,
-        root_input=input_facade,
-        root_is_active=lambda: session.runtime.is_active,
-        notice_wake_policy="queue_only",
+        agent_types=agent_types,
+        agent_type_hints={
+            "explorer": "read-only investigation",
+            "reviewer": "review",
+            "implementation_worker": "implementation in an isolated worktree",
+        },
+        register_tools=register_tools,
     )
-    session.multiagent_input = input_facade
-    session.multiagent_runtime = runtime
-    if register_tools:
-        pack = MultiAgentToolPack(
-            runtime=runtime,
-            caller=AgentCaller(runtime.control.root_ref),
-        )
-        session.register_runtime_tools(
-            pack.definitions(),
-            activate=True,
-            source_info={"pack": "harness.multiagent"},
-        )
-        session.multiagent_tool_pack = pack
-    return runtime
 
 
 class _CodingSubagentDriver:
@@ -487,10 +529,8 @@ class _CodingSubagentDriver:
     ) -> None:
         self._runtime = runtime
         self._session = session
-        self.input_facade: AgentInputFacade[object] = AgentInputFacade(
-            queue=session.runtime.queue.input_queue,
-            build_payload=_coding_input_payload,
-            submit_mailbox=_mailbox_submitter(session),
+        self.input_facade: AgentInputFacade[object] = build_agent_session_input_facade(
+            session
         )
         self._initial_message: AgentInputMessage | None = None
         self._rounds_started = 0
@@ -498,15 +538,6 @@ class _CodingSubagentDriver:
         self.delegated_execution_profile = delegated_execution_profile
         self._workspace_lease = workspace_lease
         self._workspace_leases = workspace_leases
-        self.released_workspace: WorkspaceLeaseSnapshot | None = None
-
-    @property
-    def workspace_ref(self) -> str | None:
-        return (
-            self._workspace_lease.workspace_ref
-            if self._workspace_lease is not None
-            else None
-        )
 
     def deliver(self, message: AgentInputMessage) -> None:
         if self._rounds_started == 0 and self._initial_message is None:
@@ -521,6 +552,8 @@ class _CodingSubagentDriver:
         mode: RoundMode,
     ) -> SubagentRoundResult:
         del round_id
+        if self._approval_resolver is not None:
+            self._approval_resolver.open_session()
         message_count = len(self._session.agent.state.messages)
         self._rounds_started += 1
         if mode == "prompt":
@@ -534,8 +567,10 @@ class _CodingSubagentDriver:
             )
         else:
             await self._session.continue_run()
-        result = _round_result(
-            tuple(self._session.agent.state.messages[message_count:])
+        result = project_agent_round_result(
+            tuple(self._session.agent.state.messages[message_count:]),
+            missing_response="Coding child produced no assistant response.",
+            completed_response="Coding child completed.",
         )
         if self._workspace_lease is None or self._workspace_leases is None:
             return result
@@ -548,22 +583,37 @@ class _CodingSubagentDriver:
         )
 
     def abort(self) -> None:
+        if self._approval_resolver is not None:
+            self._approval_resolver.close_session("Child agent interrupted")
         self._session.abort()
 
-    async def dispose(self) -> None:
-        runtime_error: Exception | None = None
+    async def dispose(self) -> SubagentDisposeResult:
+        errors: list[Exception] = []
+        released_workspace: WorkspaceLeaseSnapshot | None = None
         if self._approval_resolver is not None:
             self._approval_resolver.end_session("Child agent closed")
         try:
             await self._runtime.dispose_session_runtime()
         except Exception as error:
-            runtime_error = error
+            errors.append(error)
         if self._workspace_lease is not None and self._workspace_leases is not None:
-            self.released_workspace = await self._workspace_leases.release(
-                self._workspace_lease
-            )
-        if runtime_error is not None:
-            raise runtime_error
+            try:
+                released_workspace = await self._workspace_leases.release(
+                    self._workspace_lease
+                )
+            except Exception as error:
+                errors.append(error)
+        dispose_error: Exception | None
+        if len(errors) == 1:
+            dispose_error = errors[0]
+        elif errors:
+            dispose_error = ExceptionGroup("Coding child disposal failed", errors)
+        else:
+            dispose_error = None
+        return SubagentDisposeResult(
+            released_workspace=released_workspace,
+            dispose_error=dispose_error,
+        )
 
 
 def _resolve_system_prompt(request: SessionSubagentRequest) -> str:
@@ -572,11 +622,17 @@ def _resolve_system_prompt(request: SessionSubagentRequest) -> str:
     return _coding_role_system_prompt(request.agent_type.name)
 
 
-def _coding_role_system_prompt(agent_type: str) -> str:
+def coding_agent_type_system_prompt(agent_type: str) -> str:
+    """Return Coding's complete system prompt for one admitted agent type."""
+
     role_prompt = _ROLE_PROMPTS.get(agent_type)
     if role_prompt is None:
         raise ValueError(f"Coding has no system prompt for agent type {agent_type!r}")
-    return f"{DEFAULT_CODING_SYSTEM_PROMPT}\n\n{role_prompt}"
+    return f"{CODING_KERNEL_SYSTEM_PROMPT}\n\n{role_prompt}"
+
+
+def _coding_role_system_prompt(agent_type: str) -> str:
+    return coding_agent_type_system_prompt(agent_type)
 
 
 def _resolve_allowed_tools(request: SessionSubagentRequest) -> tuple[str, ...]:
@@ -597,122 +653,19 @@ def _select_tool_registry(
     source: WorkspaceToolRegistry,
     allowed_tools: tuple[str, ...],
 ) -> WorkspaceToolRegistry:
+    peer_tool_names = coding_peer_tool_names(allowed_tools)
     enabled = {definition.name for definition in source.list_enabled_definitions()}
-    missing = tuple(name for name in allowed_tools if name not in enabled)
+    missing = tuple(name for name in peer_tool_names if name not in enabled)
     if missing:
         raise ValueError(
             "Coding child tools are not registered and enabled: " + ", ".join(missing)
         )
-    selected = WorkspaceToolRegistry()
-    for name in allowed_tools:
-        selected.register_tool(
-            source.get_definition(name),
-            source_info=source.get_source_info(name),
-        )
-    return selected
-
-
-def _coding_input_payload(message: AgentInputMessage) -> ApplicationMessage:
-    sender = (
-        str(message.sender.ref.path)
-        if isinstance(message.sender, AgentCaller)
-        else "host"
-    )
-    return ApplicationMessage(
-        application_message_id=message.message_id,
-        custom_type=(
-            "harness.multiagent.completion_notice"
-            if message.message_id.startswith("completion:")
-            else "harness.multiagent.message"
-        ),
-        content=message.text,
-        timestamp=0.0,
-        display=False,
-        details={
-            "sender": sender,
-            "recipient": str(message.recipient_ref.path),
-            "references": list(message.references),
-        },
-        origin="harness.multiagent",
-        delivery_mode=("next_turn" if message.kind == "mailbox" else message.kind),
-    )
-
-
-def _mailbox_submitter(session: AgentSession) -> Callable[[object], object]:
-    queue = session.runtime.queue
-    submit = getattr(queue, "queue_mailbox_message", None)
-    if callable(submit):
-        return cast(Callable[[object], object], submit)
-    return queue.input_queue.append_next_turn
-
-
-def _install_forked_history(
-    session: AgentSession,
-    request: SessionSubagentRequest,
-) -> None:
-    plan = request.context_plan
-    if plan is None or not plan.history.messages:
-        return
-    messages: list[Message] = []
-    for message in plan.history.messages:
-        if not isinstance(message, _ALLOWED_HISTORY_TYPES):
-            raise TypeError(
-                "Coding subagent history must contain canonical Agent messages"
-            )
-        messages.append(message)
-    session.agent.state.set_messages(messages)
-
-
-def _round_result(messages: tuple[Message, ...]) -> SubagentRoundResult:
-    assistant_messages = tuple(
-        message for message in messages if isinstance(message, AssistantMessage)
-    )
-    if not assistant_messages:
-        return SubagentRoundResult(
-            status="failed",
-            final_message="Coding child produced no assistant response.",
-        )
-
-    final = assistant_messages[-1]
-    text = _assistant_text(final)
-    if final.stop_reason == "aborted":
-        status = "interrupted"
-    elif final.error_message is not None or final.stop_reason == "error":
-        status = "failed"
-    else:
-        status = "completed"
-    final_message = final.error_message or text or "Coding child completed."
-    return SubagentRoundResult(
-        status=status,
-        final_message=final_message,
-        summary=_summary(final_message),
-        latest_input_tokens=(
-            int(final.usage.input or 0) + int(final.usage.cache_read or 0)
-        ),
-        output_tokens=sum(
-            int(message.usage.output or 0) for message in assistant_messages
-        ),
-        tool_uses=sum(
-            isinstance(part, ToolCall)
-            for message in assistant_messages
-            for part in message.content
-        ),
-    )
-
-
-def _assistant_text(message: AssistantMessage) -> str:
-    return "".join(
-        part.text for part in message.content if isinstance(part, TextPart)
-    ).strip()
-
-
-def _summary(value: str, *, limit: int = 1000) -> str:
-    normalized = " ".join(value.split())
-    return normalized if len(normalized) <= limit else f"{normalized[: limit - 1]}…"
+    return source.select(peer_tool_names)
 
 
 __all__ = [
     "CodingSubagentFactory",
+    "coding_agent_type_system_prompt",
     "coding_multiagent_system_prompt",
     "coding_recipe_context_plan",
     "coding_read_only_agent_types",

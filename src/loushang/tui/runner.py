@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import sys
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass, field
 from typing import TextIO
 
@@ -26,7 +26,11 @@ from loushang.tui.terminal import (
     TerminalSize,
     terminal_size_from_environment,
 )
-from loushang.tui.terminal_input import read_input_chunk_or_render_tick
+from loushang.tui.terminal_input import (
+    ESCAPE_SEQUENCE_IDLE_TIMEOUT_MS,
+    InputChunkReader,
+    read_input_chunk_or_render_tick,
+)
 from loushang.tui.terminal_session import TerminalSession
 from loushang.tui.tui import Tui
 
@@ -59,10 +63,23 @@ class TuiRunContext:
     terminal_context: object
     reader: InputReader
     _render_wakeup: asyncio.Event = field(repr=False)
+    _stop_wakeup: asyncio.Event = field(repr=False)
+    _stop_exit_code: int | None = field(default=None, repr=False)
 
     def request_render(self, kind: RenderRequestKind = "input") -> None:
         self.runtime.request_render(kind)
         self._render_wakeup.set()
+
+    def request_stop(self, exit_code: int = 0) -> None:
+        """Ask the runner loop to exit from outside input handling.
+
+        Background completions (for example a session activation task
+        finishing while the standalone picker waits) use this to stop the
+        loop without synthesizing an input event.
+        """
+
+        self._stop_exit_code = exit_code
+        self._stop_wakeup.set()
 
     def stop(self, exit_code: int = 0) -> TuiInputResult:
         return TuiInputResult(exit_code=exit_code)
@@ -83,6 +100,7 @@ class TuiRunner:
     stdout: TextIO | None = None
     terminal_size_provider: TerminalSizeProvider | None = None
     terminal_session_factory: TerminalSessionFactory | None = None
+    input_chunk_reader: InputChunkReader | None = None
     _running: bool = field(default=False, init=False, repr=False)
 
     async def run(
@@ -107,6 +125,8 @@ class TuiRunner:
         )
         reader = InputReader()
         render_wakeup = asyncio.Event()
+        stop_wakeup = asyncio.Event()
+        stop_task: asyncio.Task[bool] | None = None
 
         previous_terminal = self.tui.terminal
         previous_runtime = self.tui._runtime
@@ -128,19 +148,32 @@ class TuiRunner:
                     terminal_context=terminal_context,
                     reader=reader,
                     _render_wakeup=render_wakeup,
+                    _stop_wakeup=stop_wakeup,
                 )
+                stop_task = asyncio.create_task(stop_wakeup.wait())
                 if on_start is not None:
                     start_result = on_start(context)
                     if inspect.isawaitable(start_result):
                         await start_result
                 runtime.render_now()
                 while True:
+                    if context._stop_exit_code is not None:
+                        return finish_tui_exit(
+                            runtime=runtime,
+                            stdout=stdout,
+                            exit_code=context._stop_exit_code,
+                        )
                     data = await read_input_chunk_or_render_tick(
                         stdin,
                         runtime=runtime,
-                        active_task=None,
+                        active_task=stop_task,
+                        input_chunk_reader=self.input_chunk_reader,
                         render_wakeup=render_wakeup,
-                        pending_input_idle_ms=10 if reader.has_pending else None,
+                        pending_input_idle_ms=(
+                            ESCAPE_SEQUENCE_IDLE_TIMEOUT_MS
+                            if reader.has_pending
+                            else None
+                        ),
                         idle_wakeup_ms=terminal_runtime_wakeup_ms(terminal_context),
                     )
                     if data is None:
@@ -179,6 +212,10 @@ class TuiRunner:
                         if result.render_requested:
                             request_runtime_render(runtime, "input")
         finally:
+            if stop_task is not None and not stop_task.done():
+                stop_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await stop_task
             self.tui.terminal = previous_terminal
             self.tui._runtime = previous_runtime
             self.tui.terminal_context = previous_context

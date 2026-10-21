@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
-from loushang.agent.types import ThinkingLevel
+from loushang.agent.types import AgentMessage, ThinkingLevel
 from loushang.ai.model import Model, ModelSelection
 from loushang.ai.types import (
     AssistantMessage,
@@ -22,6 +22,7 @@ from loushang.ai.types import (
     ToolResultMessage,
     UserMessage,
 )
+from loushang.foundation.json import JSONValue, require_json_value
 from loushang.harness.events import (
     BranchSummaryCompleted,
     BranchSummaryStarted,
@@ -40,7 +41,6 @@ from loushang.harness.transcript.kinds import (
 )
 from loushang.harness.transcript.session import AgentTranscriptSession
 from loushang.harness.transcript.types import ApplicationMessage
-from loushang.protocol import JSONValue, require_json_value
 
 _THINKING_LEVEL_ORDER: tuple[ThinkingLevel, ...] = (
     "off",
@@ -76,6 +76,7 @@ class BranchSummaryOutput:
     from_hook: bool = False
     aborted: bool = False
     error: str | None = None
+    model_input_snapshot_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -83,6 +84,17 @@ class BranchSummaryOutput:
             "details",
             require_json_value(self.details, name="branch_summary.details"),
         )
+        if not isinstance(self.model_input_snapshot_ids, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.model_input_snapshot_ids
+        ):
+            raise TypeError(
+                "branch summary Model Input snapshot ids must be non-empty strings"
+            )
+        if len(set(self.model_input_snapshot_ids)) != len(
+            self.model_input_snapshot_ids
+        ):
+            raise ValueError("branch summary Model Input snapshot ids must be unique")
 
 
 @dataclass(frozen=True)
@@ -124,13 +136,16 @@ class AgentTranscriptInspector:
 
     session: AgentTranscriptSession
 
-    def message_counts(self) -> TranscriptMessageCounts:
-        context = self.session.build_context()
+    def message_counts(
+        self, *, messages: Sequence[AgentMessage] | None = None
+    ) -> TranscriptMessageCounts:
+        if messages is None:
+            messages = self.session.build_context().messages
         assistant_message_count = 0
         user_message_count = 0
         tool_call_count = 0
         tool_result_count = 0
-        for message in context.messages:
+        for message in messages:
             if isinstance(message, AssistantMessage):
                 assistant_message_count += 1
                 tool_call_count += sum(
@@ -141,7 +156,7 @@ class AgentTranscriptInspector:
             elif isinstance(message, ToolResultMessage):
                 tool_result_count += 1
         return TranscriptMessageCounts(
-            message_count=len(context.messages),
+            message_count=len(messages),
             assistant_message_count=assistant_message_count,
             user_message_count=user_message_count,
             tool_call_count=tool_call_count,
@@ -247,11 +262,10 @@ class AgentTranscriptSelectionRuntime:
     async def apply_model(
         self,
         model: Model,
-        *,
-        endpoint_id: str | None = None,
     ) -> None:
         validated = validate_model(model)
         provider = str(getattr(validated, "provider_id", None))
+        endpoint_id = str(getattr(validated, "endpoint_id", None))
         await self.session.append_model_change(
             provider,
             validated.id,
@@ -324,11 +338,15 @@ class AgentTranscriptSelectionRuntime:
         endpoint_id = (
             model.get("endpoint_id") or model.get("endpointId") or model.get("endpoint")
         )
-        if isinstance(provider, str) and isinstance(model_id, str):
+        if (
+            isinstance(provider, str)
+            and isinstance(endpoint_id, str)
+            and isinstance(model_id, str)
+        ):
             return ModelSelection(
                 provider=provider,
+                endpoint_id=endpoint_id,
                 model_id=model_id,
-                endpoint_id=endpoint_id if isinstance(endpoint_id, str) else None,
             )
         return None
 
@@ -379,8 +397,17 @@ class AgentTranscriptNavigationRuntime:
     def is_summarizing(self) -> bool:
         return self._transaction.is_active
 
+    def owns_current_task(self) -> bool:
+        return self._transaction.owns_current_task()
+
     def abort(self) -> bool:
         return self._transaction.abort()
+
+    async def cancel_and_wait(self) -> None:
+        """Abort and join the active summary transaction before disposal."""
+
+        self.abort()
+        await self._transaction.wait()
 
     def prepare(self, target_id: str) -> TranscriptNavigationPlan | None:
         old_leaf_id = self.session.get_leaf_id()
@@ -453,26 +480,29 @@ class AgentTranscriptNavigationRuntime:
         summary_override: BranchSummaryOutput | None,
         summary_runner: BranchSummaryRunner | None,
     ) -> TranscriptNavigationResult:
+        if signal.aborted:
+            return _aborted_navigation_result(plan)
         summary = summary_override
         if summary is None and plan.divergent_records:
             if summary_runner is None:
                 raise RuntimeError("Branch summary requires a Product summary runner")
             summary = await summary_runner(plan.divergent_records, signal)
+        if signal.aborted:
+            return _aborted_navigation_result(plan)
         if summary is not None and summary.aborted:
-            return TranscriptNavigationResult(
-                cancelled=True,
-                aborted=True,
-                editor_text=plan.editor_text,
-            )
+            return _aborted_navigation_result(plan)
         if summary is not None and summary.error:
             raise RuntimeError(summary.error)
         summary_record_id: str | None = None
         if summary is not None and summary.summary is not None:
+            if signal.aborted:
+                return _aborted_navigation_result(plan)
             summary_record_id = await self.session.branch_with_summary(
                 plan.new_leaf_id,
                 summary.summary,
                 details=summary.details,
                 from_hook=summary.from_hook,
+                model_input_snapshot_ids=summary.model_input_snapshot_ids,
             )
             if label:
                 await self.session.append_label(summary_record_id, label)
@@ -556,6 +586,16 @@ class AgentTranscriptNavigationRuntime:
             )
 
 
+def _aborted_navigation_result(
+    plan: TranscriptNavigationPlan,
+) -> TranscriptNavigationResult:
+    return TranscriptNavigationResult(
+        cancelled=True,
+        aborted=True,
+        editor_text=plan.editor_text,
+    )
+
+
 def user_message_text(message: UserMessage) -> str:
     if isinstance(message.content, str):
         return message.content
@@ -577,17 +617,27 @@ def assistant_message_text(message: AssistantMessage) -> str | None:
 
 def model_selection_from_model(model: object) -> ModelSelection | None:
     provider = getattr(model, "provider_id", None) or getattr(model, "provider", None)
+    endpoint_id = getattr(model, "endpoint_id", None) or getattr(
+        model, "endpoint", None
+    )
     model_id = getattr(model, "id", None)
-    if not provider or not model_id:
+    if not provider or not endpoint_id or not model_id:
         return None
-    return ModelSelection(provider=str(provider), model_id=str(model_id))
+    return ModelSelection(
+        provider=str(provider),
+        endpoint_id=str(endpoint_id),
+        model_id=str(model_id),
+    )
 
 
 def validate_model(model: object) -> Model:
     provider = getattr(model, "provider_id", None) or getattr(model, "provider", None)
+    endpoint_id = getattr(model, "endpoint_id", None) or getattr(
+        model, "endpoint", None
+    )
     model_id = getattr(model, "id", None)
-    if not provider or not model_id:
-        raise ValueError("Model updates require a provider and model id.")
+    if not provider or not endpoint_id or not model_id:
+        raise ValueError("Model updates require provider, endpoint, and model ids.")
     return model  # type: ignore[return-value]
 
 

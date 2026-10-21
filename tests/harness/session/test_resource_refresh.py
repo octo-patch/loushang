@@ -3,12 +3,27 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
+from loushang.harness.extensions.declarations import (
+    ExtensionCapabilityDeclarationSnapshot,
+    ExtensionGraphProviderRestartRequiredError,
+    ExtensionRuntimeCapabilityDeclaration,
+)
 from loushang.harness.resources.types import (
     PromptFragmentDescriptor,
     ResourceBundle,
     SkillDescriptor,
 )
-from loushang.harness.session.resource_refresh import SessionResourceRefreshRuntime
+from loushang.harness.session.resource_refresh import (
+    CatalogRefreshRequiresAsyncError,
+    ResourceRefreshRuntimeClosedError,
+    SessionResourceRefreshOutcome,
+    SessionResourceRefreshRuntime,
+)
+from loushang.harness.session.resource_refresh_gate import (
+    ResourceCatalogRefreshGate,
+)
 
 
 class _Loader:
@@ -21,6 +36,47 @@ class _Loader:
         if isinstance(self.bundle, Exception):
             raise self.bundle
         return self.bundle
+
+
+def test_session_resource_refresh_outcome_rejects_silent_unsettled_state() -> None:
+    with pytest.raises(ValueError, match="Unsettled Session Resource"):
+        SessionResourceRefreshOutcome(published=True, settled=False)
+
+
+def test_shared_catalog_gate_rotates_after_an_idle_event_loop_epoch() -> None:
+    gate = ResourceCatalogRefreshGate()
+
+    def run_epoch(label: str) -> list[str]:
+        events: list[str] = []
+
+        async def scenario() -> None:
+            first_entered = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def first() -> None:
+                async with gate:
+                    events.append(f"{label}:first")
+                    first_entered.set()
+                    await release_first.wait()
+
+            async def second() -> None:
+                await first_entered.wait()
+                async with gate:
+                    events.append(f"{label}:second")
+
+            first_task = asyncio.create_task(first())
+            second_task = asyncio.create_task(second())
+            await first_entered.wait()
+            await asyncio.sleep(0)
+            assert events == [f"{label}:first"]
+            release_first.set()
+            await asyncio.gather(first_task, second_task)
+
+        asyncio.run(scenario())
+        return events
+
+    assert run_epoch("A") == ["A:first", "A:second"]
+    assert run_epoch("B") == ["B:first", "B:second"]
 
 
 class _ExtensionRuntime:
@@ -60,6 +116,90 @@ class _AsyncExtensionRuntime:
         )
 
 
+class _StagedRetirement:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def retire(self) -> None:
+        self.events.append("retire")
+
+
+class _StagedCandidate:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        activation_error: BaseException | None = None,
+        activation_started: asyncio.Event | None = None,
+        rollback_started: asyncio.Event | None = None,
+        release_rollback: asyncio.Event | None = None,
+        publication_error: BaseException | None = None,
+        capability_declarations: ExtensionCapabilityDeclarationSnapshot | None = None,
+    ) -> None:
+        self.events = events
+        self.activation_error = activation_error
+        self.activation_started = activation_started
+        self.rollback_started = rollback_started
+        self.release_rollback = release_rollback
+        self.publication_error = publication_error
+        self.capability_declarations = (
+            capability_declarations
+            if capability_declarations is not None
+            else ExtensionCapabilityDeclarationSnapshot(declarations=())
+        )
+
+    async def discover_resources_async(
+        self,
+        bundle: ResourceBundle,
+        *,
+        reason: str,
+    ) -> ResourceBundle:
+        self.events.append(f"discover:{reason}")
+        return bundle.merge(
+            prompts=[
+                PromptFragmentDescriptor(
+                    name="candidate",
+                    source_path=Path("/tmp/extension/prompts/candidate.md"),
+                    text="candidate prompt",
+                )
+            ]
+        )
+
+    async def activate(self, bindings: object) -> None:
+        del bindings
+        self.events.append("activate")
+        if self.activation_started is not None:
+            self.activation_started.set()
+            await asyncio.Event().wait()
+        if self.activation_error is not None:
+            raise self.activation_error
+
+    def publish(self, commit_resource) -> _StagedRetirement:
+        self.events.append("publish")
+        commit_resource()
+        self.events.append("committed")
+        if self.publication_error is not None:
+            raise self.publication_error
+        return _StagedRetirement(self.events)
+
+    async def rollback(self) -> None:
+        self.events.append("rollback")
+        if self.rollback_started is not None:
+            self.rollback_started.set()
+        if self.release_rollback is not None:
+            await self.release_rollback.wait()
+
+
+class _StagedExtensionRuntime:
+    def __init__(self, candidate: _StagedCandidate) -> None:
+        self.candidate = candidate
+        self.extension_sets: list[list[object]] = []
+
+    def prepare_generation(self, extensions) -> _StagedCandidate:
+        self.extension_sets.append(list(extensions))
+        return self.candidate
+
+
 class _Settings:
     def get_disabled_skills(self) -> list[str]:
         return ["disabled-skill"]
@@ -86,6 +226,9 @@ def _runtime(
     rebuilds: list[str] | None = None,
     failures: list[Exception] | None = None,
     syncs: list[str] | None = None,
+    extension_declaration_preflight=None,
+    catalog_refresh=None,
+    prepare_refresh=None,
 ) -> SessionResourceRefreshRuntime:
     return SessionResourceRefreshRuntime(
         get_resource_loader=lambda: loader,
@@ -101,10 +244,13 @@ def _runtime(
         sync_extension_diagnostics=lambda: (syncs if syncs is not None else []).append(
             "resource_loading"
         ),
+        extension_declaration_preflight=extension_declaration_preflight,
+        refresh_catalog=catalog_refresh,
+        prepare_resource_refresh=prepare_refresh,
     )
 
 
-def test_session_resource_refresh_runtime_gets_prompt_templates_from_loader_then_bundle() -> (
+def test_session_resource_refresh_runtime_gets_only_committed_prompt_templates() -> (
     None
 ):
     loader_prompt = PromptFragmentDescriptor(
@@ -122,7 +268,7 @@ def test_session_resource_refresh_runtime_gets_prompt_templates_from_loader_then
     runtime = _runtime(loader=_PromptLoader([loader_prompt]), bundle=bundle)
     fallback_runtime = _runtime(loader=None, bundle=bundle)
 
-    assert runtime.get_prompt_templates() == [loader_prompt]
+    assert runtime.get_prompt_templates() == [bundle_prompt]
     assert fallback_runtime.get_prompt_templates() == [bundle_prompt]
 
 
@@ -218,3 +364,730 @@ def test_session_resource_refresh_runtime_request_without_loader_is_a_no_op() ->
     runtime.request_refresh()
 
     assert syncs == []
+
+
+def test_catalog_refresh_is_async_only_and_never_enters_legacy_bundle_pipeline() -> (
+    None
+):
+    events: list[str] = []
+    loader = _Loader(AssertionError("legacy loader must not run"))
+
+    async def refresh_catalog(reason: str) -> ResourceBundle:
+        events.append(f"catalog:{reason}")
+        return ResourceBundle(cwd=Path("/tmp/project"))
+
+    runtime = _runtime(
+        loader=loader,
+        bundle=ResourceBundle(cwd=Path("/tmp/project")),
+        catalog_refresh=refresh_catalog,
+        prepare_refresh=lambda: events.append("prepare"),
+    )
+
+    with pytest.raises(CatalogRefreshRequiresAsyncError):
+        runtime.refresh()
+    asyncio.run(runtime.refresh_async(reason="watch"))
+
+    assert events == ["prepare", "catalog:watch"]
+    assert loader.calls == []
+    assert runtime.resource_revision == 2
+
+
+def test_catalog_refresh_outcome_belongs_to_its_exact_lock_held_invocation() -> None:
+    async def scenario() -> None:
+        old = ResourceBundle(cwd=Path("/tmp/old"))
+        published_by_a = ResourceBundle(cwd=Path("/tmp/published-by-a"))
+        current: list[ResourceBundle | None] = [old]
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = 0
+
+        async def refresh_catalog(_reason: str) -> ResourceBundle:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_started.set()
+                await release_first.wait()
+                current[0] = published_by_a
+                return published_by_a
+            raise RuntimeError("refresh B failed before publication")
+
+        runtime = SessionResourceRefreshRuntime(
+            get_resource_loader=lambda: None,
+            get_resource_bundle=lambda: current[0],
+            get_cwd=lambda: "/tmp/project",
+            get_extension_runtime=lambda: None,
+            get_settings=lambda: None,
+            set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+            rebuild_prompt_and_tools_view=lambda: None,
+            record_refresh_failure=lambda _error: None,
+            sync_extension_diagnostics=lambda: None,
+            refresh_catalog=refresh_catalog,
+        )
+
+        refresh_a = asyncio.create_task(runtime.refresh_with_outcome(reason="A"))
+        await first_started.wait()
+        refresh_b = asyncio.create_task(runtime.refresh_with_outcome(reason="B"))
+        release_first.set()
+
+        outcome_a = await refresh_a
+        outcome_b = await refresh_b
+
+        assert outcome_a.published is True
+        assert outcome_a.error is None
+        assert outcome_b.published is False
+        assert isinstance(outcome_b.error, RuntimeError)
+        assert str(outcome_b.error) == "refresh B failed before publication"
+        assert runtime.resource_revision == 2
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_catalog_refresh_transaction_hides_tentative_mutation_from_other_refreshes() -> (
+    None
+):
+    async def scenario() -> None:
+        current = [ResourceBundle(cwd=Path("/tmp/original"))]
+        package_enabled = [False]
+        published_settings: list[bool] = []
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        async def refresh_catalog(reason: str) -> ResourceBundle:
+            if reason == "A":
+                first_started.set()
+                await release_first.wait()
+            if reason == "package":
+                raise RuntimeError("package refresh failed before publication")
+            published_settings.append(package_enabled[0])
+            bundle = ResourceBundle(cwd=Path(f"/tmp/package-{package_enabled[0]}"))
+            current[0] = bundle
+            return bundle
+
+        runtime = SessionResourceRefreshRuntime(
+            get_resource_loader=lambda: None,
+            get_resource_bundle=lambda: current[0],
+            get_cwd=lambda: "/tmp/project",
+            get_extension_runtime=lambda: None,
+            get_settings=lambda: None,
+            set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+            rebuild_prompt_and_tools_view=lambda: None,
+            record_refresh_failure=lambda _error: None,
+            sync_extension_diagnostics=lambda: None,
+            refresh_catalog=refresh_catalog,
+        )
+
+        refresh_a = asyncio.create_task(runtime.refresh_with_outcome(reason="A"))
+        await first_started.wait()
+
+        def begin() -> bool:
+            previous = package_enabled[0]
+            package_enabled[0] = True
+            return previous
+
+        def settle(
+            previous: bool,
+            outcome: SessionResourceRefreshOutcome,
+        ) -> None:
+            if not outcome.published:
+                package_enabled[0] = previous
+
+        package_refresh = asyncio.create_task(
+            runtime.refresh_transaction_with_outcome(
+                begin=begin,
+                settle=settle,
+                reason="package",
+            )
+        )
+        await asyncio.sleep(0)
+
+        # The queued package transaction has not exposed its mutation while A
+        # owns the Catalog publication lock.
+        assert package_enabled == [False]
+        release_first.set()
+
+        outcome_a = await refresh_a
+        package_outcome = await package_refresh
+        assert outcome_a.published is True
+        assert package_outcome.published is False
+        assert isinstance(package_outcome.error, RuntimeError)
+        assert published_settings == [False]
+        assert package_enabled == [False]
+        assert current[0].cwd == Path("/tmp/package-False")
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_shared_catalog_lock_hides_root_mutation_from_child_session_refresh() -> None:
+    async def scenario() -> None:
+        shared_lock = asyncio.Lock()
+        package_enabled = [False]
+        root_current = [ResourceBundle(cwd=Path("/tmp/root-original"))]
+        child_current = [ResourceBundle(cwd=Path("/tmp/child-original"))]
+        root_started = asyncio.Event()
+        release_root = asyncio.Event()
+        child_started = asyncio.Event()
+        child_published_settings: list[bool] = []
+
+        async def root_refresh(_reason: str) -> ResourceBundle:
+            root_started.set()
+            await release_root.wait()
+            raise RuntimeError("root package candidate rejected")
+
+        async def child_refresh(_reason: str) -> ResourceBundle:
+            child_started.set()
+            child_published_settings.append(package_enabled[0])
+            bundle = ResourceBundle(
+                cwd=Path(f"/tmp/child-package-{package_enabled[0]}")
+            )
+            child_current[0] = bundle
+            return bundle
+
+        def make_runtime(
+            current: list[ResourceBundle | None],
+            refresh_catalog,
+        ) -> SessionResourceRefreshRuntime:
+            return SessionResourceRefreshRuntime(
+                get_resource_loader=lambda: None,
+                get_resource_bundle=lambda: current[0],
+                get_cwd=lambda: "/tmp/project",
+                get_extension_runtime=lambda: None,
+                get_settings=lambda: None,
+                set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+                rebuild_prompt_and_tools_view=lambda: None,
+                record_refresh_failure=lambda _error: None,
+                sync_extension_diagnostics=lambda: None,
+                refresh_catalog=refresh_catalog,
+                catalog_refresh_lock=shared_lock,
+            )
+
+        root = make_runtime(root_current, root_refresh)
+        child = make_runtime(child_current, child_refresh)
+
+        def begin() -> bool:
+            previous = package_enabled[0]
+            package_enabled[0] = True
+            return previous
+
+        def settle(
+            previous: bool,
+            outcome: SessionResourceRefreshOutcome,
+        ) -> None:
+            if not outcome.published:
+                package_enabled[0] = previous
+
+        root_task = asyncio.create_task(
+            root.refresh_transaction_with_outcome(
+                begin=begin,
+                settle=settle,
+                reason="root-package",
+            )
+        )
+        await root_started.wait()
+        child_task = asyncio.create_task(child.refresh_with_outcome(reason="child"))
+        await asyncio.sleep(0)
+
+        assert package_enabled == [True]
+        assert child_started.is_set() is False
+        release_root.set()
+
+        root_outcome = await root_task
+        child_outcome = await child_task
+        assert root_outcome.published is False
+        assert isinstance(root_outcome.error, RuntimeError)
+        assert child_outcome.published is True
+        assert child_published_settings == [False]
+        assert package_enabled == [False]
+        assert child_current[0].cwd == Path("/tmp/child-package-False")
+        await root.close()
+        await child.close()
+
+    asyncio.run(scenario())
+
+
+def test_catalog_refresh_transaction_reports_publication_and_settlement_separately() -> (
+    None
+):
+    async def scenario() -> None:
+        current = [ResourceBundle(cwd=Path("/tmp/original"))]
+
+        async def refresh_catalog(_reason: str) -> ResourceBundle:
+            published = ResourceBundle(cwd=Path("/tmp/published"))
+            current[0] = published
+            return published
+
+        runtime = SessionResourceRefreshRuntime(
+            get_resource_loader=lambda: None,
+            get_resource_bundle=lambda: current[0],
+            get_cwd=lambda: "/tmp/project",
+            get_extension_runtime=lambda: None,
+            get_settings=lambda: None,
+            set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+            rebuild_prompt_and_tools_view=lambda: None,
+            record_refresh_failure=lambda _error: None,
+            sync_extension_diagnostics=lambda: None,
+            refresh_catalog=refresh_catalog,
+        )
+
+        def fail_settlement(
+            _receipt: object,
+            _outcome: SessionResourceRefreshOutcome,
+        ) -> None:
+            raise RuntimeError("settings settlement failed")
+
+        outcome = await runtime.refresh_transaction_with_outcome(
+            begin=object,
+            settle=fail_settlement,
+        )
+
+        assert outcome.published is True
+        assert outcome.settled is False
+        assert isinstance(outcome.error, RuntimeError)
+        assert str(outcome.error) == "settings settlement failed"
+        assert current[0].cwd == Path("/tmp/published")
+        await runtime.close()
+
+    asyncio.run(scenario())
+
+
+def test_catalog_refresh_request_coalesces_and_reports_one_success() -> None:
+    events: list[str] = []
+
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def refresh_catalog(reason: str) -> ResourceBundle:
+            events.append(f"catalog:{reason}")
+            started.set()
+            await release.wait()
+            return ResourceBundle(cwd=Path("/tmp/project"))
+
+        runtime = _runtime(
+            loader=None,
+            catalog_refresh=refresh_catalog,
+            syncs=events,
+        )
+        runtime.request_refresh()
+        runtime.request_refresh()
+        await started.wait()
+        release.set()
+        await runtime.close()
+
+        assert runtime.resource_revision == 1
+
+    asyncio.run(scenario())
+    assert events == ["catalog:refresh", "resource_loading"]
+
+
+def test_catalog_refresh_request_during_active_refresh_drains_one_successor() -> None:
+    events: list[str] = []
+
+    async def scenario() -> None:
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        call_count = 0
+
+        async def refresh_catalog(reason: str) -> ResourceBundle:
+            nonlocal call_count
+            call_count += 1
+            events.append(f"catalog:{call_count}:{reason}")
+            if call_count == 1:
+                first_started.set()
+                await release_first.wait()
+            return ResourceBundle(cwd=Path("/tmp/project"))
+
+        runtime = _runtime(
+            loader=None,
+            catalog_refresh=refresh_catalog,
+            syncs=events,
+        )
+        runtime.request_refresh()
+        await first_started.wait()
+        runtime.request_refresh()
+        runtime.request_refresh()
+        release_first.set()
+        await runtime.close()
+
+        assert runtime.resource_revision == 2
+
+    asyncio.run(scenario())
+    assert events == [
+        "catalog:1:refresh",
+        "resource_loading",
+        "catalog:2:refresh",
+        "resource_loading",
+    ]
+
+
+def test_catalog_refresh_close_is_admission_and_explicit_refresh_join_barrier() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def refresh_catalog(_reason: str) -> ResourceBundle:
+            started.set()
+            await release.wait()
+            return ResourceBundle(cwd=Path("/tmp/project"))
+
+        runtime = _runtime(loader=None, catalog_refresh=refresh_catalog)
+        explicit = asyncio.create_task(runtime.refresh_async())
+        await started.wait()
+        closing = asyncio.create_task(runtime.close(cancel=True))
+        await asyncio.sleep(0)
+
+        assert closing.done() is False
+        runtime.request_refresh()
+        assert runtime._requested_refresh_task is None
+
+        release.set()
+        await explicit
+        await closing
+        with pytest.raises(ResourceRefreshRuntimeClosedError):
+            await runtime.refresh_async()
+        runtime.request_refresh()
+        assert runtime._requested_refresh_task is None
+
+    asyncio.run(scenario())
+
+
+def test_catalog_refresh_close_finishes_barrier_before_propagating_cancellation() -> (
+    None
+):
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def refresh_catalog(_reason: str) -> ResourceBundle:
+            started.set()
+            await release.wait()
+            return ResourceBundle(cwd=Path("/tmp/project"))
+
+        runtime = _runtime(loader=None, catalog_refresh=refresh_catalog)
+        explicit = asyncio.create_task(runtime.refresh_async())
+        await started.wait()
+        closing = asyncio.create_task(runtime.close())
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.sleep(0)
+
+        assert closing.done() is False
+        release.set()
+        await explicit
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        with pytest.raises(ResourceRefreshRuntimeClosedError):
+            await runtime.refresh_async()
+
+    asyncio.run(scenario())
+
+
+def test_catalog_extension_reload_delegates_to_the_same_refresh_authority() -> None:
+    events: list[str] = []
+
+    async def refresh_catalog(reason: str) -> ResourceBundle:
+        events.append(reason)
+        return ResourceBundle(cwd=Path("/tmp/project"))
+
+    current = ResourceBundle(cwd=Path("/tmp/current"))
+    runtime = _runtime(
+        loader=None,
+        bundle=current,
+        catalog_refresh=refresh_catalog,
+    )
+
+    result = asyncio.run(
+        runtime.reload_extension_generation(object(), reason="extension-reload")
+    )
+
+    assert result is current
+    assert events == ["extension-reload"]
+    assert runtime.resource_revision == 2
+
+
+def test_staged_extension_reload_publishes_resource_before_retiring_old_generation() -> (
+    None
+):
+    events: list[str] = []
+    refreshed: list[ResourceBundle] = []
+    candidate = _StagedCandidate(events)
+    extension_runtime = _StagedExtensionRuntime(candidate)
+    runtime = _runtime(
+        loader=_Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        extension_runtime=extension_runtime,
+        refreshed=refreshed,
+        rebuilds=events,
+    )
+
+    result = asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert result is not None
+    assert runtime.resource_revision == 1
+    assert result.prompt_fragments == ["candidate prompt"]
+    assert extension_runtime.extension_sets == [[]]
+    assert refreshed == [result]
+    assert events == [
+        "discover:reload",
+        "activate",
+        "publish",
+        "rebuild",
+        "committed",
+        "retire",
+    ]
+
+
+def test_staged_extension_reload_rejects_graph_provider_change_before_discovery() -> (
+    None
+):
+    events: list[str] = []
+    candidate_snapshot = ExtensionCapabilityDeclarationSnapshot(
+        declarations=(
+            ExtensionRuntimeCapabilityDeclaration(
+                extension_id="example",
+                slot="prompt.sections",
+                name="replacement",
+                implementation_version=2,
+                priority=10,
+                granted_permissions=("prompt.sections",),
+            ),
+        )
+    )
+    candidate = _StagedCandidate(
+        events,
+        capability_declarations=candidate_snapshot,
+    )
+    seen: list[ExtensionCapabilityDeclarationSnapshot] = []
+
+    def preflight(snapshot: ExtensionCapabilityDeclarationSnapshot) -> None:
+        seen.append(snapshot)
+        raise ExtensionGraphProviderRestartRequiredError(
+            capability_ids=("harness.resources",),
+            changed_slots=("prompt.sections",),
+            baseline_fingerprint="a" * 64,
+            candidate_fingerprint="b" * 64,
+        )
+
+    runtime = _runtime(
+        loader=_Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        extension_runtime=_StagedExtensionRuntime(candidate),
+        extension_declaration_preflight=preflight,
+    )
+
+    with pytest.raises(ExtensionGraphProviderRestartRequiredError):
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert seen == [candidate_snapshot]
+    assert events == ["rollback"]
+    assert runtime.resource_revision == 0
+
+
+def test_staged_extension_reload_rejects_async_preflight_before_effects() -> None:
+    events: list[str] = []
+    candidate = _StagedCandidate(events)
+
+    async def invalid_preflight(
+        _snapshot: ExtensionCapabilityDeclarationSnapshot,
+    ) -> None:
+        events.append("preflight")
+
+    runtime = _runtime(
+        loader=_Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        extension_runtime=_StagedExtensionRuntime(candidate),
+        extension_declaration_preflight=invalid_preflight,
+    )
+
+    with pytest.raises(TypeError, match="must be synchronous"):
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert events == ["rollback"]
+    assert runtime.resource_revision == 0
+
+
+def test_staged_extension_reload_rolls_back_failed_candidate_without_commit() -> None:
+    events: list[str] = []
+    refreshed: list[ResourceBundle] = []
+    candidate = _StagedCandidate(
+        events,
+        activation_error=RuntimeError("candidate failed"),
+    )
+    runtime = _runtime(
+        loader=_Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        extension_runtime=_StagedExtensionRuntime(candidate),
+        refreshed=refreshed,
+    )
+
+    with pytest.raises(RuntimeError, match="candidate failed"):
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert events == ["discover:reload", "activate", "rollback"]
+    assert refreshed == []
+
+
+def test_staged_extension_reload_joins_candidate_rollback_when_cancelled() -> None:
+    events: list[str] = []
+    activation_started = asyncio.Event()
+    candidate = _StagedCandidate(
+        events,
+        activation_started=activation_started,
+    )
+    runtime = _runtime(
+        loader=_Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        extension_runtime=_StagedExtensionRuntime(candidate),
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runtime.reload_extension_generation(object()))
+        await activation_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert events == ["discover:reload", "activate", "rollback"]
+
+
+def test_staged_extension_reload_restores_resource_when_publication_fails() -> None:
+    events: list[str] = []
+    previous = ResourceBundle(cwd=Path("/tmp/project"), prompt_fragments=["old"])
+    current: list[ResourceBundle | None] = [previous]
+    candidate = _StagedCandidate(events)
+
+    def set_bundle(bundle: ResourceBundle | None) -> None:
+        current[0] = bundle
+
+    def rebuild() -> None:
+        if current[0] is not previous:
+            raise RuntimeError("view rebuild failed")
+        events.append("restored")
+
+    runtime = SessionResourceRefreshRuntime(
+        get_resource_loader=lambda: _Loader(ResourceBundle(cwd=Path("/tmp/project"))),
+        get_resource_bundle=lambda: current[0],
+        get_cwd=lambda: "/tmp/project",
+        get_extension_runtime=lambda: _StagedExtensionRuntime(candidate),
+        get_settings=lambda: None,
+        set_resource_bundle=set_bundle,
+        rebuild_prompt_and_tools_view=rebuild,
+        record_refresh_failure=lambda error: None,
+        sync_extension_diagnostics=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="view rebuild failed"):
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert current == [previous]
+    assert runtime.resource_revision == 1
+    assert events == [
+        "discover:reload",
+        "activate",
+        "publish",
+        "restored",
+        "rollback",
+    ]
+
+
+def test_staged_extension_reload_restores_revision_when_publish_fails_after_commit() -> (
+    None
+):
+    events: list[str] = []
+    previous = ResourceBundle(cwd=Path("/tmp/old"), prompt_fragments=["old"])
+    current: list[ResourceBundle | None] = [previous]
+    candidate = _StagedCandidate(
+        events,
+        publication_error=RuntimeError("publication failed after commit"),
+    )
+    runtime = SessionResourceRefreshRuntime(
+        get_resource_loader=lambda: _Loader(ResourceBundle(cwd=Path("/tmp/new"))),
+        get_resource_bundle=lambda: current[0],
+        get_cwd=lambda: "/tmp/project",
+        get_extension_runtime=lambda: _StagedExtensionRuntime(candidate),
+        get_settings=lambda: None,
+        set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+        rebuild_prompt_and_tools_view=lambda: events.append("rebuild"),
+        record_refresh_failure=lambda error: None,
+        sync_extension_diagnostics=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="publication failed after commit"):
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert current == [previous]
+    assert runtime.resource_revision == 1
+    assert events[-1] == "rollback"
+
+
+def test_failed_view_restoration_still_restores_publication_revision() -> None:
+    previous = ResourceBundle(cwd=Path("/tmp/old"), prompt_fragments=["old"])
+    current: list[ResourceBundle | None] = [previous]
+    candidate = _StagedCandidate(
+        [],
+        publication_error=RuntimeError("publication failed after commit"),
+    )
+
+    def rebuild() -> None:
+        if current[0] is previous:
+            raise RuntimeError("restoration rebuild failed")
+
+    runtime = SessionResourceRefreshRuntime(
+        get_resource_loader=lambda: _Loader(ResourceBundle(cwd=Path("/tmp/new"))),
+        get_resource_bundle=lambda: current[0],
+        get_cwd=lambda: "/tmp/project",
+        get_extension_runtime=lambda: _StagedExtensionRuntime(candidate),
+        get_settings=lambda: None,
+        set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+        rebuild_prompt_and_tools_view=rebuild,
+        record_refresh_failure=lambda error: None,
+        sync_extension_diagnostics=lambda: None,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="publication failed after commit",
+    ) as caught:
+        asyncio.run(runtime.reload_extension_generation(object()))
+
+    assert current == [previous]
+    assert runtime.resource_revision == 1
+    assert "previous resource bundle view restoration failed" in caught.value.__notes__
+
+
+def test_failed_publication_restores_old_resource_before_async_candidate_cleanup() -> (
+    None
+):
+    previous = ResourceBundle(cwd=Path("/tmp/old"))
+    current: list[ResourceBundle | None] = [previous]
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    candidate = _StagedCandidate(
+        [],
+        rollback_started=rollback_started,
+        release_rollback=release_rollback,
+    )
+
+    def rebuild() -> None:
+        if current[0] is not previous:
+            raise RuntimeError("view rebuild failed")
+
+    runtime = SessionResourceRefreshRuntime(
+        get_resource_loader=lambda: _Loader(ResourceBundle(cwd=Path("/tmp/new"))),
+        get_resource_bundle=lambda: current[0],
+        get_cwd=lambda: "/tmp/project",
+        get_extension_runtime=lambda: _StagedExtensionRuntime(candidate),
+        get_settings=lambda: None,
+        set_resource_bundle=lambda bundle: current.__setitem__(0, bundle),
+        rebuild_prompt_and_tools_view=rebuild,
+        record_refresh_failure=lambda error: None,
+        sync_extension_diagnostics=lambda: None,
+    )
+
+    async def scenario() -> None:
+        task = asyncio.create_task(runtime.reload_extension_generation(object()))
+        await rollback_started.wait()
+        assert current == [previous]
+        release_rollback.set()
+        with pytest.raises(RuntimeError, match="view rebuild failed"):
+            await task
+
+    asyncio.run(scenario())

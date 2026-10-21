@@ -11,6 +11,12 @@ from loushang.harness.session import (
     build_agent_session_lifecycle_hooks,
     prepare_current_agent_session,
 )
+from loushang.harness.session.agent_adapter import (
+    AgentProductSessionRuntime as CompatibilityAgentProductSessionRuntime,
+)
+from loushang.harness.session.agent_product_runtime import (
+    AgentProductSessionRuntime as OwnedAgentProductSessionRuntime,
+)
 
 
 class _Manager:
@@ -20,6 +26,10 @@ class _Manager:
 
     def get_cwd(self) -> str:
         return self._cwd
+
+
+def test_agent_adapter_keeps_product_runtime_import_compatibility() -> None:
+    assert CompatibilityAgentProductSessionRuntime is OwnedAgentProductSessionRuntime
 
 
 class _Runner:
@@ -55,6 +65,9 @@ class _Session:
     def set_extension_runtime_host(self, host: object) -> None:
         self.actions.append(("bind-host", host))
 
+    async def prepare_model_call_runtime(self) -> None:
+        self.actions.append(("bind-model-call-graph",))
+
     async def start_extension_runtime(self, *, reason: str) -> None:
         self.actions.append(("start-extensions", reason))
 
@@ -86,7 +99,7 @@ def test_agent_session_lifecycle_hooks_bind_existing_session_capabilities() -> N
         decision = await hooks.before_transition(session, transition)
         assert decision is not None and decision.cancelled is False
         assert hooks.prepare_session is not None
-        hooks.prepare_session(session, None, transition)
+        await hooks.prepare_session(session, None, transition)
         assert hooks.activate_session is not None
         await hooks.activate_session(session, None, transition)
         assert hooks.before_release is not None
@@ -101,6 +114,7 @@ def test_agent_session_lifecycle_hooks_bind_existing_session_capabilities() -> N
             ("sync-diagnostics", "runtime"),
             ("stage-approvals",),
             ("bind-host", runtime_host),
+            ("bind-model-call-graph",),
             ("open-approvals",),
             ("start-extensions", "fork"),
             ("shutdown", "fork", "/target.jsonl"),

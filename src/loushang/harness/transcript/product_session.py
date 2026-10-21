@@ -10,20 +10,66 @@ and the binding input to reuse for a fork.
 from __future__ import annotations
 
 import builtins
+import sys
+from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
+from functools import partial
 from pathlib import Path
-from typing import Generic, Self, TypeVar
+from typing import TYPE_CHECKING, Generic, Self, TypeVar, cast
 
+from loushang.agent.types import AgentMessage
+from loushang.ai.types import (
+    AssistantMessage,
+    ImagePart,
+    ToolResultMessage,
+    UserMessage,
+)
+from loushang.foundation.json import JSONValue, require_json_value
+from loushang.harness.artifacts import (
+    SessionBlobStore,
+    resolve_session_blob_data_root,
+)
+from loushang.harness.conversation import ConversationRecord
+from loushang.harness.journal._owned_io import settled_io
+from loushang.harness.runtime import RuntimeProfileSnapshot
+from loushang.harness.transcript.capability_candidate import (
+    AgentTranscriptCapabilityCandidate,
+)
+from loushang.harness.transcript.committer import (
+    CommitResult,
+    PrebuiltUserMessageLookupResult,
+)
+from loushang.harness.transcript.compaction import (
+    TURN_AWARE_SUMMARY_IMPLEMENTATION,
+    TURN_AWARE_SUMMARY_VERSION,
+    AgentTranscriptCompactionCapability,
+    create_agent_transcript_compaction_capability,
+)
+from loushang.harness.transcript.jsonl_file import (
+    load_agent_transcript_file,
+    load_agent_transcript_header,
+    publish_owned_transcript_projection,
+)
 from loushang.harness.transcript.lifecycle import (
     AgentTranscriptLifecycleSession,
+    TranscriptDeletionOwner,
     delete_agent_transcript_jsonl,
 )
+from loushang.harness.transcript.model_input_blobs import SessionModelInputBlobCodec
 from loushang.harness.transcript.session import AgentTranscriptSession
+from loushang.harness.transcript.session_artifacts import (
+    collect_agent_transcript_session_blobs,
+    delete_agent_transcript_session_blobs,
+)
 from loushang.harness.transcript.session_catalog import (
+    _MAX_PATH_SUMMARY_TOTAL_BYTES,
     AgentTranscriptSessionCatalog,
     SessionMetadata,
+    SessionQuery,
     SessionRecord,
     SessionSummary,
     SessionTreeNode,
+    _status_fingerprint,
     agent_transcript_header_parent_session,
     build_agent_transcript_session_context,
     build_agent_transcript_session_tree,
@@ -34,18 +80,29 @@ from loushang.harness.transcript.session_catalog import (
     load_agent_transcript_session_metadata,
     project_agent_transcript_session_summary,
     refresh_all_agent_transcript_session_indexes,
+    same_agent_transcript_session_path,
 )
 from loushang.harness.transcript.session_factory import (
     AgentTranscriptSessionFactory,
 )
+from loushang.harness.transcript.session_images import (
+    SessionImageHydrationContext,
+    externalize_session_message_images,
+    hydrate_session_message_images,
+    rollback_externalized_session_images,
+)
 from loushang.harness.transcript.types import (
     AgentTranscriptContext,
     AgentTranscriptRecord,
+    ApplicationMessage,
+    SessionImagePart,
 )
-from loushang.protocol import require_json_value
 
 BindingInputT = TypeVar("BindingInputT")
 ProductBindingT = TypeVar("ProductBindingT")
+
+if TYPE_CHECKING:
+    from loushang.harness.journal._rooted_io import RootedFileIO
 
 
 class ProductTranscriptSession(
@@ -66,10 +123,12 @@ class ProductTranscriptSession(
         lifecycle_session: AgentTranscriptLifecycleSession[ProductBindingT],
     ) -> None:
         self._lifecycle_session = lifecycle_session
+        self._creation_factory: AgentTranscriptSessionFactory[BindingInputT, ProductBindingT] | None = None
         self.session_dir = lifecycle_session.context.session_dir
         self.cwd = lifecycle_session.context.cwd
         self.persist = lifecycle_session.context.persist
         self.session_file = lifecycle_session.context.session_file
+        self.session_blob_health = lifecycle_session.session_blob_health
         self._published_index_revision: int | None = None
         super().__init__(
             transcript=lifecycle_session.transcript,
@@ -79,22 +138,256 @@ class ProductTranscriptSession(
             ),
         )
 
+    async def append_message(
+        self,
+        message: object,
+        *,
+        metadata: Mapping[str, JSONValue] | None = None,
+    ) -> str:
+        """Externalize durable image bytes before committing an Agent message."""
+
+        if not self.persist or not isinstance(
+            message, UserMessage | AssistantMessage | ToolResultMessage
+        ):
+            return await super().append_message(message, metadata=metadata)
+        async with self._lifecycle_session.operation_scope():
+            externalized = externalize_session_message_images(
+                message,
+                self._session_blob_store(file_io=self._lifecycle_session.blob_file_io),
+            )
+            revision = self._transcript.revision
+            try:
+                return await super().append_message(
+                    externalized.message,
+                    metadata=metadata,
+                )
+            except BaseException as error:
+                rollback_externalized_session_images(
+                    externalized, error,
+                    transcript_changed=self._transcript.revision != revision,
+                )
+                raise
+
+    async def lookup_prebuilt_user_message(
+        self, record: AgentTranscriptRecord,
+    ) -> PrebuiltUserMessageLookupResult:
+        """Keep durable lookup under the existing Product ownership fence."""
+
+        if not self.persist:
+            raise ValueError("prebuilt user lookup requires a persistent Product session")
+        async with self._lifecycle_session.operation_scope():
+            return await super().lookup_prebuilt_user_message(record)
+
+    async def commit_prebuilt_user_message(
+        self, record: AgentTranscriptRecord,
+    ) -> CommitResult:
+        """Fence a fixed-ID input and verify its already-staged image references."""
+
+        if not self.persist:
+            raise ValueError("prebuilt user commit requires a persistent Product session")
+        async with self._lifecycle_session.operation_scope():
+            if isinstance(record.payload, UserMessage) and isinstance(
+                record.payload.content, list,
+            ):
+                parts = record.payload.content
+                if any(isinstance(part, ImagePart) for part in parts):
+                    raise ValueError("prebuilt user images must be externalized first")
+                if any(isinstance(part, SessionImagePart) for part in parts):
+                    externalize_session_message_images(
+                        record.payload,
+                        self._session_blob_store(
+                            file_io=self._lifecycle_session.blob_file_io,
+                        ),
+                    )
+            return await super().commit_prebuilt_user_message(record)
+
+    async def commit_prebuilt_extension_data(
+        self, record: AgentTranscriptRecord,
+    ) -> CommitResult:
+        """Keep a fixed-ID extension commit within the Product operation scope."""
+
+        if not self.persist:
+            raise ValueError("prebuilt extension commit requires a persistent Product session")
+        async with self._lifecycle_session.operation_scope():
+            return await super().commit_prebuilt_extension_data(record)
+
+    async def commit_prebuilt_user_message_from_message(
+        self,
+        message: UserMessage,
+        *,
+        prepare_record: Callable[[UserMessage], AgentTranscriptRecord],
+    ) -> CommitResult:
+        """Externalize images before freezing and committing one fixed-ID input.
+
+        Product preparation receives only the final persisted payload. This
+        keeps its Binding digest and request evidence on the same record.
+        """
+
+        if not self.persist:
+            raise ValueError("prebuilt user commit requires a persistent Product session")
+        if not isinstance(message, UserMessage) or not callable(prepare_record):
+            raise TypeError("prebuilt user commit requires a message and preparer")
+        async with self._lifecycle_session.operation_scope():
+            externalized = externalize_session_message_images(
+                message,
+                self._session_blob_store(file_io=self._lifecycle_session.blob_file_io),
+            )
+            revision = self._transcript.revision
+            try:
+                persisted = externalized.message
+                if not isinstance(persisted, UserMessage):
+                    raise TypeError("externalized user message has an invalid type")
+                record = prepare_record(persisted)
+                if not isinstance(record, ConversationRecord) or record.payload != persisted:
+                    raise ValueError("prebuilt user record changed the persisted payload")
+                return await super().commit_prebuilt_user_message(record)
+            except BaseException as error:
+                rollback_externalized_session_images(
+                    externalized, error,
+                    transcript_changed=self._transcript.revision != revision,
+                )
+                raise
+
+    async def commit_application_message(
+        self,
+        message: ApplicationMessage,
+    ) -> CommitResult:
+        """Persist Application images through the same durable boundary."""
+
+        if not self.persist:
+            return await super().commit_application_message(message)
+        async with self._lifecycle_session.operation_scope():
+            externalized = externalize_session_message_images(
+                message,
+                self._session_blob_store(file_io=self._lifecycle_session.blob_file_io),
+                now=message.timestamp,
+            )
+            revision = self._transcript.revision
+            try:
+                return await super().commit_application_message(
+                    cast(ApplicationMessage, externalized.message)
+                )
+            except BaseException as error:
+                rollback_externalized_session_images(
+                    externalized, error,
+                    transcript_changed=self._transcript.revision != revision,
+                )
+                raise
+
     @classmethod
     def _session_factory(
         cls,
     ) -> AgentTranscriptSessionFactory[BindingInputT, ProductBindingT]:
         raise NotImplementedError("Product transcript sessions must bind a factory")
 
+    @classmethod
+    def _factory_for_persistence(
+        cls, persist: bool,
+    ) -> AgentTranscriptSessionFactory[BindingInputT, ProductBindingT]:
+        """Select an application binding without changing legacy factory hooks."""
+        return cls._session_factory()
+
     def _fork_binding_input(self) -> BindingInputT:
         raise NotImplementedError("Product transcript sessions must bind fork input")
+
+    def _fork_header_metadata(self) -> Mapping[str, JSONValue] | None:
+        """Return Product-owned creation facts that must survive a fork."""
+
+        return None
+
+    @classmethod
+    async def _construct_product(
+        cls, factory: AgentTranscriptSessionFactory[BindingInputT, ProductBindingT],
+        operation: Callable[..., Awaitable[AgentTranscriptLifecycleSession[ProductBindingT]]],
+    ) -> Self:
+        if not factory.owns_persistent_sessions:
+            return cls(lifecycle_session=await operation())
+        projected: Self | None = None
+
+        def project(session: AgentTranscriptLifecycleSession[ProductBindingT]) -> None:
+            nonlocal projected
+            # Synchronous construction only: do not publish or transfer Graph
+            # ownership before the factory completes its original handoff.
+            value = cls(lifecycle_session=session)
+            value._creation_factory = factory
+            projected = value
+
+        await operation(_projection=project)
+        assert projected is not None
+        return projected
 
     async def dispose_runtime_profile(self) -> None:
         """Release the Product-owned runtime binding for this session."""
 
+        if self._lifecycle_session.ownership_state != "root_owned":
+            # The combined Session Provider owns index publication and release
+            # once the transcript trio enters Graph construction. Compatibility
+            # disposal must not race or duplicate that owner.
+            await self._lifecycle_session.dispose()
+            return
         try:
             await self.publish_index_summary()
         finally:
             await self._lifecycle_session.dispose()
+
+    @property
+    def runtime_disposed(self) -> bool:
+        """True only after the actual Session/Graph disposal owner has settled."""
+        return self._lifecycle_session.ownership_state == "disposed"
+
+    def transcript_capability_candidate(self) -> AgentTranscriptCapabilityCandidate:
+        """Project the already-bound transcript trio for Session graph adoption."""
+
+        runtime_binding = self._lifecycle_session.runtime_binding
+        snapshot = runtime_binding.runtime_profile_snapshot or RuntimeProfileSnapshot(
+            product_id="harness.transcript.legacy",
+            capabilities=(),
+        )
+        get_compaction = runtime_binding.get_compaction_capability
+        if get_compaction is None:
+            legacy_compaction = self._legacy_compaction_capability()
+
+            def resolved_get_compaction() -> AgentTranscriptCompactionCapability:
+                return legacy_compaction
+
+        else:
+            resolved_get_compaction = get_compaction
+        return AgentTranscriptCapabilityCandidate(
+            _lifecycle=self._lifecycle_session,
+            conversation_id=self.header.conversation_id,
+            runtime_profile_snapshot=snapshot,
+            _get_compaction_capability=resolved_get_compaction,
+            _create_model_input_committer=(
+                lambda purpose, logical_input, runtime_references: (
+                    self.create_model_input_committer(
+                        purpose=purpose,
+                        logical_input=logical_input,
+                        runtime_references=runtime_references,
+                    )
+                )
+            ),
+            _rebuild_model_input=self.rebuild_model_input,
+            _publish_index_summary=self.publish_index_summary,
+        )
+
+    def _legacy_compaction_capability(
+        self,
+    ) -> AgentTranscriptCompactionCapability:
+        get_runtime_capability = getattr(self, "get_runtime_capability", None)
+        if callable(get_runtime_capability):
+            selected = get_runtime_capability("context.compaction")
+            if isinstance(selected, AgentTranscriptCompactionCapability):
+                return selected
+        return create_agent_transcript_compaction_capability(
+            implementation=TURN_AWARE_SUMMARY_IMPLEMENTATION,
+            implementation_version=TURN_AWARE_SUMMARY_VERSION,
+            config={
+                "enabled": True,
+                "compactPercent": 80.0,
+                "reserveTokens": 8_192,
+                "keepRecentTokens": 32_768,
+            },
+        )
 
     async def publish_index_summary(self) -> None:
         """Publish this session's latest summary when a local index exists."""
@@ -105,11 +398,40 @@ class ProductTranscriptSession(
         if revision == self._published_index_revision:
             return
         catalog = AgentTranscriptSessionCatalog(self.session_dir)
+        file_io = self._lifecycle_session.transcript_file_io
+        if file_io is not None:
+            try:
+                async with self._lifecycle_session.operation_scope():
+                    if catalog.session_dir is None:
+                        raise ValueError("owned publication requires a local catalog")
+                    key = self._lifecycle_session.runtime_binding.key
+                    header, records = self.header, tuple(self.entries)
+                    publication = partial(
+                        publish_owned_transcript_projection,
+                        file_io=file_io, root=catalog.session_dir, key=key,
+                        source_path=self.session_file, header=header, records=records,
+                        max_bytes=_MAX_PATH_SUMMARY_TOTAL_BYTES, fingerprint=_status_fingerprint,
+                    )
+                    changed = await settled_io(
+                        catalog.publish_owned_summary,
+                        publication=publication,
+                        key=key,
+                        source_path=self.session_file,
+                        header=header, records=records,
+                        leaf_id=self.leaf_id,
+                    )
+                if changed:
+                    self._published_index_revision = revision
+            except Exception:
+                # Cache failure does not roll back committed transcript data.
+                # Any unsettled native resources remain on the original port.
+                pass
+            return
         if not catalog.index_path.exists():
             return
         try:
             await catalog.upsert_summary(
-                self.get_session_summary(),
+                self._get_session_index_summary(),
                 source_revision=revision,
             )
         except Exception:
@@ -125,23 +447,27 @@ class ProductTranscriptSession(
         persist: bool = True,
         parent_session: str | None = None,
         session_id: str | None = None,
+        additional_header_metadata: Mapping[str, JSONValue] | None = None,
+        defer_materialization: bool = True,
     ) -> Self:
-        lifecycle_session = await cls._session_factory().new(
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.new,
             session_dir=session_dir,
             cwd=cwd,
             persist=persist,
             parent_session=parent_session,
             session_id=session_id,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+            additional_header_metadata=additional_header_metadata,
+            defer_materialization=defer_materialization,
+        ))
 
     @classmethod
     async def load(cls, session_file: Path, persist: bool = True) -> Self:
-        lifecycle_session = await cls._session_factory().load(
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.load,
             session_file,
             persist=persist,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+        ))
 
     @classmethod
     async def open(
@@ -151,13 +477,13 @@ class ProductTranscriptSession(
         cwd_override: str | Path | None = None,
         persist: bool = True,
     ) -> Self:
-        lifecycle_session = await cls._session_factory().open(
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.open,
             session_file,
             session_dir=session_dir,
             cwd_override=cwd_override,
             persist=persist,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+        ))
 
     @classmethod
     async def continue_recent(
@@ -166,12 +492,12 @@ class ProductTranscriptSession(
         cwd: str | Path,
         persist: bool = True,
     ) -> Self:
-        lifecycle_session = await cls._session_factory().continue_recent(
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.continue_recent,
             session_dir=session_dir,
             cwd=cwd,
             persist=persist,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+        ))
 
     @classmethod
     async def in_memory(
@@ -179,11 +505,51 @@ class ProductTranscriptSession(
         cwd: str | Path = ".",
         session_id: str | None = None,
     ) -> Self:
-        lifecycle_session = await cls._session_factory().in_memory(
+        factory = cls._factory_for_persistence(False)
+        return await cls._construct_product(factory, partial(factory.in_memory,
             cwd=cwd,
             session_id=session_id,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+        ))
+
+    @classmethod
+    async def import_transcript(
+        cls,
+        source_file: str | Path,
+        *,
+        session_dir: str | Path,
+        cwd_override: str | Path | None = None,
+        expected_source_fingerprint: str | None = None,
+        _validate_cwd: Callable[[str], None] | None = None,
+        _unpublished: bool = False,
+    ) -> Self:
+        factory = cls._factory_for_persistence(True)
+        return await cls._construct_product(factory, partial(
+            factory.import_transcript, source_file, session_dir=session_dir,
+            cwd_override=cwd_override,
+            expected_source_fingerprint=expected_source_fingerprint,
+            _validate_cwd=_validate_cwd,
+            _unpublished=_unpublished,
+        ))
+
+    def _mark_import_delivered(self) -> None:
+        self._lifecycle_session._mark_import_delivered()
+
+    @classmethod
+    async def import_bundle(
+        cls,
+        source_file: str | Path,
+        *,
+        session_dir: str | Path,
+        cwd_override: str | Path | None = None,
+        persist: bool = True,
+    ) -> Self:
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.import_bundle,
+            source_file,
+            session_dir=session_dir,
+            cwd_override=cwd_override,
+            persist=persist,
+        ))
 
     @classmethod
     async def fork_from(
@@ -193,13 +559,13 @@ class ProductTranscriptSession(
         session_dir: str | Path,
         persist: bool = True,
     ) -> Self:
-        lifecycle_session = await cls._session_factory().fork_from(
+        factory = cls._factory_for_persistence(persist)
+        return await cls._construct_product(factory, partial(factory.fork_from,
             source_file,
             target_cwd=target_cwd,
             session_dir=session_dir,
             persist=persist,
-        )
-        return cls(lifecycle_session=lifecycle_session)
+        ))
 
     def get_session_dir(self) -> Path:
         return self.session_dir
@@ -232,6 +598,15 @@ class ProductTranscriptSession(
             self.entries,
             self.leaf_id,
             self.session_file,
+        )
+
+    def _get_session_index_summary(self) -> SessionSummary:
+        return project_agent_transcript_session_summary(
+            self.header,
+            self.entries,
+            self.leaf_id,
+            self.session_file,
+            include_all_messages_text=False,
         )
 
     def get_tree(self) -> list[SessionTreeNode[AgentTranscriptRecord]]:
@@ -270,18 +645,75 @@ class ProductTranscriptSession(
         return record_id
 
     async def fork(self, leaf_id: str) -> Self:
-        lifecycle_session = await self._session_factory().fork(
+        factory = self._creation_factory if self._creation_factory is not None else self._factory_for_persistence(self.persist)
+        return await type(self)._construct_product(factory, partial(factory.fork,
             self._lifecycle_session,
             leaf_id=leaf_id,
             binding_input=self._fork_binding_input(),
-        )
-        return type(self)(lifecycle_session=lifecycle_session)
+            additional_header_metadata=self._fork_header_metadata(),
+        ))
 
     async def create_branched_session(self, leaf_id: str) -> Path | None:
         return (await self.fork(leaf_id)).session_file
 
     def build_session_context(self) -> AgentTranscriptContext:
-        return build_agent_transcript_session_context(self.entries, self.leaf_id)
+        with self._lifecycle_session.sync_operation_scope():
+            return self._build_session_context()
+
+    def _build_session_context(self) -> AgentTranscriptContext:
+        context = build_agent_transcript_session_context(self.entries, self.leaf_id)
+        if not self.persist:
+            return context
+        store = self._session_blob_store(file_io=self._lifecycle_session.blob_file_io)
+        hydration = SessionImageHydrationContext()
+        return AgentTranscriptContext(
+            messages=tuple(
+                cast(
+                    AgentMessage,
+                    hydrate_session_message_images(
+                        message,
+                        store,
+                        hydration=hydration,
+                    ),
+                )
+                for message in context.messages
+            ),
+            state=context.state,
+        )
+
+    def _session_blob_store(self, *, file_io: RootedFileIO | None = None) -> SessionBlobStore:
+        return SessionBlobStore(
+            self.session_dir.parent if file_io is not None else resolve_session_blob_data_root(self.session_dir),
+            self.header.conversation_id,
+            file_io=file_io,
+        )
+
+    def _model_input_binary_codec(
+        self,
+        *,
+        active_only: bool,
+    ) -> SessionModelInputBlobCodec | None:
+        with self._lifecycle_session.sync_operation_scope():
+            return self._build_model_input_binary_codec(active_only=active_only)
+
+    def _build_model_input_binary_codec(
+        self, *, active_only: bool,
+    ) -> SessionModelInputBlobCodec | None:
+        if not self.persist:
+            return None
+        records = (
+            self._transcript.active_path()
+            if active_only
+            else self._transcript.records
+        )
+        return SessionModelInputBlobCodec(
+            self._session_blob_store(file_io=self._lifecycle_session.blob_file_io),
+            operation_scope=self._lifecycle_session.sync_operation_scope,
+            references=collect_agent_transcript_session_blobs(
+                records,
+                expected_session_id=self.header.conversation_id,
+            ),
+        )
 
     @classmethod
     async def rename_session(
@@ -303,15 +735,65 @@ class ProductTranscriptSession(
         session_file: str | Path,
         *,
         current_session_file: str | Path | None = None,
+        maintenance_owner: TranscriptDeletionOwner | None = None,
     ) -> bool:
+        if maintenance_owner is not None or sys.platform == "linux":
+            return await delete_agent_transcript_jsonl(
+                session_file, current_session_file=current_session_file,
+                maintenance_owner=maintenance_owner,
+            )
         target = Path(session_file).expanduser()
+        if current_session_file is not None and same_agent_transcript_session_path(
+            target,
+            Path(current_session_file).expanduser(),
+        ):
+            raise ValueError("Cannot delete the currently active session")
+        if not target.is_file():
+            return False
+        header, records = load_agent_transcript_file(target)
+        references = collect_agent_transcript_session_blobs(
+            records,
+            expected_session_id=header.conversation_id,
+        )
+        owns_unique_blob_authority = bool(references) and cls._is_unique_authority(
+            target,
+            header.conversation_id,
+        )
         deleted = await delete_agent_transcript_jsonl(
             target,
             current_session_file=current_session_file,
         )
         if deleted:
+            # The transcript authority has already committed deletion.
+            # Recoverable asset residue is left for explicit maintenance.
+            with suppress(OSError, ValueError):
+                if not owns_unique_blob_authority or not cls._is_unique_authority(
+                    target,
+                    header.conversation_id,
+                ):
+                    raise ValueError(
+                        "Session blob authority still has another transcript owner"
+                    )
+                delete_agent_transcript_session_blobs(
+                    session_dir=target.parent,
+                    session_id=header.conversation_id,
+                )
             cls._repair_index_if_present(target.parent)
         return deleted
+
+    @staticmethod
+    def _is_unique_authority(target: Path, conversation_id: str) -> bool:
+        """Fail closed when another transcript claims the same blob authority."""
+
+        for candidate in target.parent.glob("*.jsonl"):
+            if same_agent_transcript_session_path(candidate, target):
+                continue
+            try:
+                if load_agent_transcript_header(candidate).conversation_id == conversation_id:
+                    return False
+            except (OSError, ValueError):
+                continue
+        return True
 
     @classmethod
     def _repair_index_if_present(cls, session_dir: Path) -> None:
@@ -346,7 +828,7 @@ class ProductTranscriptSession(
     def find_sessions(
         cls,
         session_dir: Path,
-        query: object | None = None,
+        query: SessionQuery | None = None,
     ) -> builtins.list[SessionSummary]:
         return AgentTranscriptSessionCatalog(session_dir).find_summaries(query)
 
@@ -354,7 +836,7 @@ class ProductTranscriptSession(
     def find_all_sessions(
         cls,
         sessions_root: Path,
-        query: object | None = None,
+        query: SessionQuery | None = None,
     ) -> builtins.list[SessionSummary]:
         return find_all_agent_transcript_session_summaries(sessions_root, query)
 
@@ -385,7 +867,7 @@ class ProductTranscriptSession(
     def find_indexed_sessions(
         cls,
         session_dir: Path,
-        query: object | None = None,
+        query: SessionQuery | None = None,
     ) -> builtins.list[SessionSummary]:
         return AgentTranscriptSessionCatalog(session_dir).find_indexed_summaries(query)
 
@@ -412,7 +894,7 @@ class ProductTranscriptSession(
     def find_all_indexed_sessions(
         cls,
         sessions_root: Path,
-        query: object | None = None,
+        query: SessionQuery | None = None,
     ) -> builtins.list[SessionSummary]:
         return find_all_indexed_agent_transcript_session_summaries(sessions_root, query)
 

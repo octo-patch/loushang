@@ -77,7 +77,7 @@ def test_transcript_reader_renders_frozen_snapshot_and_footer() -> None:
     assert "Earlier transcript records were trimmed." in first
     assert first[-3] == "─" * 80
     assert first[-2] == "↑/↓ scroll   PgUp/Ctrl+B · PgDn/Ctrl+F page   Home/End jump"
-    assert first[-1] == "Ctrl+O/q/Esc close   / search   n/N next   d detail   r raw"
+    assert first[-1] == "Ctrl+T/q/Esc close   / search   n/N next   d detail   r raw"
     assert any("first" in line for line in first)
     assert all("second" not in line for line in first)
 
@@ -92,7 +92,9 @@ def test_transcript_reader_footer_chrome_is_dim_gray() -> None:
     assert raw[-1].startswith("\x1b[2;90m")
 
 
-def test_transcript_reader_short_content_fills_full_height_with_footer_at_bottom() -> None:
+def test_transcript_reader_short_content_fills_full_height_with_footer_at_bottom() -> (
+    None
+):
     reader = TranscriptReaderSurface(_Source((AssistantMessageRecord("short answer"),)))
 
     rendered = _render_text(reader, width=40, height=8)
@@ -103,7 +105,7 @@ def test_transcript_reader_short_content_fills_full_height_with_footer_at_bottom
     assert rendered[-3] == "─" * 40
     assert rendered[-2].startswith("↑/↓ scroll   PgUp/Ctrl+B")
     assert "PgDn/Ctrl" in rendered[-2]
-    assert rendered[-1].startswith("Ctrl+O/q/Esc close   / search")
+    assert rendered[-1].startswith("Ctrl+T/q/Esc close   / search")
 
 
 def test_transcript_reader_opens_at_tail_and_scrolls_by_page() -> None:
@@ -179,10 +181,164 @@ def test_transcript_reader_clamps_scroll_offset_after_resize() -> None:
 def test_transcript_reader_close_keys_return_surface_close() -> None:
     reader = TranscriptReaderSurface(_Source((AssistantMessageRecord("answer"),)))
 
-    for key in ("q", "esc", "escape", "ctrl+c", "ctrl_c", "ctrl+o", "ctrl_o"):
+    for key in (
+        "q",
+        "esc",
+        "escape",
+        "ctrl+c",
+        "ctrl_c",
+        "ctrl+t",
+        "ctrl_t",
+    ):
         assert reader.handle_input(InputEvent(kind="key", key=key)) == InputIntent(
             kind="surface_close"
         )
+
+
+def test_reader_mouse_selection_can_copy_when_application_owns_mouse() -> None:
+    reader = TranscriptReaderSurface(
+        _Source((AssistantMessageRecord("reader answer"),))
+    )
+    rows = _render_text(reader, width=40, height=8)
+    row = next(index for index, line in enumerate(rows) if "reader answer" in line)
+    column = rows[row].index("reader answer")
+    reader.handle_input(
+        InputEvent(
+            kind="mouse",
+            mouse_action="press",
+            mouse_button=0,
+            mouse_row=row,
+            mouse_column=column,
+        )
+    )
+    reader.handle_input(
+        InputEvent(
+            kind="mouse",
+            mouse_action="drag",
+            mouse_button=0,
+            mouse_row=row,
+            mouse_column=column + 6,
+        )
+    )
+    assert reader.handle_input(
+        InputEvent(
+            kind="mouse",
+            mouse_action="release",
+            mouse_button=0,
+            mouse_row=row,
+            mouse_column=column + 6,
+        )
+    ) == InputIntent(kind="copy_text", text="reader")
+    assert reader.handle_input(InputEvent(kind="key", key="ctrl+c")) == InputIntent(
+        kind="copy_text", text="reader"
+    )
+    reader.handle_input(InputEvent(kind="key", key="esc"))
+    assert reader.selected_text() == ""
+
+
+def test_reader_scroll_invalidates_selection_instead_of_copying_other_rows() -> None:
+    reader = TranscriptReaderSurface(
+        _Source(
+            (AssistantMessageRecord("\n".join(f"LINE{index}" for index in range(25))),)
+        )
+    )
+    rows = _render_text(reader, width=40, height=8)
+    row = next(index for index, line in enumerate(rows) if "LINE" in line)
+    column = rows[row].index("LINE")
+    reader.handle_input(
+        InputEvent(
+            kind="mouse",
+            mouse_action="press",
+            mouse_button=0,
+            mouse_row=row,
+            mouse_column=column,
+        )
+    )
+    reader.handle_input(
+        InputEvent(
+            kind="mouse",
+            mouse_action="release",
+            mouse_button=0,
+            mouse_row=row,
+            mouse_column=column + 4,
+        )
+    )
+    assert reader.selected_text().startswith("LINE")
+    reader.handle_input(InputEvent(kind="key", key="home"))
+    _render_text(reader, width=40, height=8)
+    assert reader.selected_text() == ""
+
+
+def test_reader_global_shortcuts_work_during_search_and_copy_feedback_is_visible() -> (
+    None
+):
+    reader = TranscriptReaderSurface(_Source((AssistantMessageRecord("answer"),)))
+    reader.handle_input(InputEvent(kind="key", key="/"))
+    assert reader.handle_input(InputEvent(kind="key", key="ctrl+o")) == InputIntent(
+        kind="copy_text", text="answer"
+    )
+    reader.copy_status = "Copied to clipboard"
+    assert "Copied to clipboard" in _render_text(reader, width=40, height=8)[-1]
+    assert reader.handle_input(InputEvent(kind="key", key="ctrl+t")) == InputIntent(
+        kind="surface_close"
+    )
+
+
+def test_transcript_reader_uses_expanded_tool_command_and_output() -> None:
+    reader = TranscriptReaderSurface(
+        _Source(
+            (
+                ToolExecutionRecord(
+                    name="bash first",
+                    tool_name="bash",
+                    state="completed",
+                    elapsed_seconds=0.2,
+                    command="bash first",
+                    output="first\n… +8 lines\nlast",
+                    expanded_command="first\nsecond\nthird",
+                    expanded_output="\n".join(
+                        f"output {index}" for index in range(1, 11)
+                    ),
+                ),
+            )
+        )
+    )
+
+    rendered = _render_text(reader, width=80, height=30)
+
+    assert any("$ first" in line for line in rendered)
+    assert any("| second" in line for line in rendered)
+    assert any("output 5" in line for line in rendered)
+    assert not any("… +8 lines" in line for line in rendered)
+
+
+def test_transcript_reader_caches_frozen_body_by_width_and_mode(monkeypatch) -> None:
+    import loushang.harnesstui.conversation.reader as reader_module
+
+    calls = 0
+    original = reader_module.render_transcript_records
+
+    def counted_render(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(reader_module, "render_transcript_records", counted_render)
+    reader = TranscriptReaderSurface(
+        _Source((AssistantMessageRecord("\n".join(f"line {i}" for i in range(50))),))
+    )
+
+    _render_text(reader, width=80, height=12)
+    _render_text(reader, width=80, height=12)
+    assert calls == 1
+
+    reader.handle_input(InputEvent(kind="key", key="d"))
+    _render_text(reader, width=80, height=12)
+    _render_text(reader, width=80, height=12)
+    assert calls == 2
+
+    _render_text(reader, width=72, height=12)
+    assert calls == 3
 
 
 def test_transcript_reader_strictly_consumes_unrecognized_input() -> None:
@@ -233,7 +389,9 @@ def test_transcript_reader_title_shows_current_render_mode() -> None:
     assert _render_text(reader, width=80, height=6)[0] == "Transcript window · detail"
 
     reader.handle_input(InputEvent(kind="key", key="r"))
-    assert _render_text(reader, width=80, height=6)[0] == "Transcript window · raw+detail"
+    assert (
+        _render_text(reader, width=80, height=6)[0] == "Transcript window · raw+detail"
+    )
 
     reader.handle_input(InputEvent(kind="key", key="d"))
     assert _render_text(reader, width=80, height=6)[0] == "Transcript window · raw"
@@ -348,7 +506,9 @@ def test_transcript_reader_search_finds_matches_and_navigates_without_closing() 
 
 
 def test_transcript_reader_search_highlights_matches_without_changing_text() -> None:
-    reader = TranscriptReaderSurface(_Source((AssistantMessageRecord("alpha beta beta"),)))
+    reader = TranscriptReaderSurface(
+        _Source((AssistantMessageRecord("alpha beta beta"),))
+    )
 
     reader.handle_input(InputEvent(kind="text", text="/"))
     reader.handle_input(InputEvent(kind="text", text="beta"))
@@ -357,7 +517,9 @@ def test_transcript_reader_search_highlights_matches_without_changing_text() -> 
     raw = _render_raw(reader, width=80, height=7)
     stripped = tuple(strip_control_sequences(line) for line in raw)
     match_line = next(
-        line for line in raw if strip_control_sequences(line).endswith("alpha beta beta")
+        line
+        for line in raw
+        if strip_control_sequences(line).endswith("alpha beta beta")
     )
 
     assert "\x1b[" in match_line

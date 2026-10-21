@@ -1,0 +1,625 @@
+"""Context accounting for the optional Agent transcript profile.
+
+This module derives context-budget observations from stable Agent messages and
+transcript compaction checkpoints. Generic estimates and budget arithmetic
+remain in :mod:`loushang.harness.context`.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Literal
+
+from loushang.agent.types import AgentMessage
+from loushang.ai.types import AssistantMessage, ToolResultMessage, UserMessage
+from loushang.harness.context.budget import calculate_compaction_budget
+from loushang.harness.context.usage import ContextUsageEstimate
+from loushang.harness.conversation import ConversationRecord
+from loushang.harness.transcript.kinds import (
+    AGENT_MESSAGE_KIND,
+    CONTEXT_COMPACTION_CHECKPOINT_KIND,
+)
+
+ContextUsageSource = Literal[
+    "assistant_usage",
+    "provider_anchor",
+    "estimated_from_last_usage",
+    "estimated",
+    "unknown",
+]
+ContextUsageAuthority = Literal["provider_usage", "local_estimator", "unknown"]
+ContextUsageAccuracy = Literal["projected", "estimated", "unknown"]
+CONTEXT_MESSAGE_ESTIMATOR_ID = "harness.message_chars.v1"
+STRUCTURAL_ENVELOPE_FINGERPRINT_ID = "harness.logical-envelope.v1"
+StructuralEnvelopeStatus = Literal[
+    "logical_match", "logical_mismatch", "unavailable"
+]
+
+
+@dataclass(frozen=True)
+class ContextUsageSnapshot:
+    """One context-budget observation over an Agent transcript branch."""
+
+    tokens: int | None
+    context_window: int | None
+    reserve_tokens: int
+    compact_percent: float = 100.0
+    keep_recent_tokens: int | None = None
+    percent_threshold_tokens: int | None = None
+    reserve_threshold_tokens: int | None = None
+    threshold_tokens: int | None = None
+    threshold_reason: Literal["compact_percent", "reserve_tokens"] | None = None
+    percent: float | None = None
+    source: ContextUsageSource = "unknown"
+    last_usage_index: int | None = None
+    stale_after_compaction: bool = False
+    compactable: bool = False
+    reason: str | None = None
+    authority: ContextUsageAuthority = "unknown"
+    accuracy: ContextUsageAccuracy = "unknown"
+    transcript_revision: int | None = None
+    leaf_id: str | None = None
+    estimator_id: str | None = None
+    surface_fingerprint: str | None = None
+    provider_anchor: ProviderContextAnchor | None = None
+    structural_envelope_fingerprint: str | None = None
+    structural_envelope_status: StructuralEnvelopeStatus = "unavailable"
+
+
+@dataclass(frozen=True)
+class ReplayContextSurfaceMeasurement:
+    """Deterministic local price of an already-resolved replay surface."""
+
+    tokens: int
+    message_count: int
+    surface_fingerprint: str
+    estimator_id: str = CONTEXT_MESSAGE_ESTIMATOR_ID
+
+
+@dataclass(frozen=True)
+class ProviderContextAnchor:
+    """Provider prompt pressure bound to one reconstructed prepared input."""
+
+    invocation_id: str
+    attempt: int
+    model_input_snapshot_id: str
+    provider_prompt_tokens: int
+    sampled_prepared_payload_hash: str
+    sampled_surface_tokens: int
+    sampled_surface_fingerprint: str
+    source_revision: int
+    commit_revision: int
+    provider_id: str
+    endpoint_id: str
+    api_id: str
+    model_id: str
+    sampled_structural_envelope_fingerprint: str | None = None
+    structural_envelope_fingerprint_id: str = STRUCTURAL_ENVELOPE_FINGERPRINT_ID
+    estimator_id: str = CONTEXT_MESSAGE_ESTIMATOR_ID
+
+
+def measure_structural_envelope_fingerprint(
+    *,
+    system_prompt: object,
+    tools: object,
+    request_options: object,
+    provider_id: str,
+    endpoint_id: str,
+    api_id: str,
+    model_id: str,
+) -> str:
+    """Identify non-replay logical input that can alter prompt pressure."""
+
+    canonical = json.dumps(
+        {
+            "api_id": api_id,
+            "endpoint_id": endpoint_id,
+            "fingerprint_id": STRUCTURAL_ENVELOPE_FINGERPRINT_ID,
+            "model_id": model_id,
+            "provider_id": provider_id,
+            "request_options": request_options,
+            "system_prompt": system_prompt,
+            "tools": tools,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def project_context_from_provider_anchor(
+    snapshot: ContextUsageSnapshot,
+    anchor: ProviderContextAnchor,
+    current_surface: ReplayContextSurfaceMeasurement | None,
+    *,
+    structural_envelope_fingerprint: str | None,
+) -> ContextUsageSnapshot:
+    """Project current prompt pressure from a compatible provider observation.
+
+    This projection is intentionally display-only until the prepared request's
+    non-message envelope also has a stable identity.  It must therefore never
+    authorize automatic compaction.
+    """
+
+    envelope_status: StructuralEnvelopeStatus = "unavailable"
+    if structural_envelope_fingerprint is not None:
+        envelope_status = (
+            "logical_match"
+            if structural_envelope_fingerprint
+            == anchor.sampled_structural_envelope_fingerprint
+            else "logical_mismatch"
+        )
+    if (
+        current_surface is None
+        or anchor.estimator_id != current_surface.estimator_id
+        or anchor.structural_envelope_fingerprint_id
+        != STRUCTURAL_ENVELOPE_FINGERPRINT_ID
+        or envelope_status != "logical_match"
+    ):
+        return replace(
+            snapshot,
+            provider_anchor=anchor,
+            structural_envelope_fingerprint=structural_envelope_fingerprint,
+            structural_envelope_status=envelope_status,
+        )
+    tokens = max(
+        0,
+        anchor.provider_prompt_tokens
+        + current_surface.tokens
+        - anchor.sampled_surface_tokens,
+    )
+    percent = (
+        (tokens / snapshot.context_window) * 100
+        if snapshot.context_window is not None
+        else None
+    )
+    return replace(
+        snapshot,
+        tokens=tokens,
+        percent=percent,
+        source="provider_anchor",
+        last_usage_index=None,
+        stale_after_compaction=snapshot.stale_after_compaction,
+        compactable=False,
+        reason="provider_anchor_display_only",
+        authority="provider_usage",
+        accuracy="projected",
+        estimator_id=current_surface.estimator_id,
+        surface_fingerprint=current_surface.surface_fingerprint,
+        provider_anchor=anchor,
+        structural_envelope_fingerprint=structural_envelope_fingerprint,
+        structural_envelope_status="logical_match",
+    )
+
+
+def calculate_context_tokens(usage: object) -> int:
+    """Extract total tokens from stable AI usage values or their JSON form."""
+
+    total_tokens = _usage_value(usage, "totalTokens", "total_tokens")
+    if isinstance(total_tokens, int) and total_tokens > 0:
+        return total_tokens
+    return sum(
+        _integer_usage_value(_usage_value(usage, *keys))
+        for keys in (
+            ("input",),
+            ("output",),
+            ("cacheRead", "cache_read"),
+            ("cacheWrite", "cache_write"),
+        )
+    )
+
+
+def estimate_context_tokens(messages: Sequence[AgentMessage]) -> ContextUsageEstimate:
+    """Estimate current context using the latest completed assistant usage."""
+
+    sequence = list(messages)
+    last_usage = _last_assistant_usage_info(sequence)
+    if last_usage is None:
+        estimated = sum(estimate_message_tokens(message) for message in sequence)
+        return ContextUsageEstimate(
+            tokens=estimated,
+            usage_tokens=0,
+            trailing_tokens=estimated,
+            last_usage_index=None,
+        )
+
+    usage, usage_index = last_usage
+    usage_tokens = calculate_context_tokens(usage)
+    trailing_tokens = sum(
+        estimate_message_tokens(message) for message in sequence[usage_index + 1 :]
+    )
+    return ContextUsageEstimate(
+        tokens=usage_tokens + trailing_tokens,
+        usage_tokens=usage_tokens,
+        trailing_tokens=trailing_tokens,
+        last_usage_index=usage_index,
+    )
+
+
+def measure_replay_context_surface(
+    messages: Sequence[AgentMessage],
+) -> ReplayContextSurfaceMeasurement:
+    """Price the authoritative replay result without choosing its membership."""
+
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    tokens = 0
+    for index, message in enumerate(messages):
+        if index:
+            digest.update(b",")
+        digest.update(
+            json.dumps(
+                _replay_message_projection(message),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        tokens += estimate_message_tokens(message)
+    digest.update(b"]")
+    return ReplayContextSurfaceMeasurement(
+        tokens=tokens,
+        message_count=len(messages),
+        surface_fingerprint="sha256:" + digest.hexdigest(),
+    )
+
+
+def current_context_usage(
+    messages: Sequence[AgentMessage],
+    branch_entries: Sequence[object],
+    model: object | None,
+) -> tuple[int | None, int | None, float | None]:
+    snapshot = build_context_usage_snapshot(
+        messages, branch_entries, model, reserve_tokens=0
+    )
+    return snapshot.tokens, snapshot.context_window, snapshot.percent
+
+
+def build_context_usage_snapshot(
+    messages: Sequence[AgentMessage],
+    branch_entries: Sequence[object],
+    model: object | None,
+    *,
+    reserve_tokens: int,
+    compact_percent: float = 100.0,
+    keep_recent_tokens: int | None = None,
+    transcript_revision: int | None = None,
+    leaf_id: str | None = None,
+    include_surface_fingerprint: bool = True,
+) -> ContextUsageSnapshot:
+    # A threshold-only check needs the replay token count after compaction,
+    # but never consumes the content fingerprint. Avoid serializing the whole
+    # history when its caller explicitly opts out of that display metadata.
+    replay_surface = (
+        measure_replay_context_surface(messages)
+        if include_surface_fingerprint
+        else None
+    )
+    surface_fingerprint = (
+        replay_surface.surface_fingerprint if replay_surface is not None else None
+    )
+    context_window = model_context_window(model)
+    if context_window is None:
+        return ContextUsageSnapshot(
+            tokens=None,
+            context_window=None,
+            reserve_tokens=reserve_tokens,
+            compact_percent=compact_percent,
+            keep_recent_tokens=keep_recent_tokens,
+            threshold_tokens=None,
+            threshold_reason=None,
+            percent=None,
+            source="unknown",
+            last_usage_index=None,
+            stale_after_compaction=False,
+            compactable=False,
+            reason="unknown_context_window",
+            transcript_revision=transcript_revision,
+            leaf_id=leaf_id,
+            surface_fingerprint=surface_fingerprint,
+        )
+
+    budget = calculate_compaction_budget(
+        context_window=context_window,
+        compact_percent=compact_percent,
+        reserve_tokens=reserve_tokens,
+    )
+    latest_compaction = latest_compaction_entry(branch_entries)
+    if latest_compaction is not None and not has_post_compaction_usage(
+        branch_entries, latest_compaction
+    ):
+        tokens = (
+            replay_surface.tokens
+            if replay_surface is not None
+            else sum(estimate_message_tokens(message) for message in messages)
+        )
+        return ContextUsageSnapshot(
+            tokens=tokens,
+            context_window=context_window,
+            reserve_tokens=reserve_tokens,
+            compact_percent=budget.compact_percent,
+            keep_recent_tokens=keep_recent_tokens,
+            percent_threshold_tokens=budget.percent_threshold_tokens,
+            reserve_threshold_tokens=budget.reserve_threshold_tokens,
+            threshold_tokens=budget.threshold_tokens,
+            threshold_reason=budget.threshold_reason,
+            percent=(tokens / context_window) * 100,
+            source="estimated",
+            last_usage_index=None,
+            stale_after_compaction=True,
+            compactable=False,
+            reason="stale_usage_after_compaction",
+            authority="local_estimator",
+            accuracy="estimated",
+            transcript_revision=transcript_revision,
+            leaf_id=leaf_id,
+            estimator_id=CONTEXT_MESSAGE_ESTIMATOR_ID,
+            surface_fingerprint=surface_fingerprint,
+        )
+
+    estimate = estimate_context_tokens(messages) if messages else None
+    tokens = estimate.tokens if estimate is not None else 0
+    last_usage_index = estimate.last_usage_index if estimate is not None else None
+    if estimate is None or last_usage_index is None:
+        source: ContextUsageSource = "estimated"
+    elif estimate.trailing_tokens > 0:
+        source = "estimated_from_last_usage"
+    else:
+        source = "assistant_usage"
+    authority: ContextUsageAuthority
+    accuracy: ContextUsageAccuracy
+    estimator_id: str | None
+    if source == "assistant_usage" and estimate is not None and estimate.usage_tokens > 0:
+        authority = "provider_usage"
+        accuracy = "projected"
+        estimator_id = None
+    elif (
+        source == "estimated_from_last_usage"
+        and estimate is not None
+        and estimate.usage_tokens > 0
+    ):
+        authority = "provider_usage"
+        accuracy = "projected"
+        estimator_id = CONTEXT_MESSAGE_ESTIMATOR_ID
+    elif source == "estimated":
+        authority = "local_estimator"
+        accuracy = "estimated"
+        estimator_id = CONTEXT_MESSAGE_ESTIMATOR_ID
+    else:
+        authority = "unknown"
+        accuracy = "unknown"
+        estimator_id = None
+    compactable = tokens > budget.threshold_tokens
+    return ContextUsageSnapshot(
+        tokens=tokens,
+        context_window=context_window,
+        reserve_tokens=reserve_tokens,
+        compact_percent=budget.compact_percent,
+        keep_recent_tokens=keep_recent_tokens,
+        percent_threshold_tokens=budget.percent_threshold_tokens,
+        reserve_threshold_tokens=budget.reserve_threshold_tokens,
+        threshold_tokens=budget.threshold_tokens,
+        threshold_reason=budget.threshold_reason,
+        percent=(tokens / context_window) * 100,
+        source=source,
+        last_usage_index=last_usage_index,
+        stale_after_compaction=False,
+        compactable=compactable,
+        reason="threshold" if compactable else None,
+        authority=authority,
+        accuracy=accuracy,
+        transcript_revision=transcript_revision,
+        leaf_id=leaf_id,
+        estimator_id=estimator_id,
+        surface_fingerprint=surface_fingerprint,
+    )
+
+
+def model_context_window(model: object | None) -> int | None:
+    capabilities: object | None = getattr(model, "capabilities", None)
+    raw_context_window: object | None = getattr(capabilities, "context_window", None)
+    if raw_context_window is None:
+        raw_context_window = getattr(model, "context_window", None)
+    return _positive_int(raw_context_window)
+
+
+def latest_compaction_entry(
+    entries: Sequence[object],
+) -> ConversationRecord[object] | None:
+    for entry in reversed(entries):
+        if (
+            isinstance(entry, ConversationRecord)
+            and entry.kind == CONTEXT_COMPACTION_CHECKPOINT_KIND
+        ):
+            return entry
+    return None
+
+
+def has_post_compaction_usage(
+    entries: Sequence[object], compaction: ConversationRecord[object]
+) -> bool:
+    try:
+        compaction_index = list(entries).index(compaction)
+    except ValueError:
+        return False
+    for entry in reversed(entries[compaction_index + 1 :]):
+        if (
+            not isinstance(entry, ConversationRecord)
+            or entry.kind != AGENT_MESSAGE_KIND
+        ):
+            continue
+        message = entry.payload
+        if not isinstance(message, AssistantMessage):
+            continue
+        if message.stop_reason in {"aborted", "error"}:
+            return False
+        return calculate_context_tokens(message.usage) > 0
+    return False
+
+
+def estimate_message_tokens(message: AgentMessage) -> int:
+    chars = 0
+    if isinstance(message, UserMessage):
+        if isinstance(message.content, str):
+            chars = len(message.content)
+        else:
+            for block in message.content:
+                if getattr(block, "type", None) == "text":
+                    chars += len(str(getattr(block, "text", "")))
+                elif getattr(block, "type", None) == "image":
+                    chars += 4_800
+        return (chars + 3) // 4
+    if isinstance(message, AssistantMessage):
+        for assistant_block in message.content:
+            block_type = getattr(assistant_block, "type", None)
+            if block_type == "text":
+                chars += len(str(getattr(assistant_block, "text", "")))
+            elif block_type == "thinking":
+                chars += len(str(getattr(assistant_block, "thinking", "")))
+            elif block_type == "toolCall":
+                chars += len(str(getattr(assistant_block, "name", ""))) + len(
+                    str(getattr(assistant_block, "arguments", ""))
+                )
+            elif block_type == "image":
+                chars += 4_800
+        return (chars + 3) // 4
+    if isinstance(message, ToolResultMessage):
+        for block in message.content:
+            if getattr(block, "type", None) == "text":
+                chars += len(str(getattr(block, "text", "")))
+            elif getattr(block, "type", None) == "image":
+                chars += 4_800
+        return (chars + 3) // 4
+    return 0
+
+
+def _replay_message_projection(message: AgentMessage) -> object:
+    if isinstance(message, UserMessage):
+        content = message.content
+        projected_content: object
+        if isinstance(content, str):
+            projected_content = content
+        else:
+            projected_content = [_replay_block_projection(block) for block in content]
+        return {"role": "user", "content": projected_content}
+    if isinstance(message, AssistantMessage):
+        return {
+            "role": "assistant",
+            "content": [
+                _replay_block_projection(block) for block in message.content
+            ],
+        }
+    if isinstance(message, ToolResultMessage):
+        return {
+            "role": "toolResult",
+            "toolCallId": message.tool_call_id,
+            "toolName": message.tool_name,
+            "content": [
+                _replay_block_projection(block) for block in message.content
+            ],
+            "isError": message.is_error,
+        }
+    return {"role": getattr(message, "role", "unknown")}
+
+
+def _replay_block_projection(block: object) -> object:
+    block_type = getattr(block, "type", None)
+    if block_type == "text":
+        return {"type": "text", "text": str(getattr(block, "text", ""))}
+    if block_type == "thinking":
+        return {
+            "type": "thinking",
+            "thinking": str(getattr(block, "thinking", "")),
+        }
+    if block_type == "toolCall":
+        return {
+            "type": "toolCall",
+            "name": str(getattr(block, "name", "")),
+            "arguments": getattr(block, "arguments", None),
+        }
+    if block_type == "image":
+        return {"type": "image"}
+    return {"type": str(block_type)}
+
+
+def _usage_value(usage: object, *keys: str) -> object | None:
+    if isinstance(usage, Mapping):
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                return value
+        return None
+    for key in keys:
+        if hasattr(usage, key):
+            value = getattr(usage, key)
+            if value is not None:
+                return value
+    return None
+
+
+def _integer_usage_value(value: object | None) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str):
+        try:
+            return int(value)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _positive_int(value: object | None) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float | str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _last_assistant_usage_info(
+    messages: Sequence[AgentMessage],
+) -> tuple[object, int] | None:
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, AssistantMessage) and message.stop_reason not in (
+            "aborted",
+            "error",
+        ):
+            return message.usage, index
+    return None
+
+
+__all__ = [
+    "ContextUsageSnapshot",
+    "ContextUsageAccuracy",
+    "ContextUsageAuthority",
+    "ContextUsageSource",
+    "CONTEXT_MESSAGE_ESTIMATOR_ID",
+    "STRUCTURAL_ENVELOPE_FINGERPRINT_ID",
+    "ReplayContextSurfaceMeasurement",
+    "ProviderContextAnchor",
+    "StructuralEnvelopeStatus",
+    "measure_structural_envelope_fingerprint",
+    "project_context_from_provider_anchor",
+    "build_context_usage_snapshot",
+    "calculate_context_tokens",
+    "current_context_usage",
+    "estimate_context_tokens",
+    "estimate_message_tokens",
+    "has_post_compaction_usage",
+    "latest_compaction_entry",
+    "model_context_window",
+    "measure_replay_context_surface",
+]

@@ -4,6 +4,11 @@ import asyncio
 from dataclasses import dataclass
 
 from loushang.harness.session import SessionFacade, SessionFacadePorts
+from loushang.harness.session.facade import SessionModelPort as FacadeModelPort
+from loushang.harness.session.facade_optional import (
+    SessionFacadeOptionalOperations,
+    SessionModelPort,
+)
 from loushang.harness.workspace.exec import ExecOutputChunk
 
 
@@ -249,7 +254,9 @@ class _Diagnostics:
 
 
 class _Packages:
-    def get_packages(self, *, catalog_path: str | None = None) -> list[dict[str, object]]:
+    def get_packages(
+        self, *, catalog_path: str | None = None
+    ) -> list[dict[str, object]]:
         return [{"catalog_path": catalog_path}]
 
     async def materialize_package(self, source: str) -> dict[str, object]:
@@ -276,6 +283,15 @@ class _Packages:
         self, source: str, *, scope: str = "project"
     ) -> dict[str, object]:
         return {"operation": "uninstall", "source": source, "scope": scope}
+
+    async def uninstall_package_async(
+        self, source: str, *, scope: str = "project"
+    ) -> dict[str, object]:
+        return {
+            "operation": "uninstall_async",
+            "source": source,
+            "scope": scope,
+        }
 
 
 def _facade():
@@ -455,14 +471,27 @@ def test_session_facade_forwards_optional_diagnostics_and_package_ports() -> Non
         }
         assert await facade.update_packages() == [{"operation": "update_all"}]
         assert await facade.check_package_updates() == [{"operation": "check_updates"}]
+        assert await facade.uninstall_package_async("git:one", scope="global") == {
+            "operation": "uninstall_async",
+            "source": "git:one",
+            "scope": "global",
+        }
 
     asyncio.run(package_operations())
-    assert facade.remove_package("git:one") == {
-        "operation": "remove",
-        "source": "git:one",
-    }
     assert facade.uninstall_package("git:one", scope="global") == {
         "operation": "uninstall",
         "source": "git:one",
         "scope": "global",
     }
+    assert facade.remove_package("git:one") == {
+        "operation": "remove",
+        "source": "git:one",
+    }
+
+
+def test_session_facade_keeps_optional_capability_compatibility_exports() -> None:
+    assert FacadeModelPort is SessionModelPort
+    assert issubclass(SessionFacade, SessionFacadeOptionalOperations)
+    assert SessionFacade.get_model_selection is (
+        SessionFacadeOptionalOperations.get_model_selection
+    )

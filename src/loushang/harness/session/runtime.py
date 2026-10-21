@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from inspect import iscoroutine, iscoroutinefunction
 from typing import Protocol, cast
 
 from loushang.agent import AbortSignal
@@ -36,7 +37,14 @@ from loushang.harness.session.agent_event_router import (
 from loushang.harness.session.application_input import ApplicationInputRuntime
 from loushang.harness.session.prompt_controller import AgentPort, PromptController
 from loushang.harness.session.queue_controller import AgentQueuePort, QueueController
-from loushang.harness.transcript import ApplicationMessage, CommitResult
+from loushang.harness.session.request_evidence import RequestEvidenceRuntimePort
+from loushang.harness.session.turn_performance import TurnStartPerformanceRuntime
+from loushang.harness.transcript import (
+    ApplicationMessage,
+    AutoCompactionOutcome,
+    CommitResult,
+    CompactionResult,
+)
 
 AppendMessage = Callable[[object], Awaitable[str]]
 CommitApplicationMessage = Callable[[ApplicationMessage], Awaitable[CommitResult]]
@@ -48,10 +56,12 @@ PreflightUserInput = Callable[..., Awaitable[object]]
 SynchronousPreflightUserInput = Callable[[str], object]
 RejectQueuedExtensionCommand = Callable[[str], None]
 BeforeAgentStartOptions = Callable[[], dict[str, object]]
-PrePromptCompaction = Callable[[], Awaitable[object | None]]
+PrePromptCompaction = Callable[[], Awaitable[AutoCompactionOutcome]]
 ToolExecutionErrorRecorder = Callable[[AgentEvent], None]
 AssistantResponseErrorRecorder = Callable[[AssistantMessage], None]
-AutoCompactionChecker = Callable[[AssistantMessage], Awaitable[object | None]]
+AutoCompactionChecker = Callable[
+    [AssistantMessage], Awaitable[AutoCompactionOutcome]
+]
 RuntimeEventListener = Callable[[RuntimeEvent[object]], Awaitable[None] | None]
 AgentEventListener = Callable[[AgentEvent, AbortSignal], Awaitable[None] | None]
 
@@ -59,7 +69,8 @@ AgentEventListener = Callable[[AgentEvent, AbortSignal], Awaitable[None] | None]
 class SessionAgentPort(Protocol):
     """Agent-loop capabilities required by the shared session runtime."""
 
-    is_streaming: bool
+    @property
+    def is_streaming(self) -> bool: ...
 
     def subscribe(self, listener: AgentEventListener) -> Callable[[], None]: ...
 
@@ -73,7 +84,11 @@ class SessionAgentPort(Protocol):
         images: list[ImagePart] | None = None,
     ) -> None: ...
 
-    async def continue_run(self) -> None: ...
+    async def continue_run(
+        self,
+        *,
+        model_call_purpose: str = "continuation",
+    ) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -101,6 +116,7 @@ class TurnPolicyPort:
     before_agent_start_system_prompt_options: BeforeAgentStartOptions
     sync_extension_diagnostics: ExtensionDiagnosticsSync
     compact_before_prompt_async: PrePromptCompaction | None = None
+    turn_performance: TurnStartPerformanceRuntime | None = None
 
 
 @dataclass(frozen=True)
@@ -129,9 +145,11 @@ class SessionRuntime:
     transcript: TranscriptRuntimePort
     turn_policy: TurnPolicyPort
     after_turn_policy: AfterTurnPolicyPort
+    request_evidence: RequestEvidenceRuntimePort | None = None
 
     def __post_init__(self) -> None:
         self._closed = False
+        self._committed_input_recovery_suppressed = False
         self._event_bus: OrderedEventBus[RuntimeEvent[object]] = OrderedEventBus(
             async_listener_error=(
                 "Async runtime event listeners require a running event loop."
@@ -151,6 +169,7 @@ class SessionRuntime:
             preflight_user_input=self.turn_policy.preflight_user_input,
             reject_extension_command=self.turn_policy.reject_queued_extension_command,
             emit_queue_update=self._emit_queue_update,
+            request_evidence=self.request_evidence,
         )
         self._prompt_controller = PromptController(
             agent=cast(AgentPort, self.agent),
@@ -166,8 +185,14 @@ class SessionRuntime:
                 self.turn_policy.before_agent_start_system_prompt_options
             ),
             sync_extension_diagnostics=self.turn_policy.sync_extension_diagnostics,
-            compact_before_prompt_async=self.turn_policy.compact_before_prompt_async,
+            compact_before_prompt_async=(
+                self._compact_before_prompt
+                if self.turn_policy.compact_before_prompt_async is not None
+                else None
+            ),
             run_prompt=self.run_agent_prompt,
+            turn_performance=self.turn_policy.turn_performance,
+            request_evidence=self.request_evidence,
         )
         self._application_inputs = ApplicationInputRuntime(
             commit_application_message=self.transcript.commit_application_message,
@@ -188,8 +213,19 @@ class SessionRuntime:
             record_assistant_response_error=(
                 self.after_turn_policy.record_assistant_response_error
             ),
-            check_auto_compaction=self.after_turn_policy.check_auto_compaction,
+            check_auto_compaction=self.check_auto_compaction,
+            allow_automatic_recovery=lambda: not self._committed_input_recovery_suppressed,
+            schedule_continue_run=lambda: self.schedule_continue_run(
+                model_call_purpose="retry"
+            ),
             consume_queued_message=self._queue_controller.mark_message_consumed,
+            request_evidence=self.request_evidence,
+            complete_queued_message=(
+                self._queue_controller.complete_message_evidence
+            ),
+            discard_in_flight_messages=(
+                self._queue_controller.discard_in_flight_evidence
+            ),
         )
         self.transcript.set_commit_observer(self._schedule_transcript_commit)
         self._unsubscribe_agent = self.agent.subscribe(self.handle_agent_event)
@@ -249,17 +285,76 @@ class SessionRuntime:
     async def continue_run(self) -> None:
         await self._host_runtime.run_after_idle(self.agent.continue_run)
 
-    def schedule_continue_run(self) -> asyncio.Task[None]:
+    async def run_committed_input(self, *, prepare_current_input: Callable[[], None]) -> None:
+        """Run an owned committed input without submitting another user message.
+
+        The Product checks and installs the current input inside the original
+        host claim. This explicit run suppresses automatic retry/compaction
+        recovery; their normal policy is restored on exit.
+        """
+
+        if not callable(prepare_current_input) or iscoroutinefunction(prepare_current_input):
+            raise TypeError("committed input preparation must be synchronous")
+
+        async def operation() -> None:
+            result = cast(Callable[[], object], prepare_current_input)()
+            if result is not None:
+                if iscoroutine(result):
+                    result.close()
+                raise TypeError("committed input preparation must return None")
+            self._committed_input_recovery_suppressed = True
+            try:
+                await self.agent.continue_run(model_call_purpose="main")
+            finally:
+                self._committed_input_recovery_suppressed = False
+
+        await self._host_runtime.run(operation)
+
+    def schedule_continue_run(
+        self,
+        *,
+        model_call_purpose: str = "continuation",
+    ) -> asyncio.Task[None]:
         return self._host_runtime.defer_run(
-            self.agent.continue_run,
+            lambda: self.agent.continue_run(
+                model_call_purpose=model_call_purpose
+            ),
             key="agent-continue",
         )
+
+    async def check_auto_compaction(
+        self,
+        assistant_message: AssistantMessage,
+    ) -> CompactionResult | None:
+        outcome = await self.after_turn_policy.check_auto_compaction(
+            assistant_message
+        )
+        return self._accept_auto_compaction_outcome(outcome)
+
+    async def _compact_before_prompt(self) -> CompactionResult | None:
+        compact = self.turn_policy.compact_before_prompt_async
+        if compact is None:
+            return None
+        return self._accept_auto_compaction_outcome(await compact())
+
+    def _accept_auto_compaction_outcome(
+        self,
+        outcome: AutoCompactionOutcome,
+    ) -> CompactionResult | None:
+        if outcome.should_continue:
+            self.schedule_continue_run()
+        return outcome.result
 
     def abort(self) -> bool:
         return self._host_runtime.abort()
 
     async def wait_for_idle(self) -> None:
         await self._host_runtime.wait_for_idle()
+
+    async def settle_execution(self, *, interrupted: bool = False) -> None:
+        """Drain retained Agent continuations and their ordered projections."""
+        await self._host_runtime.settle_runs(cancel_pending=interrupted)
+        await self._event_bus.drain()
 
     async def run_agent_prompt(
         self,
@@ -279,6 +374,8 @@ class SessionRuntime:
     async def handle_agent_event(
         self, event: AgentEvent, signal: AbortSignal
     ) -> None:
+        if self.turn_policy.turn_performance is not None:
+            self.turn_policy.turn_performance.observe_agent_event(event)
         await self._agent_event_router.handle(event, signal)
 
     async def dispatch_event(
@@ -325,6 +422,8 @@ class SessionRuntime:
         self._closed = True
         self._unsubscribe_agent()
         self.transcript.set_commit_observer(None)
+        if self.request_evidence is not None:
+            self.request_evidence.close()
         self._event_bus.clear()
 
     async def _project_direct_application_message(

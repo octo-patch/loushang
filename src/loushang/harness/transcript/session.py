@@ -9,11 +9,13 @@ session directories, summaries, and lifecycle policy.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from loushang.agent.types import AgentMessage
 from loushang.ai.types import AssistantMessage, ToolResultMessage, UserMessage
+from loushang.foundation.json import JSONValue, require_json_value
 from loushang.harness.conversation import (
     BranchDelta,
     CommandExecutionRecord,
@@ -21,9 +23,24 @@ from loushang.harness.conversation import (
 )
 from loushang.harness.transcript.committer import (
     CommitResult,
+    PrebuiltUserMessageLookupResult,
     TranscriptCommitter,
 )
 from loushang.harness.transcript.kinds import RECORD_ANNOTATION_PATCH_KIND
+from loushang.harness.transcript.model_call import (
+    ModelCallInvocationProjection,
+    project_model_call_invocations,
+)
+from loushang.harness.transcript.model_input import (
+    ModelInputCommitContext as _ModelInputCommitContext,
+)
+from loushang.harness.transcript.model_input import (
+    ModelInputRuntimeReferences,
+    ModelInputTranscriptCommitter,
+    RebuiltModelInput,
+    rebuild_model_input,
+)
+from loushang.harness.transcript.model_input_blobs import SessionModelInputBlobCodec
 from loushang.harness.transcript.types import (
     AgentTranscriptContext,
     AgentTranscriptRecord,
@@ -40,7 +57,6 @@ from loushang.harness.transcript.unit_of_work import (
     AgentTranscriptCommit,
     AgentTranscriptUnitOfWork,
 )
-from loushang.protocol import require_json_value
 
 CommitObserver = Callable[[CommitResult], None]
 ApplicationMessageIdFactory = Callable[[], str]
@@ -117,10 +133,24 @@ class AgentTranscriptSession:
     def get_entries(self) -> list[AgentTranscriptRecord]:
         return list(self.entries)
 
+    def get_active_entries(self) -> list[AgentTranscriptRecord]:
+        """Return the selected transcript path in commit order."""
+
+        return list(self._transcript.active_path())
+
+    def get_context_message_bindings(
+        self,
+        records: Sequence[AgentTranscriptRecord] | None = None,
+    ) -> tuple[tuple[str, AgentMessage], ...]:
+        """Bind every projected context message to its exact source record."""
+
+        projection = self._transcript.replay_projection(records)
+        return tuple(zip(projection.item_record_ids, projection.items, strict=True))
+
     def get_children(self, parent_id: str) -> list[AgentTranscriptRecord]:
         return list(self._transcript.children(parent_id))
 
-    def get_tree(self) -> list[object]:
+    def get_tree(self) -> Sequence[object]:
         """Return the current record tree for product-neutral inspection."""
 
         return list(self._transcript.tree())
@@ -160,6 +190,7 @@ class AgentTranscriptSession:
         summary: str,
         details: object | None = None,
         from_hook: bool | None = None,
+        model_input_snapshot_ids: tuple[str, ...] = (),
     ) -> str:
         if branch_from_id is not None and self._transcript.get(branch_from_id) is None:
             raise ValueError(f"Entry {branch_from_id} not found")
@@ -176,6 +207,7 @@ class AgentTranscriptSession:
                             name="branch_summary.details",
                         ),
                         from_hook=from_hook,
+                        model_input_snapshot_ids=model_input_snapshot_ids,
                     )
                 )
             )
@@ -189,18 +221,56 @@ class AgentTranscriptSession:
             self._record_label_entry(entry)
         return self._complete_commit(commit)
 
-    async def append_message(self, message: object) -> str:
+    async def append_message(
+        self,
+        message: object,
+        *,
+        metadata: Mapping[str, JSONValue] | None = None,
+    ) -> str:
         if isinstance(message, ApplicationMessage):
+            if metadata:
+                raise TypeError(
+                    "application messages do not accept Agent message metadata"
+                )
             return (await self.commit_application_message(message)).record_id
         if isinstance(message, CommandExecutionRecord):
+            if metadata:
+                raise TypeError("command messages do not accept Agent message metadata")
             return self._complete_commit(
                 await self._transcript.append_command_execution(message)
             )
         if isinstance(message, UserMessage | AssistantMessage | ToolResultMessage):
             return self._complete_commit(
-                await self._transcript.append_agent_message(message)
+                await self._transcript.append_agent_message(message, metadata=metadata)
             )
         raise TypeError(f"Unsupported transcript message: {type(message)!r}")
+
+    async def lookup_prebuilt_user_message(
+        self, record: AgentTranscriptRecord,
+    ) -> PrebuiltUserMessageLookupResult:
+        """Observe a fixed-ID input without changing transcript or observers."""
+
+        return await self._committer.lookup_prebuilt_user_message(record)
+
+    async def commit_prebuilt_user_message(
+        self, record: AgentTranscriptRecord,
+    ) -> CommitResult:
+        """Commit or reconcile one fixed-ID user input through the message owner."""
+
+        result = await self._committer.commit_prebuilt_user_message(record)
+        if result.disposition == "committed":
+            self._notify_commit(result)
+        return result
+
+    async def commit_prebuilt_extension_data(
+        self, record: AgentTranscriptRecord,
+    ) -> CommitResult:
+        """Commit or reconcile one fixed-ID extension fact through Transcript."""
+
+        result = await self._committer.commit_prebuilt_extension_data(record)
+        if result.disposition == "committed":
+            self._notify_commit(result)
+        return result
 
     async def commit_application_message(
         self,
@@ -223,14 +293,14 @@ class AgentTranscriptSession:
         provider: str,
         model_id: str,
         *,
-        endpoint_id: str | None = None,
+        endpoint_id: str,
     ) -> str:
         return self._complete_commit(
             await self._transcript.append_model_selection(
                 ModelSelectionSnapshot(
                     provider=provider,
-                    model_id=model_id,
                     endpoint_id=endpoint_id,
+                    model_id=model_id,
                 )
             )
         )
@@ -242,6 +312,7 @@ class AgentTranscriptSession:
         tokens_before: int,
         details: object | None = None,
         from_hook: bool | None = None,
+        model_input_snapshot_ids: tuple[str, ...] = (),
     ) -> str:
         return self._complete_commit(
             await self._transcript.append_compaction_checkpoint(
@@ -251,6 +322,7 @@ class AgentTranscriptSession:
                     tokens_before=tokens_before,
                     details=require_json_value(details, name="compaction.details"),
                     from_hook=from_hook,
+                    model_input_snapshot_ids=model_input_snapshot_ids,
                 )
             )
         )
@@ -284,9 +356,7 @@ class AgentTranscriptSession:
             display=display,
             timestamp=self._clock().timestamp(),
         )
-        return self._complete_application_commit(
-            await self._committer.commit_application_message(message)
-        )
+        return await self.append_message(message)
 
     async def append_label(self, target_id: str, label: str | None) -> str:
         if self._transcript.get(target_id) is None:
@@ -316,6 +386,58 @@ class AgentTranscriptSession:
 
     def build_context(self) -> AgentTranscriptContext:
         return self._transcript.replay_context()
+
+    def create_model_input_committer(
+        self,
+        *,
+        purpose: str,
+        logical_input: dict[str, object],
+        runtime_references: ModelInputRuntimeReferences,
+    ) -> ModelInputTranscriptCommitter:
+        """Capture one fresh Model Input boundary without exposing the Store."""
+
+        source_leaf_id = self._transcript.leaf_id
+        if source_leaf_id is None:
+            raise RuntimeError(
+                "Model Input requires committed logical facts in the transcript"
+            )
+        return ModelInputTranscriptCommitter(
+            transcript=self._transcript,
+            context=_ModelInputCommitContext(
+                purpose=purpose,
+                source_leaf_id=source_leaf_id,
+                source_revision=self._transcript.revision,
+                logical_input=logical_input,
+            ),
+            runtime_references=runtime_references,
+            binary_codec=self._model_input_binary_codec(active_only=True),
+        )
+
+    def rebuild_model_input(self, snapshot_id: str) -> RebuiltModelInput:
+        """Reconstruct one committed request through the Session boundary."""
+
+        return rebuild_model_input(
+            self._transcript,
+            snapshot_id,
+            binary_codec=self._model_input_binary_codec(active_only=False),
+        )
+
+    def _model_input_binary_codec(
+        self,
+        *,
+        active_only: bool,
+    ) -> SessionModelInputBlobCodec | None:
+        """Return a Product storage-edge codec when this Session persists blobs."""
+
+        del active_only
+        return None
+
+    def get_model_call_invocations(
+        self,
+    ) -> tuple[ModelCallInvocationProjection, ...]:
+        """Project prepared attempts and known outcomes on the selected path."""
+
+        return project_model_call_invocations(self._transcript.active_path())
 
     def _complete_commit(self, commit: AgentTranscriptCommit) -> str:
         result = CommitResult(

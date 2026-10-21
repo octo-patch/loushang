@@ -27,11 +27,13 @@ class StatusProvider:
         statusline_settings: StatusLineSettings | None = None,
         on_statusline_settings_changed: Callable[[StatusLineSettings], None]
         | None = None,
+        session_id: Callable[[], str | None] | None = None,
     ) -> None:
         self._model_label = model_label
         self._cwd = cwd
         self._branch = branch
         self._session_label = session_label
+        self._session_id = session_id or (lambda: None)
         self._thinking_level = thinking_level
         self._running = running
         self._permission_profile = permission_profile or (lambda: None)
@@ -63,6 +65,7 @@ class StatusProvider:
             cwd=self._cwd,
             branch=self._branch,
             session_label=self._session_label(),
+            session_id=self._session_id(),
             thinking_level=self._thinking_level(),
             running=self._running(),
             statusline_visible=self.is_visible(),
@@ -99,7 +102,11 @@ class StatusProvider:
                 replace(self._statusline_settings, **{bool_field: enabled})  # type: ignore[arg-type]
             )
             return f"Status line {bool_field.replace('_', ' ')}: {normalized}"
-        if item_id in {"statusline.field.queue", "statusline.field.message"}:
+        if item_id in {
+            "statusline.field.queue",
+            "statusline.field.message",
+            "statusline.field.context",
+        }:
             field_name = item_id.rsplit(".", 1)[-1]
             if normalized not in {"auto", "true", "false"}:
                 return f"Invalid status line {field_name} value."

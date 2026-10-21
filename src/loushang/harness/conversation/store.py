@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 HeaderT = TypeVar("HeaderT")
 RecordT = TypeVar("RecordT")
+BatchRecordT = TypeVar("BatchRecordT", contravariant=True)
 
 
 def _require_text(value: object, *, name: str) -> str:
@@ -38,6 +40,12 @@ class ConversationKey:
     def __post_init__(self) -> None:
         _require_text(self.namespace, name="conversation namespace")
         _require_text(self.conversation_id, name="conversation id")
+
+
+# A namespace target grants query lifetime only, never another key's writes.
+ConversationOperationScope = Callable[
+    [ConversationKey | str], AbstractAsyncContextManager[None]
+]
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,28 @@ class ConversationLoadResult(Generic[HeaderT, RecordT]):
 class ConversationCommitResult:
     receipt: CommitReceipt
     diagnostics: tuple[ConversationSourceDiagnostic, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConversationBatchCommitResult:
+    """Receipts for one ordered, revision-contiguous append batch."""
+
+    receipts: tuple[CommitReceipt, ...]
+    diagnostics: tuple[ConversationSourceDiagnostic, ...] = ()
+
+    def __init__(
+        self,
+        receipts: Sequence[CommitReceipt],
+        diagnostics: Sequence[ConversationSourceDiagnostic] = (),
+    ) -> None:
+        durable_receipts = tuple(receipts)
+        if not durable_receipts:
+            raise ValueError("batch commit result requires at least one receipt")
+        revisions = tuple(receipt.revision for receipt in durable_receipts)
+        if revisions != tuple(range(revisions[0], revisions[0] + len(revisions))):
+            raise ValueError("batch commit receipt revisions must be contiguous")
+        object.__setattr__(self, "receipts", durable_receipts)
+        object.__setattr__(self, "diagnostics", tuple(diagnostics))
 
 
 @dataclass(frozen=True)
@@ -229,6 +259,20 @@ class ConversationStore(Protocol[HeaderT, RecordT]):
     ) -> ConversationPage: ...
 
 
+@runtime_checkable
+class ConversationBatchStore(Protocol[BatchRecordT]):
+    """Optional Store extension for one-lock, one-sync contiguous appends."""
+
+    async def append_batch(
+        self,
+        key: ConversationKey,
+        records: Sequence[BatchRecordT],
+        *,
+        expected_revision: int,
+        operation_ids: Sequence[str],
+    ) -> ConversationBatchCommitResult: ...
+
+
 @dataclass(frozen=True)
 class ConversationProviderBinding(Generic[HeaderT, RecordT]):
     """One registered Store namespace addressable by a stable provider id."""
@@ -280,6 +324,8 @@ def page_offset(cursor: str | None) -> int:
 
 __all__ = [
     "CommitReceipt",
+    "ConversationBatchCommitResult",
+    "ConversationBatchStore",
     "ConversationCommitResult",
     "ConversationHead",
     "ConversationKey",

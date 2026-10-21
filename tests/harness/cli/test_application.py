@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from io import StringIO
 from types import SimpleNamespace
 
-from loushang.channel import ProductHostLifecycle
+from loushang.harness.approval import HeadlessApprovalResolver
 from loushang.harness.cli import (
     AgentCliApplicationBinding,
     AgentCliStatePreparationPorts,
@@ -17,6 +17,7 @@ from loushang.harness.cli import (
     CliLaunchPlan,
     CliParseResult,
     CliPhaseResult,
+    ResourceToggleError,
     capture_cli_parse,
     collect_agent_cli_help_extension_flags,
     format_cli_error,
@@ -26,6 +27,8 @@ from loushang.harness.cli import (
     report_agent_resource_settings_errors,
     run_agent_cli_application,
 )
+from loushang.harness.cli.application import _settle_runtime_disposal
+from loushang.harness.host.product_host import ProductHostLifecycle
 from loushang.harness.runtime import SessionOperationResult
 from loushang.harness.tools.workspace import WorkspaceToolRuntimeSettings
 
@@ -133,6 +136,7 @@ def test_application_runtime_owns_two_pass_session_phase_order(tmp_path) -> None
             output_guard=lambda enabled: (
                 calls.append(("guard", enabled)) or _null_context()
             ),
+            dispose_runtime=lambda value: calls.append(("dispose_runtime", value)),
         )
     )
 
@@ -168,9 +172,82 @@ def test_application_runtime_owns_two_pass_session_phase_order(tmp_path) -> None
         "configure",
         "operations",
         "host",
+        ("dispose_runtime", runtime),
     ]
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == ""
+
+
+def test_application_releases_runtime_after_pre_session_exit(tmp_path) -> None:
+    runtime = object()
+    released: list[object] = []
+    application = CliApplicationRuntime(
+        CliApplicationPorts[
+            _Args,
+            str,
+            object,
+            object,
+        ](
+            parse_args=lambda *_args: CliParseResult(_Args()),
+            initialize_args=lambda _args: None,
+            launch_plan=lambda _args: CliLaunchPlan(),
+            args_cwd=lambda args: args.cwd,
+            early_operation=lambda _context: None,
+            validated_operation=lambda _context: None,
+            prepare_state=lambda _context: CliPhaseResult.continue_with("state"),
+            startup_context=lambda _context, _state: _null_context(),
+            build_runtime=lambda _context, _state: runtime,
+            runtime_operation=lambda _context: None,
+            pre_session_bootstrap=lambda _context: CliPhaseResult.exit(3),
+            resolve_session=lambda _context: (_ for _ in ()).throw(
+                AssertionError("Session resolution must not run")
+            ),
+            collect_extension_flags=lambda _session: {},
+            configure_session=lambda _context: None,
+            session_operations=lambda _context: None,
+            run_host=lambda _context: 0,
+            output_guard=lambda _enabled: _null_context(),
+            dispose_runtime=lambda value: released.append(value),
+        )
+    )
+
+    assert (
+        asyncio.run(
+            application.run(
+                (), stdin=StringIO(), stdout=StringIO(), stderr=StringIO(), cwd=tmp_path
+            )
+        )
+        == 3
+    )
+    assert released == [runtime]
+
+
+def test_cli_runtime_cleanup_settles_before_propagating_cancellation() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        finished: list[bool] = []
+
+        async def dispose(_runtime: object) -> None:
+            started.set()
+            await release.wait()
+            finished.append(True)
+
+        task = asyncio.create_task(_settle_runtime_disposal(dispose, object()))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("CLI cancellation must propagate after cleanup")
+        assert finished == [True]
+
+    asyncio.run(scenario())
 
 
 def test_application_pre_session_bootstrap_bypasses_default_resolution(
@@ -305,6 +382,14 @@ def test_application_helpers_preserve_parser_and_builder_boundaries() -> None:
         format_cli_error(FileNotFoundError(2, "missing", "/tmp/example"))
         == "missing: /tmp/example"
     )
+    coded = ResourceToggleError(
+        "plugin Installation is not migrated",
+        code="plugin_enablement_migration_required",
+    )
+    assert format_cli_error(coded) == (
+        "plugin_enablement_migration_required: "
+        "plugin Installation is not migrated"
+    )
 
 
 def test_agent_runtime_builder_receives_standard_binding_values(tmp_path) -> None:
@@ -384,7 +469,10 @@ def test_resource_settings_errors_are_reported_for_standard_operations() -> None
 
 def test_agent_application_state_preparation_binds_product_tools_and_approval(
     tmp_path,
+    monkeypatch,
 ) -> None:
+    platform_sessions = tmp_path / "user-home" / "data" / "sessions"
+    monkeypatch.setenv("LOUSHANG_HOME", str(tmp_path / "user-home"))
     calls: list[object] = []
     policy_engine = object()
     args = _ApplicationArgs()
@@ -423,11 +511,11 @@ def test_agent_application_state_preparation_binds_product_tools_and_approval(
 
     assert result.exit_code is None
     assert result.value is not None
-    assert result.value.session_dir == tmp_path / ".loushang" / "sessions"
+    assert result.value.session_dir == platform_sessions
     assert result.value.tool_registry == "registry"
     assert result.value.approval_resolver == "interactive"
     assert calls == [
-        ("pre_runtime", tmp_path / ".loushang" / "sessions"),
+        ("pre_runtime", platform_sessions),
         (
             "tools",
             WorkspaceToolRuntimeSettings(policy_engine=policy_engine),
@@ -491,6 +579,8 @@ def test_agent_application_state_preparation_resolves_tool_settings_once(
         {
             "blocked_tools": ("bash",),
             "ask_tools": (),
+            "blocked_capabilities": ("workspace.command",),
+            "ask_capabilities": (),
             "blocked_substrings": (),
             "ask_substrings": (),
             "blocked_path_substrings": (),
@@ -503,6 +593,60 @@ def test_agent_application_state_preparation_resolves_tool_settings_once(
     assert captured["approval_resolver"] == "interactive"
 
 
+def test_agent_application_state_wraps_configured_tool_approval_for_session(
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+    session_resolver = object()
+    manager = SimpleNamespace(
+        get_settings=lambda: SimpleNamespace(session_dir=None),
+        get_tool_settings=lambda: SimpleNamespace(approval_mode="allow"),
+    )
+    services = SimpleNamespace(settings_manager=manager)
+    context = CliBootstrapContext(
+        raw_argv=(),
+        args=_ApplicationArgs(),
+        launch_plan=CliLaunchPlan(),
+        project_root=tmp_path,
+        stdin=StringIO(),
+        stdout=StringIO(),
+        stderr=StringIO(),
+    )
+
+    def build_session_resolver(*, fallback: object | None = None) -> object:
+        captured["fallback"] = fallback
+        return session_resolver
+
+    ports = AgentCliStatePreparationPorts(
+        build_services=lambda _root: services,
+        product_catalog_operation=lambda _args: False,
+        pre_runtime_operation=lambda _context: None,
+        build_empty_tool_registry=lambda: "empty",
+        build_tool_registry=lambda _services, runtime_settings, approval: (
+            captured.update(
+                runtime_settings=runtime_settings,
+                registry_approval=approval,
+            )
+            or "registry"
+        ),
+        policy_factory=lambda **_kwargs: object(),
+        build_interactive_approval_resolver=build_session_resolver,
+        run_resource_toggle=lambda *_args, **_kwargs: None,
+    )
+
+    result = asyncio.run(prepare_agent_cli_application_state(context, ports=ports))
+
+    assert result.value is not None
+    assert result.value.approval_resolver is session_resolver
+    assert captured["registry_approval"] is session_resolver
+    fallback = captured["fallback"]
+    assert isinstance(fallback, HeadlessApprovalResolver)
+    assert fallback.mode == "allow"
+    runtime_settings = captured["runtime_settings"]
+    assert isinstance(runtime_settings, WorkspaceToolRuntimeSettings)
+    assert runtime_settings.approval_resolver is fallback
+
+
 @dataclass(frozen=True)
 class _HelpArgs:
     fork: str | None = "source"
@@ -513,6 +657,7 @@ class _HelpArgs:
 
 def test_help_extension_discovery_reuses_agent_state_ports(tmp_path) -> None:
     captured: list[_HelpArgs] = []
+    released: list[object] = []
     flag = SimpleNamespace(name="research-mode")
     session = SimpleNamespace(
         extension_runner=SimpleNamespace(get_flags=lambda: [flag])
@@ -538,6 +683,7 @@ def test_help_extension_discovery_reuses_agent_state_ports(tmp_path) -> None:
             state_ports=state_ports,
             build_runtime=lambda args, *_rest: captured.append(args) or "runtime",
             resolve_session=lambda *_args: session,
+            dispose_runtime=lambda runtime: released.append(runtime),
         )
     )
 
@@ -548,6 +694,7 @@ def test_help_extension_discovery_reuses_agent_state_ports(tmp_path) -> None:
             no_session=True,
         )
     ]
+    assert released == ["runtime"]
 
 
 def test_agent_application_binding_runs_non_coding_product(tmp_path) -> None:

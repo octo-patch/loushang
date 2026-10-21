@@ -3,31 +3,57 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
+import stat
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, TypeVar
 
+from loushang.ai.types import AssistantMessage, UserMessage
+from loushang.foundation.platform_paths import resolve_platform_paths
+from loushang.harness.capabilities.owner_component_host import (
+    CapabilityOwnerComponentHost,
+)
 from loushang.harness.continuity import (
     CallbackPreparedActivationLease,
+    ContinuityActivationPayload,
     ContinuityArtifactReference,
+    ContinuityDeletionRecoveryAuthority,
     ContinuityDiagnostic,
     ContinuityHub,
     ContinuityPreview,
     ContinuityPreviewSection,
     ContinuityProviderDescriptor,
     ContinuityProviderPack,
+    ContinuityProviderSourceDescriptor,
     ContinuitySummary,
     ContinuityTarget,
+    ExperienceComposition,
     ExperienceDescriptor,
     ProviderPage,
     ProviderPageItem,
     ProviderQuery,
+    build_continuity_hub,
     compose_experience_continuity,
 )
+from loushang.harness.continuity.plugin_runtime import (
+    ContinuityPluginGeneration,
+    ContinuityPluginGenerationAuthority,
+    ContinuityPluginInstanceFamilyAuthority,
+    ContinuityPluginLifecycleError,
+    ContinuityPluginPendingCleanup,
+    ContinuityPluginPublication,
+    ResolvedContinuityPluginSelection,
+    construct_continuity_plugin_generation,
+    publish_continuity_plugin_generation,
+    publish_continuity_plugin_generation_with_mutations,
+)
 from loushang.harness.conversation import IndexedProjection
+from loushang.harness.journal._owned_io import settled_io
 from loushang.harness.runtime import (
     CONTINUITY_PROVIDER_PACKS_SLOT,
     ProductRuntimePlan,
@@ -44,10 +70,22 @@ from loushang.harness.runtime import (
 )
 from loushang.harness.transcript import (
     AgentTranscriptSessionCatalog,
+    SessionAssetHealthSummary,
     SessionIndexPage,
     SessionQuery,
     SessionSummary,
+    assistant_message_text,
     same_agent_transcript_session_path,
+    session_summary_authority_is_current,
+    session_summary_revision,
+    user_message_text,
+)
+from loushang.harness.transcript.jsonl_file import AgentTranscriptFileError
+
+from .resume_history import (
+    read_coding_resume_header,
+    read_coding_resume_recent_page,
+    read_coding_resume_snapshot,
 )
 
 CODING_CONTINUITY_PROVIDER_ID = "coding.sessions"
@@ -56,7 +94,10 @@ CODING_CONTINUITY_IMPLEMENTATION_VERSION = 1
 CODING_EXPERIENCE_ID = "coding"
 
 _MAX_PREVIEW_CACHE = 256
+_MAX_CODING_CONTINUITY_IMPORT_BYTES = 64 * 1024 * 1024
 _RUNTIME_BINDING_ATTRIBUTE = "_loushang_coding_continuity"
+
+T = TypeVar("T")
 
 
 class CodingContinuityRuntimePort(Protocol):
@@ -68,11 +109,14 @@ class CodingContinuityRuntimePort(Protocol):
         *,
         cursor: str | None = None,
         limit: int = 25,
+        ignore_authority: str | Path | None = None,
     ) -> SessionIndexPage: ...
 
     def request_session_index_refresh(self, *, all_sessions: bool = False) -> None: ...
 
     def request_session_index_repair(self) -> None: ...
+
+    def request_bounded_session_index_refresh(self) -> None: ...
 
     def get_current_session(self) -> object | None: ...
 
@@ -94,16 +138,120 @@ class CodingPreparedSessionOperation(Protocol):
 
     async def abort(self) -> None: ...
 
+    async def close(self) -> None: ...
+
+
+class CodingContinuityActivationBridge:
+    """Import portable bytes through Coding's canonical Session lifecycle."""
+
+    def __init__(
+        self,
+        runtime: CodingContinuityRuntimePort,
+        *,
+        temporary_root: str | Path | None = None,
+        fallback_cwd: str | Path | None = None,
+        max_bytes: int = _MAX_CODING_CONTINUITY_IMPORT_BYTES,
+    ) -> None:
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+            raise TypeError("Coding continuity import limit must be an integer")
+        if not 1 <= max_bytes <= _MAX_CODING_CONTINUITY_IMPORT_BYTES:
+            raise ValueError("Coding continuity import limit is invalid")
+        self._runtime = runtime
+        temporary_path = Path(
+            temporary_root
+            if temporary_root is not None
+            else resolve_platform_paths().temporary / "continuity-import"
+        ).expanduser()
+        absolute = Path(os.path.abspath(temporary_path))
+        self._temporary_root = absolute.parent.resolve(strict=False) / absolute.name
+        self._fallback_cwd = (
+            None
+            if fallback_cwd is None
+            else str(Path(fallback_cwd).expanduser().resolve(strict=False))
+        )
+        self._max_bytes = max_bytes
+
+    async def prepare(
+        self,
+        target: ContinuityTarget,
+        payload: ContinuityActivationPayload,
+        source: ContinuityProviderSourceDescriptor,
+    ) -> CallbackPreparedActivationLease:
+        if not isinstance(target, ContinuityTarget):
+            raise TypeError("Coding continuity activation target is invalid")
+        if not isinstance(payload, ContinuityActivationPayload):
+            raise TypeError("Coding continuity activation payload is invalid")
+        if not isinstance(source, ContinuityProviderSourceDescriptor):
+            raise TypeError("Coding continuity activation source is invalid")
+        if source.provider_id != target.provider_id:
+            raise ValueError("Coding continuity activation source does not own target")
+        if payload.byte_size > self._max_bytes:
+            raise ValueError("Coding continuity activation exceeds Product limit")
+        staged = await _write_private_continuity_payload_atomic(
+            self._temporary_root,
+            payload,
+        )
+        try:
+            prepared = await self._runtime.prepare_restore_session_operation(
+                staged.path,
+                fallback_cwd=self._fallback_cwd,
+                missing_cwd="fallback" if self._fallback_cwd is not None else "error",
+            )
+        except BaseException as operation_error:
+            try:
+                await _remove_private_continuity_payload_atomic(staged)
+            except BaseException as cleanup_error:
+                operation_error.add_note(
+                    "Coding continuity temporary cleanup also failed: "
+                    f"{cleanup_error!r}"
+                )
+            raise
+        try:
+            await _remove_private_continuity_payload_atomic(staged)
+        except BaseException as cleanup_error:
+            try:
+                abort_task = asyncio.create_task(prepared.abort())
+                await _await_owned_task_cancellation_atomic(abort_task)
+            except BaseException as abort_error:
+                cleanup_error.add_note(
+                    "Coding continuity prepared-operation abort also failed: "
+                    f"{abort_error!r}"
+                )
+            raise
+        settlement = _CodingPreparedSessionSettlement(prepared)
+        return CallbackPreparedActivationLease(
+            target=target,
+            disposition="in_place",
+            consume=settlement.consume,
+            abort=settlement.abort,
+        )
+
 
 class StaleContinuityTargetError(RuntimeError):
     """Raised when a selected summary no longer matches transcript authority."""
 
 
+class ConflictedContinuityTargetError(RuntimeError):
+    """Raised when one Session identity has different discovered authorities."""
+
+
 class CodingContinuityProvider:
     """Adapt Agent transcript summaries without leaking Coding UI or Git facts."""
 
-    def __init__(self, runtime: CodingContinuityRuntimePort) -> None:
+    def __init__(
+        self,
+        runtime: CodingContinuityRuntimePort,
+        *,
+        cwd: str | Path | None = None,
+        all_sessions: bool = False,
+    ) -> None:
         self._runtime = runtime
+        self._cwd = (
+            str(Path(cwd).expanduser().resolve(strict=False))
+            if cwd is not None
+            else None
+        )
+        self._all_sessions = all_sessions
         self._index_refresh_requested = False
         self._preview_items: OrderedDict[str, IndexedProjection[SessionSummary]] = (
             OrderedDict()
@@ -125,15 +273,22 @@ class CodingContinuityProvider:
         )
 
     async def query(self, request: ProviderQuery) -> ProviderPage:
+        current_reference = self._runtime.get_current_session_ref()
         page = await asyncio.to_thread(
             self._runtime.try_query_session_index_page,
             SessionQuery(
+                cwd=None if self._all_sessions else self._query_cwd(),
                 text=request.text or None,
                 sort_by="created" if request.sort_id == "created" else "recent",
                 has_messages=True,
+                source_mode=(
+                    "canonical" if "delete" in request.required_actions else None
+                ),
+                exclude_session_file=current_reference,
             ),
             cursor=request.cursor,
             limit=request.limit,
+            ignore_authority=current_reference,
         )
         items: list[ProviderPageItem] = []
         for page_item in page.items:
@@ -145,25 +300,44 @@ class CodingContinuityProvider:
                     after_cursor=page_item.after_cursor,
                 )
             )
-        diagnostics: tuple[ContinuityDiagnostic, ...] = ()
+        diagnostics = [
+            ContinuityDiagnostic(
+                code=f"coding_session_discovery_{issue.code}",
+                message=(f"Ignored Session source {issue.source_id}: {issue.detail}."),
+                provider_id=CODING_CONTINUITY_PROVIDER_ID,
+            )
+            for issue in page.discovery_issues
+        ]
         if page.restart_required:
-            diagnostics = (
+            diagnostics.append(
                 ContinuityDiagnostic(
                     code="coding_continuity_snapshot_expired",
                     message="The Coding session index traversal expired; restart search.",
                     provider_id=CODING_CONTINUITY_PROVIDER_ID,
-                ),
+                )
             )
         elif page.index_state != "fresh":
             if not self._index_refresh_requested:
-                self._runtime.request_session_index_repair()
+                if page.bounded_fallback:
+                    self._runtime.request_bounded_session_index_refresh()
+                else:
+                    self._runtime.request_session_index_repair()
                 self._index_refresh_requested = True
-            diagnostics = (
+            diagnostics.append(
                 ContinuityDiagnostic(
-                    code="coding_continuity_index_not_ready",
-                    message="Coding session history is being indexed.",
+                    code=(
+                        "coding_continuity_bounded_catalog"
+                        if page.bounded_fallback
+                        else "coding_continuity_index_not_ready"
+                    ),
+                    message=(
+                        "Showing recent Coding sessions from bounded transcript "
+                        "previews."
+                        if page.bounded_fallback
+                        else "Coding session history is being indexed."
+                    ),
                     provider_id=CODING_CONTINUITY_PROVIDER_ID,
-                ),
+                )
             )
         else:
             self._index_refresh_requested = False
@@ -175,22 +349,174 @@ class CodingContinuityProvider:
             ),
             index_generation=page.index_generation,
             query_snapshot=page.query_snapshot,
-            diagnostics=diagnostics,
+            diagnostics=tuple(diagnostics),
         )
+
+    def _query_cwd(self) -> str | None:
+        if self._cwd is not None:
+            return self._cwd
+        try:
+            value = getattr(self._runtime, "cwd", None)
+        except Exception:
+            return None
+        if not isinstance(value, str) or not value:
+            return None
+        return str(Path(value).expanduser().resolve(strict=False))
 
     async def preview(self, target: ContinuityTarget) -> ContinuityPreview:
         indexed = self._cached_target(target)
         summary = indexed.projection
+        history_changed = False
+        history_text: str | None = None
         rows = [
+            ("Session ID", summary.session_id),
             ("Workspace", summary.cwd or "Unknown"),
-            ("Messages", str(summary.message_count)),
-            ("Entries", str(summary.entry_count)),
+            (
+                "Messages",
+                str(summary.message_count)
+                if summary.counts_exact
+                else f"at least {summary.message_count}",
+            ),
+            (
+                "Entries",
+                str(summary.entry_count)
+                if summary.counts_exact
+                else f"at least {summary.entry_count}",
+            ),
         ]
+        discovery = summary.discovery
+        if discovery is not None:
+            rows.extend(
+                (
+                    ("Storage", _session_storage_label(summary)),
+                    ("Health", _session_health_label(summary)),
+                )
+            )
+            if discovery.aliases:
+                rows.append(("Compatible copies", str(len(discovery.aliases))))
+            if discovery.conflicts:
+                rows.append(("Conflicting copies", str(len(discovery.conflicts))))
+        if summary.session_file is not None:
+            # A cancelled preview still owns each submitted native read until
+            # it settles. Stable references therefore keep root shutdown joined
+            # through real completion rather than just waiter cancellation.
+            try:
+                history = await settled_io(
+                    read_coding_resume_header, summary.session_file,
+                )
+            except (OSError, ValueError):
+                rows.append(("History identity", "Unavailable"))
+            else:
+                if history.header.conversation_id != summary.session_id:
+                    history_changed = True
+                    rows.append(("History identity", "Changed; refresh"))
+                else:
+                    rows.append((
+                        "History identity",
+                        "Coding" if history.product_identity == "coding" else "Unverified",
+                    ))
+                    rows.append((
+                        "Historical composition",
+                        history.composition.set_id
+                        if history.composition is not None else "Legacy unknown",
+                    ))
+                    try:
+                        from .runtime.agent_session_runtime import AgentSessionRuntime
+
+                        if isinstance(self._runtime, AgentSessionRuntime):
+                            snapshot = await AgentSessionRuntime.preview_resume_history(
+                                self._runtime, summary.session_file,
+                                max_bytes=1024 * 1024,
+                            )
+                        else:
+                            snapshot = await settled_io(
+                                read_coding_resume_snapshot,
+                                summary.session_file,
+                                max_bytes=1024 * 1024,
+                            )
+                    except AgentTranscriptFileError as exc:
+                        if exc.code != "session_file_too_large":
+                            rows.append(("Recent history", "Bounded preview unavailable"))
+                        else:
+                            try:
+                                if isinstance(self._runtime, AgentSessionRuntime):
+                                    recent = await AgentSessionRuntime.preview_resume_recent_page(
+                                        self._runtime, summary.session_file,
+                                    )
+                                else:
+                                    recent = await settled_io(
+                                        read_coding_resume_recent_page,
+                                        summary.session_file,
+                                    )
+                            except (OSError, ValueError):
+                                rows.append(("Recent history", "Bounded preview unavailable"))
+                            else:
+                                if not recent.records:
+                                    rows.append(("Recent history", "Bounded preview unavailable"))
+                                elif (
+                                    recent.header_preview.header != history.header
+                                    or (
+                                        summary.authority_fingerprint is not None
+                                        and recent.source_fingerprint
+                                        != summary.authority_fingerprint
+                                    )
+                                ):
+                                    history_changed = True
+                                else:
+                                    history_text = _readonly_history_text(recent.records)
+                                    rows.append(("Recent history", "Unverified tail preview"))
+                    except (OSError, ValueError):
+                        rows.append(("Recent history", "Bounded preview unavailable"))
+                    else:
+                        if (
+                            snapshot.header_preview.header != history.header
+                            or (
+                                summary.authority_fingerprint is not None
+                                and snapshot.source_fingerprint
+                                != summary.authority_fingerprint
+                            )
+                        ):
+                            history_changed = True
+                        else:
+                            history_text = _readonly_history_text(snapshot.selected_records)
+                            start_planning = getattr(
+                                self._runtime, "start_configured_resume_planning", None
+                            )
+                            if callable(start_planning):
+                                try:
+                                    planning_started = await start_planning(snapshot)
+                                except (OSError, RuntimeError, TypeError, ValueError):
+                                    rows.append(("Resume preparation", "Unavailable"))
+                                else:
+                                    if planning_started is True:
+                                        rows.append(("Resume preparation", "In progress"))
+        inspect_assets = getattr(
+            self._runtime,
+            "inspect_discovered_session_assets",
+            None,
+        )
+        if callable(inspect_assets) and summary.session_file is not None:
+            try:
+                asset_health = await settled_io(
+                    inspect_assets,
+                    summary.session_file,
+                )
+            except (OSError, ValueError):
+                asset_health = SessionAssetHealthSummary(state="unavailable")
+            if isinstance(asset_health, SessionAssetHealthSummary):
+                rows.append(("Assets", _asset_health_label(asset_health)))
         if summary.model:
             provider = summary.model.get("provider")
             model_id = summary.model.get("model_id")
             if provider and model_id:
                 rows.append(("Model", f"{provider}/{model_id}"))
+        if summary.authority_fingerprint is not None:
+            history_changed = (
+                not session_summary_authority_is_current(summary)
+                or history_changed
+            )
+        if history_changed:
+            history_text = None
         artifacts = (
             (
                 ContinuityArtifactReference(
@@ -203,12 +529,18 @@ class CodingContinuityProvider:
         )
         return ContinuityPreview(
             target=target,
-            revision=str(indexed.source_revision),
+            revision=session_summary_revision(summary, indexed.source_revision),
             heading=_summary_title(summary),
             sections=(
                 ContinuityPreviewSection(
                     kind="text",
-                    text=summary.last_message_preview or summary.first_message,
+                    text=(
+                        "History changed; refresh"
+                        if history_changed
+                        else history_text
+                        or summary.last_message_preview
+                        or summary.first_message
+                    ),
                 ),
                 ContinuityPreviewSection(
                     kind="key_value",
@@ -220,22 +552,62 @@ class CodingContinuityProvider:
                     artifacts=artifacts,
                 ),
             ),
-            stale=str(indexed.source_revision) != target.revision,
+            stale=(
+                session_summary_revision(summary, indexed.source_revision)
+                != target.revision
+            ) or history_changed,
         )
+
+    async def resolve_history_source(
+        self,
+        target: ContinuityTarget,
+    ) -> str | Path:
+        """Resolve one current native transcript without preparing a Session."""
+
+        indexed = self._cached_target(target)
+        summary = indexed.projection
+        _require_unconflicted_summary(summary)
+        expected_revision = session_summary_revision(
+            summary,
+            indexed.source_revision,
+        )
+        if target.revision != expected_revision:
+            raise StaleContinuityTargetError(
+                "The selected Coding session summary is stale."
+            )
+        # Index rows are advisory projections. Resolve their raw identity against
+        # fresh path-level discovery so a same-source duplicate cannot be entered
+        # through a stale collapsed index entry.
+        reference: str | Path = (
+            summary.session_id
+            if summary.discovery is not None
+            else summary.session_file or summary.session_id
+        )
+        if summary.authority_fingerprint is not None:
+            if not session_summary_authority_is_current(summary):
+                raise StaleContinuityTargetError(
+                    "The selected Coding session changed after it was listed."
+                )
+        else:
+            current_revision = await asyncio.to_thread(
+                AgentTranscriptSessionCatalog(
+                    self._runtime.session_dir
+                ).load_authoritative_revision,
+                indexed.locator,
+            )
+            if current_revision != indexed.source_revision:
+                raise StaleContinuityTargetError(
+                    "The selected Coding session changed after it was listed."
+                )
+        return reference
 
     async def prepare(
         self,
         target: ContinuityTarget,
     ) -> CallbackPreparedActivationLease:
+        reference = await self.resolve_history_source(target)
         indexed = self._cached_target(target)
-        expected_revision = str(indexed.source_revision)
-        if target.revision != expected_revision:
-            raise StaleContinuityTargetError(
-                "The selected Coding session summary is stale."
-            )
-        reference: str | Path = (
-            indexed.projection.session_file or indexed.projection.session_id
-        )
+        summary = indexed.projection
         current = self._runtime.get_current_session()
         if current is not None and _same_session_reference(
             self._runtime.get_current_session_ref(),
@@ -251,17 +623,15 @@ class CodingContinuityProvider:
                     cancelled=False,
                 ),
             )
-        current_revision = await asyncio.to_thread(
-            AgentTranscriptSessionCatalog(
-                self._runtime.session_dir
-            ).load_authoritative_revision,
-            indexed.locator,
-        )
-        if current_revision != indexed.source_revision:
-            raise StaleContinuityTargetError(
-                "The selected Coding session changed after it was listed."
-            )
         candidate = await self._runtime.prepare_restore_session_operation(reference)
+        if (
+            summary.authority_fingerprint is not None
+            and not session_summary_authority_is_current(summary)
+        ):
+            await candidate.abort()
+            raise StaleContinuityTargetError(
+                "The selected Coding session changed while it was being prepared."
+            )
         return CallbackPreparedActivationLease(
             target=target,
             disposition="in_place",
@@ -271,29 +641,46 @@ class CodingContinuityProvider:
 
     async def delete(self, target: ContinuityTarget) -> bool:
         indexed = self._cached_target(target)
-        expected_revision = str(indexed.source_revision)
+        summary = indexed.projection
+        _require_unconflicted_summary(summary)
+        if summary.discovery is not None and summary.discovery.mode != "canonical":
+            raise RuntimeError(
+                "Compatibility Sessions are read-only; resume them before deletion."
+            )
+        expected_revision = session_summary_revision(
+            summary,
+            indexed.source_revision,
+        )
         if target.revision != expected_revision:
             raise StaleContinuityTargetError(
                 "The selected Coding session summary is stale."
             )
         reference: str | Path = (
-            indexed.projection.session_file or indexed.projection.session_id
+            summary.session_id
+            if summary.discovery is not None
+            else summary.session_file or summary.session_id
         )
         if _same_session_reference(
             self._runtime.get_current_session_ref(),
             reference,
         ):
             raise ValueError("Cannot delete the currently active session")
-        current_revision = await asyncio.to_thread(
-            AgentTranscriptSessionCatalog(
-                self._runtime.session_dir
-            ).load_authoritative_revision,
-            indexed.locator,
-        )
-        if current_revision != indexed.source_revision:
-            raise StaleContinuityTargetError(
-                "The selected Coding session changed after it was listed."
+        if summary.authority_fingerprint is not None:
+            if not session_summary_authority_is_current(summary):
+                raise StaleContinuityTargetError(
+                    "The selected Coding session changed after it was listed."
+                )
+        else:
+            current_revision = await asyncio.to_thread(
+                AgentTranscriptSessionCatalog(
+                    self._runtime.session_dir
+                ).load_authoritative_revision,
+                indexed.locator,
             )
+            if current_revision != indexed.source_revision:
+                raise StaleContinuityTargetError(
+                    "The selected Coding session changed after it was listed."
+                )
         deleted = await self._runtime.delete_session(reference)
         if deleted:
             self._preview_items.pop(target.opaque_id, None)
@@ -341,7 +728,14 @@ class CodingContinuityComposition:
     binding: RuntimeProfileBinding
     binder: RuntimeProfileBinder
     hub: ContinuityHub
+    plugin_publication: ContinuityPluginPublication | None = None
+    owned_cleanup: Callable[[], None] | None = None
     runtime_owned: bool = False
+    binding_cwd: str | None = None
+    all_sessions: bool = False
+    configured_request_fingerprint: str | None = None
+    _core_shutdown: bool = False
+    _owned_cleanup_complete: bool = False
     _shutdown: bool = False
 
     async def dispose(self) -> None:
@@ -351,26 +745,107 @@ class CodingContinuityComposition:
             await self.shutdown()
 
     async def shutdown(self) -> None:
-        """Dispose the process-scoped binding at Product runtime shutdown."""
+        """Close the authority, then dispose the process-scoped binding.
+
+        Close-then-record: shutdown completion is recorded only after the hub
+        has staled references, aborted outstanding activation leases, joined
+        in-flight operations, and the binding has been disposed.  A failed or
+        cancelled close leaves the composition unrecorded and retryable.
+        """
 
         if self._shutdown:
             return
+        if not self._core_shutdown:
+            if self.plugin_publication is None:
+                await self.hub.close()
+            else:
+                await self.plugin_publication.shutdown()
+            await self.binder.dispose(self.binding)
+            self._core_shutdown = True
+        if not self._owned_cleanup_complete:
+            if self.owned_cleanup is not None:
+                self.owned_cleanup()
+            self._owned_cleanup_complete = True
         self._shutdown = True
-        await self.binder.dispose(self.binding)
+
+
+async def resolve_coding_continuity_history_source(
+    composition: CodingContinuityComposition,
+    target: ContinuityTarget,
+) -> str | Path:
+    """Resolve an admitted native Coding target for history-first Resume."""
+
+    if not isinstance(composition, CodingContinuityComposition):
+        raise TypeError("Coding continuity composition is invalid")
+    if not isinstance(target, ContinuityTarget):
+        raise TypeError("Coding continuity target is invalid")
+    if target.provider_id != CODING_CONTINUITY_PROVIDER_ID:
+        raise RuntimeError(
+            "History-first Resume requires a native Coding session target"
+        )
+    providers = tuple(
+        bound.provider
+        for bound in composition.hub.composition.continuity_providers
+        if bound.provider.descriptor.provider_id == CODING_CONTINUITY_PROVIDER_ID
+    )
+    if len(providers) != 1 or type(providers[0]) is not CodingContinuityProvider:
+        raise RuntimeError("Native Coding continuity authority is unavailable")
+    return await providers[0].resolve_history_source(target)
+
+
+@dataclass
+class _CodingContinuityBindingReservation:
+    binder: RuntimeProfileBinder | None = None
+    binding: RuntimeProfileBinding | None = None
+    generation: ContinuityPluginGeneration | None = None
+    construction_cleanup: ContinuityPluginPendingCleanup | None = None
+    generation_authority: ContinuityPluginGenerationAuthority | None = None
+
+    async def retry_cleanup(self) -> tuple[str, ...]:
+        codes: list[str] = []
+        construction_cleanup = self.construction_cleanup
+        if construction_cleanup is not None:
+            try:
+                await construction_cleanup.retry()
+            except BaseException:
+                codes.append("continuity_provider_construction_cleanup_retryable")
+            else:
+                self.construction_cleanup = None
+        generation = self.generation
+        if generation is not None:
+            try:
+                await generation.dispose()
+            except BaseException:
+                codes.append("continuity_provider_generation_cleanup_retryable")
+            else:
+                self.generation = None
+        if self.binder is not None and self.binding is not None:
+            try:
+                await self.binder.dispose(self.binding)
+            except BaseException:
+                codes.append("coding_continuity_base_cleanup_retryable")
+            else:
+                self.binder = None
+                self.binding = None
+        return tuple(codes)
 
 
 def bind_coding_continuity(
     runtime: CodingContinuityRuntimePort,
     *,
+    cwd: str | Path | None = None,
+    all_sessions: bool = False,
     layers: Iterable[RuntimeProfileLayer] = (),
     grants: Iterable[RuntimeProfileLayerGrant] = (),
     implementations: Iterable[RuntimeCapabilityImplementation] = (),
 ) -> CodingContinuityComposition:
-    """Bind process-scoped Product/OEM packs once, then compose Coding."""
+    """Bind Product/OEM continuity packs once for one Coding runtime."""
 
     layer_values = tuple(layers)
     grant_values = tuple(grants)
     implementation_values = tuple(implementations)
+    if any(layer.source == "extension" for layer in layer_values):
+        raise ValueError("Coding continuity does not admit direct extension layers")
     cached = getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None)
     if isinstance(cached, CodingContinuityComposition):
         if layer_values or grant_values or implementation_values:
@@ -378,7 +853,152 @@ def bind_coding_continuity(
                 "Coding continuity is already sealed for this Product runtime"
             )
         return cached
+    if cached is not None:
+        raise RuntimeError("Coding continuity binding or cleanup is already pending")
 
+    binder, binding, composition = _compose_coding_continuity_base(
+        runtime,
+        cwd=cwd,
+        all_sessions=all_sessions,
+        layers=layer_values,
+        grants=grant_values,
+        implementations=implementation_values,
+    )
+    result = CodingContinuityComposition(
+        binding=binding,
+        binder=binder,
+        hub=build_continuity_hub(composition),
+        binding_cwd=_canonical_continuity_cwd(cwd),
+        all_sessions=all_sessions,
+    )
+    _retain_coding_continuity(runtime, result)
+    return result
+
+
+async def bind_coding_plugin_continuity(
+    runtime: CodingContinuityRuntimePort,
+    *,
+    resolved_plugins: ResolvedContinuityPluginSelection,
+    component_host: CapabilityOwnerComponentHost,
+    activation_decision_ids: Mapping[str, str],
+    instance_family_authority: ContinuityPluginInstanceFamilyAuthority,
+    runtime_id: str,
+    deletion_authority: ContinuityDeletionRecoveryAuthority | None = None,
+    owned_cleanup: Callable[[], None] | None = None,
+    cwd: str | Path | None = None,
+    all_sessions: bool = False,
+    temporary_root: str | Path | None = None,
+    fallback_cwd: str | Path | None = None,
+    layers: Iterable[RuntimeProfileLayer] = (),
+    grants: Iterable[RuntimeProfileLayerGrant] = (),
+    implementations: Iterable[RuntimeCapabilityImplementation] = (),
+) -> CodingContinuityComposition:
+    """Bind Coding's canonical Provider with one approved Plugin generation."""
+
+    existing = getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None)
+    if existing is not None:
+        raise RuntimeError(
+            "Coding continuity is already sealed for this Product runtime"
+        )
+    layer_values = tuple(layers)
+    if any(layer.source == "extension" for layer in layer_values):
+        raise ValueError("Coding continuity does not admit direct extension layers")
+    generation_authority = ContinuityPluginGenerationAuthority(
+        product_id=CODING_EXPERIENCE_ID,
+        runtime_id=runtime_id,
+    )
+    reservation = _CodingContinuityBindingReservation(
+        generation_authority=generation_authority,
+    )
+    try:
+        setattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, reservation)
+    except (AttributeError, TypeError) as exc:
+        raise RuntimeError(
+            "Plugin continuity runtime must retain its sealed binding"
+        ) from exc
+    generation = None
+    try:
+        binder, binding, base = _compose_coding_continuity_base(
+            runtime,
+            cwd=cwd,
+            all_sessions=all_sessions,
+            layers=layer_values,
+            grants=tuple(grants),
+            implementations=tuple(implementations),
+        )
+        reservation.binder = binder
+        reservation.binding = binding
+        generation = await construct_continuity_plugin_generation(
+            resolved_plugins,
+            component_host=component_host,
+            activation_decision_ids=activation_decision_ids,
+            instance_family_authority=instance_family_authority,
+            generation_authority=generation_authority,
+        )
+        reservation.generation = generation
+        activation_bridge = CodingContinuityActivationBridge(
+            runtime,
+            temporary_root=temporary_root,
+            fallback_cwd=fallback_cwd,
+        )
+        if deletion_authority is None:
+            publication = publish_continuity_plugin_generation(
+                base,
+                generation,
+                activation_bridge=activation_bridge,
+            )
+        else:
+            publication = await publish_continuity_plugin_generation_with_mutations(
+                base,
+                generation,
+                activation_bridge=activation_bridge,
+                deletion_authority=deletion_authority,
+            )
+    except BaseException as error:
+        if (
+            isinstance(error, ContinuityPluginLifecycleError)
+            and error.pending_cleanup is not None
+        ):
+            reservation.construction_cleanup = error.pending_cleanup
+        cleanup_codes = await _retry_coding_continuity_reservation_atomic(
+            runtime,
+            reservation,
+        )
+        if cleanup_codes:
+            cleanup_error = ContinuityPluginLifecycleError(
+                "Coding continuity binding cleanup remains retryable.",
+                code="coding_continuity_binding_cleanup_retryable",
+            )
+            for code in cleanup_codes:
+                cleanup_error.add_note(code)
+            raise cleanup_error from error
+        _delete_runtime_binding_if(runtime, reservation)
+        raise
+    result = CodingContinuityComposition(
+        binding=binding,
+        binder=binder,
+        hub=publication.hub,
+        plugin_publication=publication,
+        owned_cleanup=owned_cleanup,
+        binding_cwd=_canonical_continuity_cwd(cwd),
+        all_sessions=all_sessions,
+    )
+    if getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None) is not reservation:
+        raise RuntimeError("Coding continuity binding reservation was replaced")
+    setattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, result)
+    result.runtime_owned = True
+    return result
+
+
+def _compose_coding_continuity_base(
+    runtime: CodingContinuityRuntimePort,
+    *,
+    cwd: str | Path | None,
+    all_sessions: bool,
+    layers: tuple[RuntimeProfileLayer, ...],
+    grants: tuple[RuntimeProfileLayerGrant, ...],
+    implementations: tuple[RuntimeCapabilityImplementation, ...],
+) -> tuple[RuntimeProfileBinder, RuntimeProfileBinding, ExperienceComposition]:
     plan = ProductRuntimePlan(
         product_id=CODING_EXPERIENCE_ID,
         slots=(CONTINUITY_PROVIDER_PACKS_SLOT,),
@@ -391,11 +1011,11 @@ def bind_coding_continuity(
         ),
     )
     admitted = RuntimeProfileAdmissionPolicy(
-        grants=grant_values,
+        grants=grants,
         slot_permissions={
             CONTINUITY_PROVIDER_PACKS_SLOT.key: frozenset({"continuity.provider"})
         },
-    ).admit(plan, layer_values)
+    ).admit(plan, layers)
     profile = RuntimeProfileResolver().resolve(
         plan,
         layers=admitted.require_valid(),
@@ -407,10 +1027,16 @@ def bind_coding_continuity(
                 implementation=CODING_CONTINUITY_IMPLEMENTATION,
                 implementation_version=CODING_CONTINUITY_IMPLEMENTATION_VERSION,
                 create=lambda _selection, context: ContinuityProviderPack(
-                    providers=(CodingContinuityProvider(_require_runtime(context)),)
+                    providers=(
+                        CodingContinuityProvider(
+                            _require_runtime(context),
+                            cwd=cwd,
+                            all_sessions=all_sessions,
+                        ),
+                    )
                 ),
             ),
-            *implementation_values,
+            *implementations,
         )
     )
     binder = RuntimeProfileBinder(registry)
@@ -424,27 +1050,386 @@ def bind_coding_continuity(
         ),
         binding=binding,
     )
-    result = CodingContinuityComposition(
-        binding=binding,
-        binder=binder,
-        hub=ContinuityHub(composition),
-    )
+    return binder, binding, composition
+
+
+def _retain_coding_continuity(
+    runtime: CodingContinuityRuntimePort,
+    result: CodingContinuityComposition,
+) -> None:
     try:
         setattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, result)
     except (AttributeError, TypeError):
         pass
     else:
         result.runtime_owned = True
+
+
+def _canonical_continuity_cwd(cwd: str | Path | None) -> str | None:
+    return (
+        str(Path(cwd).expanduser().resolve(strict=False))
+        if cwd is not None
+        else None
+    )
+
+
+@dataclass(slots=True)
+class _CodingPreparedSessionSettlement:
+    prepared: CodingPreparedSessionOperation
+    _abort_complete: bool = False
+
+    async def consume(self) -> object:
+        try:
+            return await self.prepared.consume()
+        except BaseException as operation_error:
+            try:
+                await self.abort()
+            except BaseException as abort_error:
+                operation_error.add_note(
+                    "Coding prepared Session abort also failed: "
+                    f"{type(abort_error).__name__}"
+                )
+            raise
+
+    async def abort(self) -> None:
+        if self._abort_complete:
+            return
+        abort_task = asyncio.create_task(self.prepared.abort())
+        try:
+            await _await_owned_task_cancellation_atomic(abort_task)
+        except BaseException:
+            if _task_completed_successfully(abort_task):
+                self._abort_complete = True
+            raise
+        self._abort_complete = True
+
+
+def _task_completed_successfully(task: asyncio.Task[object]) -> bool:
+    return task.done() and not task.cancelled() and task.exception() is None
+
+
+@dataclass(frozen=True, slots=True)
+class _PrivateContinuityPayload:
+    path: Path
+    file_identity: tuple[int, int]
+    root_identity: tuple[int, int]
+    root_descriptor: int
+    file_descriptor: int  # Pin the inode until identity-checked cleanup finishes.
+
+
+def _write_private_continuity_payload(
+    root: Path,
+    payload: ContinuityActivationPayload,
+) -> _PrivateContinuityPayload:
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _validate_private_continuity_path_chain(root)
+    if not _supports_continuity_directory_handles():
+        raise OSError(
+            "Secure directory-relative Continuity staging is unavailable "
+            "on this platform"
+        )
+    return _write_private_continuity_payload_at(root, payload)
+
+
+def _write_private_continuity_payload_at(
+    root: Path,
+    payload: ContinuityActivationPayload,
+) -> _PrivateContinuityPayload:
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    root_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    root_descriptor = os.open(root, root_flags)
+    descriptor = -1
+    name = ""
+    try:
+        root_status = os.fstat(root_descriptor)
+        path_status = root.lstat()
+        _validate_private_continuity_root(root, root_status)
+        if not os.path.samestat(root_status, path_status):
+            raise OSError("Coding continuity temporary root identity changed")
+        os.fchmod(root_descriptor, 0o700)
+        root_identity = (root_status.st_dev, root_status.st_ino)
+        suffix = _continuity_payload_suffix(payload)
+        file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        file_flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        for _attempt in range(128):
+            name = f"continuity-{secrets.token_hex(16)}{suffix}"
+            try:
+                descriptor = os.open(
+                    name,
+                    file_flags,
+                    0o600,
+                    dir_fd=root_descriptor,
+                )
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise FileExistsError("Coding continuity temporary namespace is exhausted")
+        os.fchmod(descriptor, 0o600)
+        _write_continuity_payload_bytes(descriptor, payload.data)
+        status = os.fstat(descriptor)
+        file_identity = (status.st_dev, status.st_ino)
+        return _PrivateContinuityPayload(
+            path=root / name,
+            file_identity=file_identity,
+            root_identity=root_identity,
+            root_descriptor=root_descriptor,
+            file_descriptor=descriptor,
+        )
+    except BaseException:
+        try:
+            if descriptor >= 0:
+                with suppress(OSError):
+                    current = os.stat(
+                        name, dir_fd=root_descriptor, follow_symlinks=False
+                    )
+                    if os.path.samestat(os.fstat(descriptor), current):
+                        os.unlink(name, dir_fd=root_descriptor)
+        finally:
+            try:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            finally:
+                os.close(root_descriptor)
+        raise
+
+
+def _validate_private_continuity_root(
+    root: Path,
+    root_status: os.stat_result,
+) -> None:
+    if (
+        not stat.S_ISDIR(root_status.st_mode)
+        or stat.S_ISLNK(root_status.st_mode)
+        or bool(getattr(root_status, "st_reparse_tag", 0))
+    ):
+        raise OSError("Coding continuity temporary root is unsafe")
+    getuid = getattr(os, "getuid", None)
+    if os.name == "posix" and callable(getuid) and root_status.st_uid != getuid():
+        raise PermissionError(
+            f"Coding continuity temporary root belongs to another user: {root}"
+        )
+
+
+def _validate_private_continuity_path_chain(root: Path) -> None:
+    for directory in (root, *root.parents):
+        metadata = directory.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_reparse_tag", 0))
+        ):
+            raise OSError("Coding continuity temporary path contains an unsafe link")
+        if (
+            os.name == "posix"
+            and metadata.st_mode & 0o022
+            and not metadata.st_mode & stat.S_ISVTX
+        ):
+            raise PermissionError(
+                "Coding continuity temporary path has a writable ancestor"
+            )
+
+
+def _continuity_payload_suffix(payload: ContinuityActivationPayload) -> str:
+    return (
+        ".loushang.zip"
+        if payload.media_type.endswith("session-bundle+zip")
+        else ".jsonl"
+    )
+
+
+def _write_continuity_payload_bytes(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written < 1:
+            raise OSError("Coding continuity temporary write made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+
+
+def _supports_continuity_directory_handles() -> bool:
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    return (
+        os.name == "posix"
+        and isinstance(getattr(os, "O_DIRECTORY", None), int)
+        and isinstance(getattr(os, "O_NOFOLLOW", None), int)
+        and os.open in supports_dir_fd
+        and os.stat in supports_dir_fd
+        and os.unlink in supports_dir_fd
+    )
+
+
+def _remove_private_continuity_payload(staged: _PrivateContinuityPayload) -> None:
+    try:
+        root_status = os.fstat(staged.root_descriptor)
+        if (root_status.st_dev, root_status.st_ino) != staged.root_identity:
+            raise OSError("Coding continuity temporary root identity changed")
+        try:
+            status = os.stat(
+                staged.path.name,
+                dir_fd=staged.root_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISLNK(status.st_mode)
+            or bool(getattr(status, "st_reparse_tag", 0))
+            or (status.st_dev, status.st_ino) != staged.file_identity
+        ):
+            raise OSError("Coding continuity temporary file identity changed")
+        os.unlink(staged.path.name, dir_fd=staged.root_descriptor)
+    finally:
+        try:
+            os.close(staged.file_descriptor)
+        finally:
+            os.close(staged.root_descriptor)
+
+
+async def _remove_private_continuity_payload_atomic(
+    staged: _PrivateContinuityPayload,
+) -> None:
+    task = asyncio.create_task(
+        asyncio.to_thread(_remove_private_continuity_payload, staged)
+    )
+    await _await_owned_task_cancellation_atomic(task)
+
+
+async def _write_private_continuity_payload_atomic(
+    root: Path,
+    payload: ContinuityActivationPayload,
+) -> _PrivateContinuityPayload:
+    task = asyncio.create_task(
+        asyncio.to_thread(_write_private_continuity_payload, root, payload)
+    )
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as first_cancellation:
+        cancellation = first_cancellation
+        caller = asyncio.current_task()
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as repeated:
+                if caller is None or caller.cancelling() == 0:
+                    return task.result()
+                cancellation = repeated
+        try:
+            staged = task.result()
+        except BaseException as write_error:
+            cancellation.add_note(
+                "Coding continuity temporary write also failed: "
+                f"{type(write_error).__name__}"
+            )
+            raise cancellation
+        try:
+            await _remove_private_continuity_payload_atomic(staged)
+        except BaseException as cleanup_error:
+            cancellation.add_note(
+                "Coding continuity cancelled-write cleanup also failed: "
+                f"{type(cleanup_error).__name__}"
+            )
+        raise cancellation
+
+
+async def _await_owned_task_cancellation_atomic(
+    task: asyncio.Task[T],
+) -> T:
+    """Join an owned cleanup task before propagating caller cancellation."""
+
+    cancellation: asyncio.CancelledError | None = None
+    caller = asyncio.current_task()
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if caller is None or caller.cancelling() == 0:
+                return task.result()
+            cancellation = exc
+    result = task.result()
+    if cancellation is not None:
+        raise cancellation
     return result
+
+
+async def _retry_coding_continuity_reservation_atomic(
+    runtime: object,
+    reservation: _CodingContinuityBindingReservation,
+) -> tuple[str, ...]:
+    cleanup_task = asyncio.create_task(reservation.retry_cleanup())
+    try:
+        return await _await_owned_task_cancellation_atomic(cleanup_task)
+    except asyncio.CancelledError:
+        if cleanup_task.done() and not cleanup_task.cancelled():
+            try:
+                codes = cleanup_task.result()
+            except BaseException:
+                pass
+            else:
+                if not codes:
+                    _delete_runtime_binding_if(runtime, reservation)
+        raise
 
 
 async def shutdown_coding_continuity(runtime: object) -> None:
     composition = getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None)
+    if isinstance(composition, _CodingContinuityBindingReservation):
+        codes = await _retry_coding_continuity_reservation_atomic(
+            runtime,
+            composition,
+        )
+        if codes:
+            error = ContinuityPluginLifecycleError(
+                "Coding continuity binding cleanup remains retryable.",
+                code="coding_continuity_binding_cleanup_retryable",
+            )
+            for code in codes:
+                error.add_note(code)
+            raise error
+        _delete_runtime_binding_if(runtime, composition)
+        return
     if not isinstance(composition, CodingContinuityComposition):
+        return
+    shutdown_task = asyncio.create_task(composition.shutdown())
+    try:
+        await _await_owned_task_cancellation_atomic(shutdown_task)
+    except asyncio.CancelledError:
+        if shutdown_task.done() and not shutdown_task.cancelled():
+            try:
+                shutdown_task.result()
+            except BaseException:
+                pass
+            else:
+                _delete_runtime_binding_if(runtime, composition)
+        raise
+    _delete_runtime_binding_if(runtime, composition)
+
+
+def get_coding_continuity_composition(
+    runtime: object,
+) -> CodingContinuityComposition | None:
+    """Return the process-sealed composition without recomposing another scope."""
+
+    composition = getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None)
+    return (
+        composition
+        if isinstance(composition, CodingContinuityComposition)
+        else None
+    )
+
+
+def supports_coding_continuity_secure_staging() -> bool:
+    """Report whether portable Plugin payloads can be staged safely."""
+
+    return _supports_continuity_directory_handles()
+
+
+def _delete_runtime_binding_if(runtime: object, expected: object) -> None:
+    if getattr(runtime, _RUNTIME_BINDING_ATTRIBUTE, None) is not expected:
         return
     with suppress(AttributeError):
         delattr(runtime, _RUNTIME_BINDING_ATTRIBUTE)
-    await composition.shutdown()
 
 
 def _require_runtime(value: object | None) -> CodingContinuityRuntimePort:
@@ -461,16 +1446,21 @@ def _continuity_summary(
         target=ContinuityTarget(
             provider_id=CODING_CONTINUITY_PROVIDER_ID,
             opaque_id=summary.session_id,
-            revision=str(indexed.source_revision),
+            revision=session_summary_revision(summary, indexed.source_revision),
         ),
         domain_ids=("coding",),
         primary_domain_id="coding",
         title=_summary_title(summary),
         updated_at=summary.updated_at,
         created_at=summary.created_at,
-        subtitle=None,
+        subtitle=_session_subtitle(summary),
         excerpt=summary.last_message_preview or summary.first_message,
-        status="Needs attention" if summary.has_diagnostics else None,
+        status=_session_status(summary),
+        actions=(
+            ("activate", "delete")
+            if summary.discovery is None or summary.discovery.mode == "canonical"
+            else ("activate",)
+        ),
     )
 
 
@@ -481,14 +1471,106 @@ def _summary_title(summary: SessionSummary) -> str:
     return summary.session_id[:8]
 
 
+def _readonly_history_text(records: Iterable[object]) -> str | None:
+    """Show a few selected-path messages without activating their Session."""
+
+    recent: list[str] = []
+    for record in reversed(tuple(records)):
+        payload = getattr(record, "payload", None)
+        text: str | None
+        if isinstance(payload, UserMessage):
+            label, text = "You", user_message_text(payload)
+        elif isinstance(payload, AssistantMessage):
+            label, text = "Assistant", assistant_message_text(payload)
+        else:
+            continue
+        normalized = " ".join(text.split()) if text else ""
+        if not normalized:
+            continue
+        recent.append(f"{label}: {normalized[:160]}")
+        if len(recent) == 3:
+            break
+    return "\n".join(reversed(recent)) if recent else None
+
+
+def _require_unconflicted_summary(summary: SessionSummary) -> None:
+    discovery = summary.discovery
+    if discovery is not None and not discovery.resumable:
+        raise ConflictedContinuityTargetError(
+            "This Session ID has different transcripts in multiple discovery "
+            "sources. Select an exact path or resolve the conflict before resume."
+        )
+
+
+def _session_status(summary: SessionSummary) -> str | None:
+    discovery = summary.discovery
+    if discovery is None:
+        return "Needs attention" if summary.has_diagnostics else None
+    if discovery.health == "conflict":
+        return "Conflict"
+    if discovery.health == "needs_attention":
+        return "Needs attention"
+    if summary.has_diagnostics:
+        return "Needs attention"
+    if discovery.health == "legacy":
+        return f"Legacy · {discovery.origin}"
+    return None
+
+
+def _session_subtitle(summary: SessionSummary) -> str | None:
+    discovery = summary.discovery
+    if discovery is None or discovery.mode == "canonical":
+        return summary.cwd or None
+    origin = discovery.origin.capitalize()
+    return f"{summary.cwd or 'Unknown workspace'} · {origin} compatibility"
+
+
+def _session_storage_label(summary: SessionSummary) -> str:
+    discovery = summary.discovery
+    if discovery is None:
+        return "Unknown"
+    if discovery.mode == "canonical":
+        return f"{discovery.origin.capitalize()} canonical"
+    return f"{discovery.origin.capitalize()} compatibility"
+
+
+def _session_health_label(summary: SessionSummary) -> str:
+    discovery = summary.discovery
+    if discovery is None:
+        return "Unknown"
+    return discovery.health.replace("_", " ").title()
+
+
+def _asset_health_label(health: SessionAssetHealthSummary) -> str:
+    if health.state == "none":
+        return "None"
+    if health.state == "unavailable":
+        return "Unavailable (preview budget or read boundary)"
+    suffix = f" · {health.object_count} objects · {health.total_bytes} bytes"
+    if health.state == "available":
+        return f"Available{suffix}"
+    if health.state == "partial":
+        return f"Present (integrity checked on resume){suffix}"
+    return (
+        f"{health.state.title()}{suffix} · "
+        f"{health.missing} missing · {health.corrupt} corrupt"
+    )
+
+
 __all__ = [
     "CODING_CONTINUITY_IMPLEMENTATION",
     "CODING_CONTINUITY_IMPLEMENTATION_VERSION",
     "CODING_CONTINUITY_PROVIDER_ID",
     "CODING_EXPERIENCE_ID",
     "CodingContinuityComposition",
+    "CodingContinuityActivationBridge",
     "CodingContinuityProvider",
+    "ConflictedContinuityTargetError",
     "StaleContinuityTargetError",
     "bind_coding_continuity",
+    "bind_coding_plugin_continuity",
+    "get_coding_continuity_composition",
+    "resolve_coding_continuity_history_source",
     "shutdown_coding_continuity",
+    "supports_coding_continuity_secure_staging",
 ]

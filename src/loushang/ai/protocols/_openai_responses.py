@@ -20,6 +20,7 @@ from loushang.ai.tool.transform import (
 )
 from loushang.ai.types import AssistantMessage, TextPart, Tool, ToolResultMessage
 from loushang.ai.utils import sanitize_surrogates, short_hash
+from loushang.ai.utils.async_iter import DirectAsyncIterator, close_async_source
 
 
 class _BufferedTextPart(TypedDict):
@@ -112,6 +113,28 @@ def convert_responses_tools(
 
 
 async def process_responses_stream(
+    openai_stream,
+    *,
+    reasoning_enabled: bool = False,
+    source: str = "openai-responses",
+) -> AsyncIterator[RawPart]:
+    events = DirectAsyncIterator(openai_stream)
+    parts = _process_responses_events(
+        events,
+        reasoning_enabled=reasoning_enabled,
+        source=source,
+    )
+    try:
+        async for part in parts:
+            yield part
+    finally:
+        try:
+            await close_async_source(parts)
+        finally:
+            await events.aclose()
+
+
+async def _process_responses_events(
     openai_stream,
     *,
     reasoning_enabled: bool = False,
@@ -305,9 +328,11 @@ async def process_responses_stream(
                     thinking_closed = True
                 if (not text_closed) and text_buf:
                     text_closed = True
+                await _drain_terminal_events(openai_stream)
                 for part in _response_terminal_parts(resp, source=source):
                     yield part
                 return
+            await _drain_terminal_events(openai_stream)
             yield provider_error_part_from_raw(
                 "response terminal event did not include a response",
                 code="provider_protocol",
@@ -320,6 +345,7 @@ async def process_responses_stream(
             err = (
                 f"Error Code {code}: {message}" if code or message else "Unknown error"
             )
+            await _drain_terminal_events(openai_stream)
             yield provider_error_part_from_raw(err, code=code, source=source)
             return
 
@@ -330,6 +356,19 @@ async def process_responses_stream(
         ),
         source=source,
     )
+
+
+async def _drain_terminal_events(openai_stream: AsyncIterator[object]) -> None:
+    """Reach transport EOF before exposing a terminal part to the runtime."""
+
+    try:
+        async for _ in openai_stream:
+            pass
+    except Exception:
+        # The terminal event already determines the request outcome. Advancing to
+        # EOF here owns generator cleanup; a trailing transport error must not
+        # replace that outcome.
+        pass
 
 
 def process_responses_response(
@@ -824,7 +863,9 @@ def _normalize_responses_tool_call_id(
     call_id, item_id = tool_call_id.split("|", 1)
     normalized_call_id = _normalize_id_part(call_id)
     is_foreign_tool_call = (
-        source.provider != model.provider_id or source.api != resolve_model_api(model)
+        source.provider != model.provider_id
+        or source.endpoint != model.endpoint_id
+        or source.api != resolve_model_api(model)
     )
     normalized_item_id = (
         _build_foreign_responses_item_id(item_id)

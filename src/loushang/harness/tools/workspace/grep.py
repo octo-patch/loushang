@@ -8,13 +8,15 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from loushang.agent.types import AgentToolResult, TextPart
-from loushang.harness.approval import ApprovalResolver
+from loushang.harness.tools.authoring import (
+    FilesystemActionAdapter,
+    ToolContext,
+    authorized_tool,
+    tool,
+)
 from loushang.harness.workspace.operations import GrepOperations, resolve_operation
 
-from .authoring import tool
-from .authorization import AuthorizedWorkspaceAction, execute_workspace_tool_action
 from .builtin_renderers import render_grep_call, render_grep_result
-from .context import ToolContext, context_approval_resolver
 from .external_tools import (
     ExternalToolDownloader,
     ExternalToolPolicy,
@@ -27,13 +29,11 @@ from .external_tools import (
     resolve_external_tool,
 )
 from .ignore import load_ignore_matcher
-from .normalize import tool_to_definition
 from .operations import (
     normalize_grep_operations,
     raise_if_operation_aborted,
 )
 from .path_utils import resolve_tool_path
-from .policy import ToolPolicyEvaluator
 from .process import run_external_process_lines
 from .runtime import coerce_int_parameter, pi_truncation_details, prepare_tool_arguments
 from .truncate import (
@@ -92,15 +92,11 @@ class GrepToolOptions:
     external_tool_policy: ExternalToolPolicy | None = None
     allow_external_tool_downloads: bool = False
     require_external_tool: bool = False
-    policy_engine: ToolPolicyEvaluator | None = None
-    approval_resolver: ApprovalResolver | None = None
 
 
 def create_grep_tool_definition(
     *,
     operations: GrepOperations | None = None,
-    policy_engine: ToolPolicyEvaluator | None = None,
-    approval_resolver: ApprovalResolver | None = None,
     options: GrepToolOptions | None = None,
 ) -> ToolDefinition:
     selected_operations = operations or (
@@ -129,12 +125,6 @@ def create_grep_tool_definition(
         selected_operations is None
         and external_tools_enabled_for_policy(external_tool_policy)
     )
-    resolved_policy_engine = policy_engine or (
-        options.policy_engine if options is not None else None
-    )
-    resolved_approval_resolver = approval_resolver or (
-        options.approval_resolver if options is not None else None
-    )
 
     @tool(
         name="grep",
@@ -160,13 +150,21 @@ def create_grep_tool_definition(
         context_lines = _validate_context(context)
         raise_if_operation_aborted(ctx.signal)
         resolved_path = resolve_tool_path(path or ".", cwd=ctx.cwd)
+        active_operations = (
+            normalize_grep_operations(
+                ctx.operation_binding
+                if ctx.operation_binding is not None
+                else ops
+            )
+            if selected_operations is None
+            else ops
+        )
+        active_external_tools = use_external_tools
 
-        async def execute(
-            _action: AuthorizedWorkspaceAction,
-        ) -> AgentToolResult[dict[str, Any]]:
+        async def execute() -> AgentToolResult[dict[str, Any]]:
             search_path, base_dir = await _require_search_path(
                 resolved_path,
-                operations=ops,
+                operations=active_operations,
             )
             effective_limit = _effective_limit(limit)
             matches, match_limit_reached = await _search_contents(
@@ -177,27 +175,26 @@ def create_grep_tool_definition(
                 ignore_case=bool(ignoreCase),
                 literal=bool(literal),
                 limit=effective_limit,
-                operations=ops,
-                use_external_tools=use_external_tools,
+                operations=active_operations,
+                use_external_tools=active_external_tools,
                 external_tool_resolver=external_tool_resolver,
                 require_external_tool=require_external_tool,
                 signal=ctx.signal,
             )
             rendered_entries = await _render_grep_entries(
-                base_dir, matches, context=context_lines, operations=ops
+                base_dir,
+                matches,
+                context=context_lines,
+                operations=active_operations,
             )
             raise_if_operation_aborted(ctx.signal)
-            raw_output = "\n".join(
-                entry["rendered"] for entry in rendered_entries
-            )
+            raw_output = "\n".join(entry["rendered"] for entry in rendered_entries)
             truncation = truncate_head(raw_output, max_lines=1_000_000)
             visible_matches = _visible_grep_matches(
                 rendered_entries,
                 truncation.content,
             )
-            lines_truncated = any(
-                entry["line_truncated"] for entry in rendered_entries
-            )
+            lines_truncated = any(entry["line_truncated"] for entry in rendered_entries)
             rendered = truncation.content if matches else "No matches found"
             if matches:
                 rendered = _append_grep_notices(
@@ -215,9 +212,7 @@ def create_grep_tool_definition(
                     **truncation_details(truncation),
                     "truncated": match_limit_reached or truncation.truncated,
                     "match_limit_reached": match_limit_reached,
-                    "match_limit": (
-                        effective_limit if match_limit_reached else None
-                    ),
+                    "match_limit": (effective_limit if match_limit_reached else None),
                     "lines_truncated": lines_truncated,
                     "truncation": (
                         pi_truncation_details(truncation)
@@ -227,33 +222,24 @@ def create_grep_tool_definition(
                 },
             )
 
-        return await execute_workspace_tool_action(
-            resolved_policy_engine,
-            tool_name="grep",
-            arguments={"path": str(resolved_path), "pattern": pattern},
-            executor=execute,
-            cwd=ctx.cwd,
-            approval_resolver=context_approval_resolver(
-                ctx,
-                resolved_approval_resolver,
-            ),
-            tool_call_id=ctx.tool_call_id,
-            audit_sink=ctx.event_sink,
-            execution_profile_ceiling=getattr(
-                ctx.exec_service,
-                "execution_profile",
-                None,
-            ),
-        )
+        return await execute()
 
     return replace(
-        tool_to_definition(grep),
+        authorized_tool(
+            grep,
+            action=FilesystemActionAdapter(
+                "read",
+                default_path=".",
+                authorization_fields=("pattern",),
+            ),
+        ),
         prepare_arguments=lambda value: prepare_tool_arguments(
             value,
             aliases=(("file_path", "path"), ("ignore_case", "ignoreCase")),
         ),
         render_call=render_grep_call,
         render_result=render_grep_result,
+        operation_binding_key="grep_operations",
     )
 
 
@@ -504,7 +490,11 @@ async def _search_contents_with_operations(
 
         for line_no, line in enumerate(contents.splitlines(), start=1):
             haystack = line.lower() if literal and ignore_case else line
-            matched = (pattern in haystack) if literal else bool(regex.search(line))
+            if literal:
+                matched = pattern in haystack
+            else:
+                assert regex is not None
+                matched = bool(regex.search(line))
             if not matched:
                 continue
             all_matches.append(

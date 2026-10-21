@@ -14,6 +14,7 @@ from loushang.ai.auth.credentials import (
     OAuthBearerAuth,
     OAuthCredential,
 )
+from loushang.ai.prepared_request import PreparedRequestCommitter, PreparedRequestLimits
 from loushang.ai.structured import StructuredOutputOptions
 
 PairingMode = Literal["strict", "repair"]
@@ -90,10 +91,19 @@ class CallOptions:
     idle_timeout_seconds: float | int | None = None
     retry: RetryOptions | None = None
     trace: object | None = None
-    pairing_mode: PairingMode = "strict"
+    # Default to repair so interrupted/partial transcripts (e.g. a run killed
+    # mid-tool-call) recover automatically instead of failing the whole request.
+    # Callers that need strict validation (e.g. new-session message flow) can
+    # set pairing_mode="strict" explicitly.
+    pairing_mode: PairingMode = "repair"
     reasoning: ReasoningOptions | None = None
     tool_choice: ToolChoice | None = None
     output: StructuredOutputOptions | None = None
+    request_limits: PreparedRequestLimits | None = None
+    prepared_request_committer: PreparedRequestCommitter | None = field(
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.auth is not None and not isinstance(
@@ -149,6 +159,19 @@ class CallOptions:
             self.reasoning, ReasoningOptions
         ):
             raise TypeError("reasoning must be ReasoningOptions")
+        if self.prepared_request_committer is not None and not isinstance(
+            self.prepared_request_committer,
+            PreparedRequestCommitter,
+        ):
+            raise TypeError(
+                "prepared_request_committer must implement "
+                "commit_prepared_request"
+            )
+        if self.request_limits is not None and not isinstance(
+            self.request_limits,
+            PreparedRequestLimits,
+        ):
+            raise TypeError("request_limits must be PreparedRequestLimits or None")
         _validate_tool_choice(self.tool_choice)
 
 
@@ -341,6 +364,7 @@ __all__ = [
     "CallOptions",
     "PairingMode",
     "ReasoningOptions",
+    "PreparedRequestLimits",
     "RetryOptions",
     "StructuredOutputOptions",
     "ThinkingLevel",

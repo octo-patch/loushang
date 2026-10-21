@@ -6,9 +6,57 @@ from dataclasses import dataclass
 KeyId = str
 KeybindingAction = str
 KeybindingConfig = Mapping[KeybindingAction, KeyId | Sequence[KeyId] | None]
+KeybindingDefinitions = Mapping[KeybindingAction, KeyId | Sequence[KeyId]]
 
 
-DEFAULT_KEYBINDINGS: dict[KeybindingAction, tuple[KeyId, ...]] = {
+@dataclass(frozen=True, slots=True)
+class KeybindingCatalog:
+    """Immutable action definitions composed across package and plugin owners."""
+
+    entries: tuple[tuple[KeybindingAction, tuple[KeyId, ...]], ...]
+
+    def __post_init__(self) -> None:
+        seen: set[KeybindingAction] = set()
+        for action, _keys in self.entries:
+            if not action:
+                raise ValueError("Keybinding action ids must be non-empty")
+            if action in seen:
+                raise ValueError(
+                    f"Duplicate keybinding action definition: {action}"
+                )
+            seen.add(action)
+
+    @classmethod
+    def from_definitions(
+        cls,
+        definitions: KeybindingDefinitions,
+    ) -> "KeybindingCatalog":
+        return cls(
+            tuple(
+                (action, (keys,) if isinstance(keys, str) else tuple(keys))
+                for action, keys in definitions.items()
+            )
+        )
+
+    def definitions(self) -> dict[KeybindingAction, tuple[KeyId, ...]]:
+        return dict(self.entries)
+
+    def compose(self, *catalogs: "KeybindingCatalog") -> "KeybindingCatalog":
+        merged = self.definitions()
+        for catalog in catalogs:
+            for action, keys in catalog.entries:
+                if action in merged:
+                    raise ValueError(
+                        f"Duplicate keybinding action definition: {action}"
+                    )
+                merged[action] = keys
+        return KeybindingCatalog.from_definitions(merged)
+
+
+TUI_CORE_KEYBINDING_DEFINITIONS: dict[
+    KeybindingAction,
+    tuple[KeyId, ...],
+] = {
     "tui.editor.cursorUp": ("up",),
     "tui.editor.cursorDown": ("down",),
     "tui.editor.cursorLeft": ("left", "ctrl+b"),
@@ -41,19 +89,24 @@ DEFAULT_KEYBINDINGS: dict[KeybindingAction, tuple[KeyId, ...]] = {
     "tui.input.submit": ("enter",),
     "tui.input.tab": ("tab",),
     "tui.input.copy": ("ctrl+c",),
-    "tui.transcript.open": ("ctrl+o",),
-    "app.clipboard.pasteImage": ("ctrl+v",),
-    "tui.queue.editLast": ("alt+up",),
+    "tui.transcript.open": ("ctrl+t",),
+    "tui.transcript.copyLastAnswer": ("ctrl+o",),
+    "tui.transcript.focusDetail": ("f4",),
     "tui.select.up": ("up", "shift+tab"),
     "tui.select.down": ("down", "alt+down"),
     "tui.select.pageUp": ("pageUp",),
     "tui.select.pageDown": ("pageDown",),
     "tui.select.confirm": ("enter",),
     "tui.select.cancel": ("escape", "ctrl+c"),
-    "tui.continuity.preview": ("space",),
-    "tui.continuity.domain": ("tab",),
-    "tui.continuity.sort": ("ctrl+s",),
 }
+
+TUI_CORE_KEYBINDING_CATALOG = KeybindingCatalog.from_definitions(
+    TUI_CORE_KEYBINDING_DEFINITIONS
+)
+
+# Compatibility name for callers that consume the generic TUI defaults as a
+# mapping. Upper-layer actions intentionally do not belong in this mapping.
+DEFAULT_KEYBINDINGS = TUI_CORE_KEYBINDING_DEFINITIONS
 
 _MODIFIER_ORDER = ("ctrl", "shift", "alt", "super")
 _ALIASES = {
@@ -74,6 +127,7 @@ _ALIASES = {
     "ctrl_j": "ctrl+j",
     "ctrl_k": "ctrl+k",
     "ctrl_o": "ctrl+o",
+    "ctrl_t": "ctrl+t",
     "ctrl_u": "ctrl+u",
     "ctrl_w": "ctrl+w",
     "ctrl_y": "ctrl+y",
@@ -91,11 +145,24 @@ class KeybindingManager:
     def __init__(
         self,
         user_bindings: KeybindingConfig | None = None,
-        definitions: Mapping[KeybindingAction, Sequence[KeyId]] | None = None,
+        definitions: KeybindingDefinitions | None = None,
+        *,
+        catalog: KeybindingCatalog | None = None,
     ) -> None:
+        if definitions is not None and catalog is not None:
+            raise TypeError("Pass definitions or catalog, not both")
+        self._catalog = (
+            catalog
+            if catalog is not None
+            else (
+                TUI_CORE_KEYBINDING_CATALOG
+                if definitions is None
+                else KeybindingCatalog.from_definitions(definitions)
+            )
+        )
         self._definitions = {
             action: tuple(normalize_key_id(key) for key in keys)
-            for action, keys in (definitions or DEFAULT_KEYBINDINGS).items()
+            for action, keys in self._catalog.entries
         }
         self._user_bindings = dict(user_bindings or {})
         self._resolved: dict[KeybindingAction, tuple[KeyId, ...]] = {}
@@ -105,6 +172,17 @@ class KeybindingManager:
     def matches(self, key: KeyId, action: KeybindingAction) -> bool:
         return normalize_key_id(key) in self._resolved.get(action, ())
 
+    def matches_prefer_explicit(self, key: KeyId, action: KeybindingAction) -> bool:
+        """Let an explicit user binding displace another action's default."""
+
+        normalized = normalize_key_id(key)
+        explicit = {
+            owner
+            for owner, keys in self._user_bindings.items()
+            if owner in self._definitions and normalized in _normalize_keys(keys)
+        }
+        return (not explicit or action in explicit) and self.matches(normalized, action)
+
     def keys_for(self, action: KeybindingAction) -> tuple[KeyId, ...]:
         return self._resolved.get(action, ())
 
@@ -113,6 +191,40 @@ class KeybindingManager:
 
     def resolved(self) -> dict[KeybindingAction, tuple[KeyId, ...]]:
         return dict(self._resolved)
+
+    @property
+    def catalog(self) -> KeybindingCatalog:
+        return self._catalog
+
+    def with_catalog(self, catalog: KeybindingCatalog) -> "KeybindingManager":
+        """Compose an upper-layer catalog while preserving raw user overrides."""
+
+        current = self._catalog.definitions()
+        additions: dict[KeybindingAction, tuple[KeyId, ...]] = {}
+        for action, keys in catalog.entries:
+            if action not in current:
+                additions[action] = keys
+                continue
+            if current[action] != keys:
+                raise ValueError(
+                    f"Duplicate keybinding action definition: {action}"
+                )
+        if not additions:
+            return self
+        return KeybindingManager(
+            self._user_bindings,
+            catalog=self._catalog.compose(
+                KeybindingCatalog.from_definitions(additions)
+            ),
+        )
+
+    def with_definitions(
+        self,
+        definitions: KeybindingDefinitions,
+    ) -> "KeybindingManager":
+        """Return a manager with additional actions and the same user overrides."""
+
+        return self.with_catalog(KeybindingCatalog.from_definitions(definitions))
 
     def _rebuild(self) -> None:
         claims: dict[KeyId, set[KeybindingAction]] = {}

@@ -26,6 +26,7 @@ from loushang.ai.types import (
     ToolResultMessage,
     UserMessage,
 )
+from loushang.foundation.json import JSONValue, require_json_mapping
 from loushang.harness.conversation import (
     CommandExecutionRecord,
     ConversationHeader,
@@ -43,6 +44,10 @@ from loushang.harness.transcript.kinds import (
     CONTEXT_COMPACTION_CHECKPOINT_KIND,
     CONVERSATION_METADATA_PATCH_KIND,
     EXTENSION_DATA_KIND,
+    MODEL_CALL_ATTEMPT_USAGE_KIND,
+    MODEL_CALL_OUTCOME_KIND,
+    MODEL_INPUT_COMPONENT_KIND,
+    MODEL_INPUT_PREPARED_KIND,
     MODEL_SELECTION_KIND,
     RECORD_ANNOTATION_PATCH_KIND,
     STANDARD_AGENT_TRANSCRIPT_KINDS,
@@ -56,7 +61,6 @@ from loushang.harness.transcript.types import (
     ContextCompactionCheckpoint,
     RecordAnnotationPatch,
 )
-from loushang.protocol import JSONValue, require_json_mapping
 
 from .ansi import render_ansi_pre
 from .markdown import render_markdown
@@ -74,6 +78,10 @@ HTML_TRANSCRIPT_DISPOSITIONS = {
     EXTENSION_DATA_KIND: "hidden",
     RECORD_ANNOTATION_PATCH_KIND: "tree-only",
     CONVERSATION_METADATA_PATCH_KIND: "metadata-only",
+    MODEL_CALL_OUTCOME_KIND: "hidden",
+    MODEL_CALL_ATTEMPT_USAGE_KIND: "hidden",
+    MODEL_INPUT_COMPONENT_KIND: "hidden",
+    MODEL_INPUT_PREPARED_KIND: "hidden",
 }
 if set(HTML_TRANSCRIPT_DISPOSITIONS) != set(STANDARD_AGENT_TRANSCRIPT_KINDS):
     raise RuntimeError("HTML transcript dispositions must cover every standard kind")
@@ -365,7 +373,7 @@ def _read_asset(name: str) -> str:
 
 
 def _encode_transcript_data(request: TranscriptExportRequest) -> str:
-    data = {
+    data: dict[str, object] = {
         "header": dict(_HEADER_CODEC.encode_header(request.header)),
         "entries": [
             dict(_RECORD_CODEC.encode_record(entry)) for entry in request.entries

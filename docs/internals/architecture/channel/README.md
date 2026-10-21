@@ -6,7 +6,7 @@
 RPC surfaces, and future WebUI/AppUI adapters.
 
 The implementation defines endpoint and envelope types that carry
-`loushang.work.WorkOperation`, `loushang.work.WorkEvent`, and a projected
+`loushang.harnesswork.WorkOperation`, `loushang.harnesswork.WorkEvent`, and a projected
 `loushang.harness.events.RuntimeEventView` across a boundary, plus a
 deliberately narrow JSONL framing adapter for headless clients.
 
@@ -17,14 +17,12 @@ Current code package:
 ```text
 src/loushang/channel/
   __init__.py
+  adapters/
+    harnesswork.py
+    runtime_events.py
   host.py
   json_codec.py
-  jsonl_command_host.py
-  json_projection.py
-  product_host.py
-  remote_ui.py
   rpc_jsonl.py
-  stdout_guard.py
   types.py
 ```
 
@@ -48,26 +46,12 @@ The `rpc_jsonl` surface provides:
   delivery;
 - `ChannelError` for transport or acceptance failure;
 - strict `encode_rpc_jsonl_frame` / `decode_rpc_jsonl_frame` helpers that own
-  one-frame JSONL encoding only; and
-- `project_channel_value` for documented dataclass, `Path`, mapping, list, and
-  tuple transport projection without arbitrary-object coercion.
+  one-frame JSONL encoding only.
 
-`product_host.py` provides reusable Product-host lifecycle mechanics without a
-wire schema: `ProductHostAction` / `ProductHostAdapter`, line-input
-`ProductHostRuntime`, and `ProductHostTaskTracker`. Standard Channel JSONL and
-Product-specific compatibility hosts may share those mechanics while retaining
-their separate protocols.
-
-`stdout_guard.py` preserves a raw protocol stdout stream while routing incidental
-process output to stderr. It is available to any Product whose JSON or JSONL
-transport requires a clean stdout contract.
-
-The Product-owned JSONL command-host surface provides:
-
-- `JsonlCommand` and `JsonlCommandHostError` as strict input observations;
-- `JsonlCommandHost` and its injected `JsonlCommandPort`; and
-- `RemoteUiContext` for request correlation, dialog timeout, and headless UI
-  state without a standardized widget wire schema.
+Reusable Product-host lifecycle, strict JSON projection, Product-owned JSONL
+command input, stdout protection, and remote UI correlation live in
+`loushang.harness.host`. Channel uses those lower-level mechanics where needed
+but does not own or re-export them.
 
 `ChannelEnvelope` accepts two envelope kinds and three payload families:
 
@@ -94,28 +78,36 @@ stdio JSONL loop over an injected `ChannelHostPort`: a Product port accepts a
 `operation_id` and `run_id` retain Work ownership. See
 [Channel Host Boundary](channel-host-boundary.md).
 
-[Product Host Runtime Boundary](product-host-runtime-boundary.md) records the
-separate lower-level host lifecycle shared by standard Channel and
-Product-specific host adapters.
+`adapters/harnesswork.py` owns the HarnessWork-to-Channel operation binding, so HarnessWork
+does not import its transport. `adapters/runtime_events.py` owns the optional
+Harness runtime-view projection. Neither adapter is imported by the Channel
+package root.
 
-`jsonl_command_host.py` supplies a separate, injected strict-JSON input loop
-for Product-owned JSONL command schemas. It does not define a second standard
-Channel frame grammar or response envelope. `remote_ui.py` supplies request
-correlation, dialog timeout, and snapshot mechanics through a Product-injected
-emitter; it does not standardize widget or extension payloads. See
-[JSONL Command Host Boundary](jsonl-command-host-boundary.md).
+[Product Host Runtime Boundary](../harness/product-host-runtime-boundary.md)
+records the lower-level host lifecycle shared by standard Channel and
+Product-specific hosts. [JSONL Command Host Boundary](../harness/jsonl-command-host-boundary.md)
+records the separate Product-owned command input runtime.
 
 ## Ownership
 
-`loushang.channel` may depend on `loushang.work` because the channel boundary
-carries work operations and work events. It may also depend only on
-`loushang.harness.events.projection.RuntimeEventView` to transport an already
-projected runtime observation.
+`loushang.channel` depends on `loushang.harnesswork` because the channel boundary
+carries work operations and work events. It depends downward on selected
+Harness Host mechanics and event-view contracts. The optional runtime-event
+adapter may consume Harness session projection functions; Harness never
+imports Channel, and HarnessWork never imports Channel.
 
-That is a value-contract dependency, not a runtime dependency: Channel must
-not import a Harness session, event bus, publisher, store, or Product adapter.
-Harness must not import Channel. Products select and create runtime views; the
-Channel package only frames and delivers them.
+This dependency is intentional: Channel is currently the typed Work transport,
+not a universal payload bus. Its core owns the stable Work and runtime-view wire
+codec, while `channel.adapters.harnesswork` owns execution binding. A generic
+codec registry, plugin discovery, or opaque payload protocol must not be added
+until a second concrete non-Work transport requirement demonstrates that need.
+
+The package direction is:
+
+```text
+Channel -> HarnessWork -> Harness
+Channel --------> Harness
+```
 
 `loushang.channel` must not depend on:
 
@@ -140,6 +132,7 @@ The current channel package does not implement:
 - UI layout, widgets, rendering, or a universal UI wire protocol
 - direct agent loop or product session control
 - a universal Product RPC command schema
+- a universal payload codec registry or negotiation protocol
 
 Capability negotiation and interaction request/response contracts remain
 future work. They must remain independent of legacy Coding RPC widget and

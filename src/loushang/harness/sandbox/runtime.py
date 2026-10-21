@@ -1,20 +1,35 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from loushang.harness.authorization import (
     EffectiveExecutionProfile,
+    ExecutionProfileProvider,
     constrain_execution_profile,
 )
 from loushang.harness.environment import HostEnvironmentProbe
+from loushang.harness.tools.process_hosting import (
+    ProcessExecutionScope,
+    ScopeBoundProcessLauncher,
+    _bind_process_owner_launcher,
+)
+from loushang.harness.worker.launch import (
+    ManagedWorkerLaunchPort,
+    _bind_managed_worker_launch_port,
+)
 from loushang.harness.workspace.exec import (
     ExecRequest,
     ExecService,
     ExecUpdateCallback,
+    LocalExecBackend,
 )
+from loushang.harness.workspace.process import AuthorizedProcessLauncher
+from loushang.harness.workspace.process.host import ProcessHost
 
 from .binding import SandboxExecutionBinding, bind_sandbox_execution
 from .exec_backend import SandboxScopeRequestFactory
+from .process import HostedProcessContainmentPlanner
 from .registry import SandboxBackendRegistry
 from .service import SandboxDiagnosticSink
 from .types import SandboxSettings, SandboxStatus
@@ -26,16 +41,94 @@ class SandboxExecutionRuntime:
 
     binding: SandboxExecutionBinding
     exec_service: ExecService
+    _process_host: ProcessHost
+    _process_containment: HostedProcessContainmentPlanner
     _closed: bool = False
+    _process_launcher: ScopeBoundProcessLauncher | None = None
+    _worker_launcher: ManagedWorkerLaunchPort | None = None
+    _close_task: asyncio.Task[None] | None = None
 
     def status(self) -> SandboxStatus:
+        override = self._process_containment.status_override()
+        if override is not None:
+            return override
         return self.binding.status()
 
+    def bind_process_launcher(
+        self,
+        scope: ProcessExecutionScope,
+    ) -> AuthorizedProcessLauncher:
+        if self._closed or self._close_task is not None:
+            raise RuntimeError("sandbox execution runtime is closing")
+        if self._process_launcher is not None:
+            raise RuntimeError("process launcher is already bound for this runtime")
+        launcher = _bind_process_owner_launcher(
+            scope=scope,
+            host=self._process_host,
+            containment=self._process_containment,
+            managed_owner_authority=(
+                self._process_containment._claim_managed_process_owner_authority()
+            ),
+            managed_plan_verifier=(
+                self._process_containment._verify_managed_process_plan
+            ),
+        )
+        self._process_launcher = launcher
+        return launcher
+
+    def bind_managed_worker_launch_port(
+        self,
+        scope: ProcessExecutionScope,
+    ) -> ManagedWorkerLaunchPort:
+        """Mint one Worker-only port over the owned Process/Sandbox boundary."""
+
+        if self._closed or self._close_task is not None:
+            raise RuntimeError("sandbox execution runtime is closing")
+        if self._worker_launcher is not None:
+            raise RuntimeError("managed Worker launch port is already bound")
+        launcher = _bind_process_owner_launcher(
+            scope=scope,
+            host=self._process_host,
+            containment=self._process_containment,
+            managed_owner_authority=(
+                self._process_containment._claim_managed_process_owner_authority()
+            ),
+            managed_plan_verifier=(
+                self._process_containment._verify_managed_process_plan
+            ),
+        )
+        port = _bind_managed_worker_launch_port(launcher)
+        self._worker_launcher = port
+        return port
+
     async def close(self) -> None:
-        if self._closed:
-            return
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(
+                self._close_owned(),
+                name="harness-sandbox-execution-runtime-close",
+            )
+            self._close_task = task
+        await _await_close_before_propagating_cancellation(task)
+
+    async def _close_owned(self) -> None:
+        errors: list[BaseException] = []
+        for close in (
+            self._process_host.close,
+            self._process_containment.close,
+            self.binding.close,
+        ):
+            try:
+                await close()
+            except BaseException as exc:
+                errors.append(exc)
         self._closed = True
-        await self.binding.close()
+        if not errors:
+            return
+        primary = errors[0]
+        for secondary in errors[1:]:
+            primary.add_note(f"later cleanup failure: {secondary}")
+        raise primary
 
 
 def bind_sandbox_execution_runtime(
@@ -47,6 +140,7 @@ def bind_sandbox_execution_runtime(
     environment_probe: HostEnvironmentProbe | None = None,
     diagnostic_sink: SandboxDiagnosticSink | None = None,
     execution_profile: EffectiveExecutionProfile | None = None,
+    execution_profile_provider: ExecutionProfileProvider | None = None,
 ) -> SandboxExecutionRuntime:
     """Wrap one existing execution service without creating a bypass path."""
 
@@ -61,6 +155,8 @@ def bind_sandbox_execution_runtime(
         if base_profile is not None and execution_profile is not None
         else execution_profile or base_profile
     )
+    if execution_profile_provider is not None and effective_profile is None:
+        raise TypeError("live execution selection requires an EffectiveExecutionProfile ceiling")
     local_backend = _ExecServiceBackend(base_exec_service)
     binding = bind_sandbox_execution(
         settings=settings,
@@ -70,16 +166,26 @@ def bind_sandbox_execution_runtime(
         scope_request_factory=scope_request_factory,
         diagnostic_sink=diagnostic_sink,
     )
+    process_containment = HostedProcessContainmentPlanner(
+        settings=settings,
+        resolution=binding.resolution,
+        scope_request_factory=scope_request_factory,
+        diagnostic_sink=diagnostic_sink,
+    )
     return SandboxExecutionRuntime(
         binding=binding,
         exec_service=(
             base_exec_service
             if binding.status().state == "disabled" and effective_profile is None
+            and execution_profile_provider is None
             else ExecService(
                 backend=binding.exec_backend,
                 execution_profile=effective_profile,
+                execution_profile_provider=execution_profile_provider,
             )
         ),
+        _process_host=ProcessHost(),
+        _process_containment=process_containment,
     )
 
 
@@ -88,6 +194,18 @@ class _ExecServiceBackend:
 
     def __init__(self, service: ExecService) -> None:
         self._service = service
+        # Disabled containment still wraps live authority. Retain only the
+        # capture capability the delegate explicitly admits; execute-only
+        # adapters must continue to refuse managed output capture.
+        capture_factory = getattr(service, "capture_executor", None)
+        captured = capture_factory() if callable(capture_factory) else None
+        self.execute_captured = None if captured is None else captured.execute
+
+    def _uses_builtin_local_backend(self) -> bool:
+        return (
+            type(self._service) is ExecService
+            and type(self._service._backend) is LocalExecBackend
+        )
 
     async def __call__(
         self,
@@ -101,6 +219,27 @@ class _ExecServiceBackend:
             signal=signal,
             on_update=on_update,
         )
+
+
+async def _await_close_before_propagating_cancellation(
+    task: asyncio.Task[None],
+) -> None:
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(task)
+            break
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            if cancellation is None:
+                cancellation = exc
+        except BaseException as exc:
+            if cancellation is not None:
+                raise cancellation from exc
+            raise
+    if cancellation is not None:
+        raise cancellation
 
 
 __all__ = ["SandboxExecutionRuntime", "bind_sandbox_execution_runtime"]

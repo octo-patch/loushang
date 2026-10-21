@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import pytest
+
 from loushang.harnesstui.status.line import (
     StatusLinePreviewSnapshot,
     StatusLineSettings,
@@ -9,6 +11,7 @@ from loushang.harnesstui.status.line import (
     status_line_separator,
     status_line_style_mode,
 )
+from loushang.tui import RenderConstraints, StatusBar
 
 
 def _snapshot(**overrides: object) -> StatusLinePreviewSnapshot:
@@ -34,13 +37,16 @@ def test_status_line_settings_defaults_match_product_defaults() -> None:
     assert settings.runtime is True
     assert settings.queue == "auto"
     assert settings.message == "auto"
+    assert settings.context == "auto"
     assert settings.separator == "pipe"
     assert settings.style == "codex-like"
 
 
 def test_status_line_fields_use_product_order_priority_and_tokens() -> None:
     fields = status_line_fields(
-        _snapshot(running=True, pending_followups=2, pending_steers=1, status_message="Saved"),
+        _snapshot(
+            running=True, pending_followups=2, pending_steers=1, status_message="Saved"
+        ),
         StatusLineSettings(),
     )
 
@@ -49,7 +55,7 @@ def test_status_line_fields_use_product_order_priority_and_tokens() -> None:
         ("loushang", 90, "workspace"),
         ("main", 80, "branch"),
         ("abcd", 70, "session"),
-        ("perm=standard", 35, "permissions"),
+        ("standard", 35, "permissions"),
         ("running", 60, "runtime.running"),
         ("queued=2 steer=1", 50, "queue"),
         ("Saved", 40, "message"),
@@ -67,10 +73,56 @@ def test_status_line_fields_keep_current_missing_value_fallbacks() -> None:
         "cwd",
         "no-branch",
         "no-session",
-        "perm=standard",
+        "standard",
         "idle",
     ]
     assert fields[5].token == "runtime.idle"
+
+
+def test_status_line_fields_show_only_model_from_full_model_identity() -> None:
+    fields = status_line_fields(
+        _snapshot(model_label="kimi-code:kimi-code-anthropic:kimi-for-coding"),
+        StatusLineSettings(),
+    )
+
+    assert fields[0].text == "kimi-for-coding"
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        (None, "d8525f5e"),
+        ("d8525f5ecd8c42e2974dd451b640c5f8", "d8525f5e"),
+        ("My session", "My session"),
+        ("deadbeef0123456789abcdef", "deadbeef0123456789abcdef"),
+    ],
+)
+def test_status_line_shortens_only_the_identity_fallback(name, expected) -> None:
+    session_id = "d8525f5ecd8c42e2974dd451b640c5f8"
+    snapshot = _snapshot(session_label=name, session_id=session_id)
+    field = next(
+        item
+        for item in status_line_fields(snapshot, StatusLineSettings())
+        if item.token == "session"
+    )
+    assert field.text == expected
+    assert snapshot.session_id == session_id
+    assert snapshot.session_label == name
+
+
+def test_context_display_preserves_the_original_usage_metadata() -> None:
+    usage = {
+        "percent": 35.6,
+        "source": "estimated_from_last_usage",
+        "accuracy": "projected",
+    }
+    original = dict(usage)
+    snapshot = _snapshot(context_usage=usage)
+    field = status_line_fields(snapshot, StatusLineSettings())[-1]
+    assert field.text == "64% left"
+    assert field.token == "context.estimated"
+    assert snapshot.context_usage == original
+    assert usage == original
 
 
 def test_status_line_fields_can_disable_regular_fields() -> None:
@@ -92,20 +144,32 @@ def test_status_line_fields_can_disable_regular_fields() -> None:
 def test_status_line_queue_auto_true_false_behavior() -> None:
     snapshot = _snapshot()
 
-    assert [field.text for field in status_line_fields(snapshot, StatusLineSettings(queue="auto"))] == [
+    assert [
+        field.text
+        for field in status_line_fields(snapshot, StatusLineSettings(queue="auto"))
+    ] == [
         "moonshot/kimi-for-coding",
         "loushang",
         "main",
         "abcd",
-        "perm=standard",
+        "standard",
         "idle",
     ]
-    assert status_line_fields(snapshot, StatusLineSettings(queue="true"))[-1].text == "queued=0 steer=0"
-    assert all(field.token != "queue" for field in status_line_fields(snapshot, StatusLineSettings(queue="false")))
+    assert (
+        status_line_fields(snapshot, StatusLineSettings(queue="true"))[-1].text
+        == "queued=0 steer=0"
+    )
+    assert all(
+        field.token != "queue"
+        for field in status_line_fields(snapshot, StatusLineSettings(queue="false"))
+    )
 
 
 def test_status_line_queue_auto_shows_when_data_exists() -> None:
-    fields = status_line_fields(_snapshot(pending_followups=1, pending_steers=3), StatusLineSettings(queue="auto"))
+    fields = status_line_fields(
+        _snapshot(pending_followups=1, pending_steers=3),
+        StatusLineSettings(queue="auto"),
+    )
 
     assert fields[-1].text == "queued=1 steer=3"
     assert fields[-1].token == "queue"
@@ -114,13 +178,110 @@ def test_status_line_queue_auto_shows_when_data_exists() -> None:
 def test_status_line_message_auto_true_false_behavior() -> None:
     snapshot = _snapshot(status_message=None)
 
-    assert all(field.token != "message" for field in status_line_fields(snapshot, StatusLineSettings(message="auto")))
-    assert status_line_fields(snapshot, StatusLineSettings(message="true"))[-1].text == "no status"
-    assert all(field.token != "message" for field in status_line_fields(snapshot, StatusLineSettings(message="false")))
+    assert all(
+        field.token != "message"
+        for field in status_line_fields(snapshot, StatusLineSettings(message="auto"))
+    )
+    assert (
+        status_line_fields(snapshot, StatusLineSettings(message="true"))[-1].text
+        == "no status"
+    )
+    assert all(
+        field.token != "message"
+        for field in status_line_fields(snapshot, StatusLineSettings(message="false"))
+    )
+
+
+def test_status_line_context_distinguishes_measurement_quality() -> None:
+    measured = status_line_fields(
+        _snapshot(context_usage={"percent": 66.2, "source": "assistant_usage"}),
+        StatusLineSettings(),
+    )[-1]
+    estimated = status_line_fields(
+        _snapshot(
+            context_usage={"percent": 66.2, "source": "estimated_from_last_usage"}
+        ),
+        StatusLineSettings(),
+    )[-1]
+    stale = status_line_fields(
+        _snapshot(
+            context_usage={
+                "percent": 66.2,
+                "source": "assistant_usage",
+                "staleAfterCompaction": True,
+            }
+        ),
+        StatusLineSettings(),
+    )[-1]
+    changed = status_line_fields(
+        _snapshot(
+            context_usage={
+                "percent": 66.2,
+                "source": "assistant_usage",
+                "accuracy": "projected",
+                "structuralEnvelopeStatus": "logical_mismatch",
+            }
+        ),
+        StatusLineSettings(),
+    )[-1]
+
+    assert (measured.text, measured.token) == ("34% left", "context.measured")
+    assert (estimated.text, estimated.token) == (
+        "34% left",
+        "context.estimated",
+    )
+    assert (stale.text, stale.token) == (
+        "34% left stale",
+        "context.stale",
+    )
+    assert (changed.text, changed.token) == (
+        "34% left changed",
+        "context.estimated",
+    )
+    assert (
+        status_line_fields(
+            _snapshot(context_usage=None), StatusLineSettings(context="true")
+        )[-1].text
+        == "ctx ?"
+    )
+
+
+@pytest.mark.parametrize("width", [120, 80, 50, 20])
+def test_status_line_context_never_displaces_higher_priority_fields(width: int) -> None:
+    settings = StatusLineSettings()
+    without_context = (
+        StatusBar(status_line_fields(_snapshot(), settings))
+        .render(RenderConstraints(width=width, max_height=1))
+        .lines[0]
+        .text
+    )
+    with_context = (
+        StatusBar(
+            status_line_fields(
+                _snapshot(
+                    context_usage={
+                        "percent": 65.625,
+                        "source": "estimated_from_last_usage",
+                    }
+                ),
+                settings,
+            )
+        )
+        .render(RenderConstraints(width=width, max_height=1))
+        .lines[0]
+        .text
+    )
+
+    assert with_context in {
+        without_context,
+        f"{without_context} | 34% left",
+    }
 
 
 def test_status_line_message_auto_shows_when_data_exists() -> None:
-    fields = status_line_fields(_snapshot(status_message="Status line: on"), StatusLineSettings(message="auto"))
+    fields = status_line_fields(
+        _snapshot(status_message="Status line: on"), StatusLineSettings(message="auto")
+    )
 
     assert fields[-1].text == "Status line: on"
     assert fields[-1].token == "message"
@@ -129,6 +290,8 @@ def test_status_line_message_auto_shows_when_data_exists() -> None:
 def test_status_line_separator_and_style_mapping() -> None:
     assert status_line_separator(StatusLineSettings(separator="pipe")) == " | "
     assert status_line_separator(StatusLineSettings(separator="dot")) == " · "
-    assert status_line_style_mode(StatusLineSettings(style="codex-like")) == "codex-like"
+    assert (
+        status_line_style_mode(StatusLineSettings(style="codex-like")) == "codex-like"
+    )
     assert status_line_style_mode(StatusLineSettings(style="muted")) == "muted"
     assert status_line_style_mode(StatusLineSettings(style="plain")) == "plain"

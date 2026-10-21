@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass
 from io import StringIO
-from typing import Any
+from typing import Any, Literal
 
 from loushang.tui import (
     FakeTerminalPort,
@@ -155,10 +154,11 @@ def test_runner_context_request_render_wakes_input_wait() -> None:
 
         return await TuiRunner(
             tui,
-            stdin=_BlockingAfterFirstInput(first="x", block_seconds=0.03),
+            stdin=StringIO(""),
             stdout=stdout,
             terminal_session_factory=_recording_terminal_session_factory(),
             terminal_size_provider=lambda: TerminalSize(columns=20, rows=5),
+            input_chunk_reader=_AsyncAfterFirstInput(first="x", block_seconds=0.03),
         ).run(on_input=handle)
 
     assert asyncio.run(run()) == 0
@@ -202,10 +202,11 @@ def test_runner_rejects_reentrant_run_calls() -> None:
     tui = Tui()
     runner = TuiRunner(
         tui,
-        stdin=_BlockingAfterFirstInput(first="x", block_seconds=0.03),
+        stdin=StringIO(""),
         stdout=StringIO(),
         terminal_session_factory=_recording_terminal_session_factory(),
         terminal_size_provider=lambda: TerminalSize(columns=20, rows=5),
+        input_chunk_reader=_AsyncAfterFirstInput(first="x", block_seconds=0.03),
     )
     errors: list[str] = []
 
@@ -301,10 +302,11 @@ def test_runner_polls_terminal_runtime_fallback_on_idle_wakeup() -> None:
 
         return await TuiRunner(
             Tui(),
-            stdin=_BlockingAfterFirstInput(first="x", block_seconds=0.03),
+            stdin=StringIO(""),
             stdout=StringIO(),
             terminal_session_factory=lambda _stdin, _stdout: session,
             terminal_size_provider=lambda: TerminalSize(columns=20, rows=5),
+            input_chunk_reader=_AsyncAfterFirstInput(first="x", block_seconds=0.03),
         ).run(on_input=handle)
 
     assert asyncio.run(run()) == 0
@@ -347,7 +349,9 @@ class _RecordingTerminalSession:
         self.entered += 1
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> bool:
+    def __exit__(
+        self, exc_type: object, exc: object, traceback: object
+    ) -> Literal[False]:
         self.exited += 1
         return False
 
@@ -378,18 +382,68 @@ def _recording_terminal_session_factory() -> Any:
     return lambda _stdin, _stdout: _RecordingTerminalSession()
 
 
-class _BlockingAfterFirstInput:
+class _AsyncAfterFirstInput:
     def __init__(self, *, first: str, block_seconds: float) -> None:
         self._first = first
         self._block_seconds = block_seconds
         self._calls = 0
 
-    def read(self, _size: int) -> str:
+    async def __call__(self, _stdin: Any) -> str:
         self._calls += 1
         if self._calls == 1:
             return self._first
-        time.sleep(self._block_seconds)
+        await asyncio.sleep(self._block_seconds)
         return ""
 
-    def isatty(self) -> bool:
-        return False
+
+def test_runner_exits_when_context_requests_stop_without_input() -> None:
+    tui = Tui()
+    tui.add_child(_MutableRenderable(("ready",)))
+
+    async def run() -> int:
+        async def handle(event: InputEvent, context: object) -> TuiInputResult:
+            # Simulate an external completion (e.g. a background activation
+            # task) asking the loop to stop after this event is handled.
+            context.request_stop(5)
+            return TuiInputResult()
+
+        return await TuiRunner(
+            tui,
+            stdin=StringIO("x"),
+            stdout=StringIO(),
+            terminal_session_factory=_recording_terminal_session_factory(),
+            terminal_size_provider=lambda: TerminalSize(columns=20, rows=5),
+        ).run(on_input=handle)
+
+    assert asyncio.run(run()) == 5
+
+
+def test_runner_exits_when_background_task_requests_stop_while_input_waits() -> None:
+    tui = Tui()
+    tui.add_child(_MutableRenderable(("ready",)))
+
+    async def run() -> int:
+        async def wait_for_input(_stdin: object) -> str:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def start(context: Any) -> None:
+            async def stop_later() -> None:
+                await asyncio.sleep(0)
+                context.request_stop(6)
+
+            asyncio.create_task(stop_later())
+
+        return await asyncio.wait_for(
+            TuiRunner(
+                tui,
+                stdin=StringIO(""),
+                stdout=StringIO(),
+                terminal_session_factory=_recording_terminal_session_factory(),
+                terminal_size_provider=lambda: TerminalSize(columns=20, rows=5),
+                input_chunk_reader=wait_for_input,
+            ).run(on_start=start),
+            timeout=0.1,
+        )
+
+    assert asyncio.run(run()) == 6

@@ -11,6 +11,10 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import TextIO
 
+from loushang.foundation.runtime_scope import (
+    RuntimeScope,
+    resolve_runtime_scope,
+)
 from loushang.harness.cli.agent_args import AgentCliArgs
 from loushang.harness.cli.command_execution import (
     CommandExecutionError,
@@ -56,6 +60,7 @@ from loushang.harness.cli.plugin_listing import (
     format_plugin_records,
     list_plugin_records,
 )
+from loushang.harness.cli.plugin_management import PluginManagementCliBinding
 from loushang.harness.cli.resource_toggles import (
     ResourceToggleError,
     ResourceToggleRequest,
@@ -81,6 +86,11 @@ from loushang.harness.cli.skill_listing import (
     list_skill_records,
 )
 from loushang.harness.diagnostics import export_diagnostics_bundle
+from loushang.harness.runtime.resources import (
+    DEFAULT_ARTIFACT_STORE_FACTORY,
+    ArtifactStoreFactory,
+    RuntimeResourceOwner,
+)
 from loushang.harness.session.model_selection import format_model_metadata_table
 from loushang.harness.transcript.session_catalog import try_project_session_record
 
@@ -139,7 +149,11 @@ async def run_agent_cli_early_operation(
         output.write(ports.format_help(extension_flags))
         return 0
     if args.version:
-        stdout.write(f"{ports.package_version()}\n")
+        if args.verbose:
+            identity = ports.runtime_identity(project_root)
+            stdout.write(ports.format_runtime_identity(identity) + "\n")
+        else:
+            stdout.write(f"{ports.package_version()}\n")
         return 0
     if args.source_info:
         source_identity = ports.runtime_identity(project_root)
@@ -164,20 +178,43 @@ def run_diagnostics_export_operation(
     stderr: TextIO,
     format_error: CliErrorFormatter = str,
     success_prefix: str = "Exported diagnostics to:",
+    runtime_scope_factory: Callable[[], RuntimeScope] = resolve_runtime_scope,
+    artifact_store_factory: ArtifactStoreFactory = DEFAULT_ARTIFACT_STORE_FACTORY,
 ) -> int | None:
     """Export diagnostics through the shared archive engine."""
 
     if not requested:
         return None
     try:
-        output_path = export_diagnostics_bundle(
-            project_root=project_root,
-            session_dir=session_dir,
-            output=output,
-            diagnostics_service=diagnostics_service,
-            debug_latest_path=debug_latest_path,
-            trace_latest_path=trace_latest_path,
-        )
+        scope = runtime_scope_factory()
+        with RuntimeResourceOwner.acquire(
+            scope,
+            artifact_store_factory=artifact_store_factory,
+        ) as runtime_resources:
+            snapshot_roots = (
+                (
+                    Path(debug_latest_path).expanduser().parent
+                    if debug_latest_path is not None
+                    else scope.paths.state / "debug"
+                ),
+                (
+                    Path(trace_latest_path).expanduser().parent
+                    if trace_latest_path is not None
+                    else scope.paths.state / "traces"
+                ),
+            )
+            output_path = export_diagnostics_bundle(
+                project_root=project_root,
+                session_dir=session_dir,
+                output=output,
+                diagnostics_service=diagnostics_service,
+                debug_latest_path=debug_latest_path,
+                trace_latest_path=trace_latest_path,
+                artifact_store=runtime_resources.artifact_snapshots(
+                    allowed_roots=snapshot_roots,
+                ),
+                platform_paths=scope.paths,
+            )
     except Exception as error:
         stderr.write(f"Error: {format_error(error)}\n")
         return 1
@@ -220,12 +257,17 @@ class StandardCliOperationRequest:
 
 def agent_session_listing_request(
     args: AgentCliArgs,
+    *,
+    default_cwd: str | Path | None = None,
 ) -> SessionListingOperationRequest | None:
     if not args.list_sessions:
         return None
+    cwd = args.session_cwd
+    if cwd is None and not args.all_sessions and default_cwd is not None:
+        cwd = str(Path(default_cwd).expanduser().resolve(strict=False))
     return SessionListingOperationRequest(
         output_format=args.list_sessions_format,
-        cwd=args.session_cwd,
+        cwd=cwd,
         name=args.session_name_filter,
         parent_session=args.session_parent,
         text=args.session_query,
@@ -243,13 +285,14 @@ def run_agent_cli_session_listing(
     *,
     stdout: TextIO,
     stderr: TextIO,
+    default_cwd: str | Path | None = None,
     format_error: CliErrorFormatter = str,
 ) -> int | None:
     """Run the session listing selected by standard Agent CLI arguments."""
 
     return run_session_listing_operation(
         runtime,
-        agent_session_listing_request(args),
+        agent_session_listing_request(args, default_cwd=default_cwd),
         stdout=stdout,
         stderr=stderr,
         format_error=format_error,
@@ -291,9 +334,7 @@ def agent_standard_cli_operation_request(
         else None,
         diagnostics_output_format=args.list_diagnostics_format,
         skill_listing_format=args.list_skills_format if args.list_skills else None,
-        plugin_listing_format=args.list_plugins_format
-        if args.list_plugins
-        else None,
+        plugin_listing_format=args.list_plugins_format if args.list_plugins else None,
         package_lifecycle=package_request if package_request.has_operations else None,
         command=CommandExecutionRequest(
             command=args.command,
@@ -315,6 +356,8 @@ async def run_standard_cli_operations(
     stdout: TextIO,
     stderr: TextIO,
     insertions: Sequence[CliOperationInsertion] = (),
+    additional_listing_requested: bool = False,
+    plugin_management: PluginManagementCliBinding | None = None,
     evaluate_install_source: PolicyEvaluator | None = None,
     on_policy_denied: PolicyDeniedHandler | None = None,
     format_error: CliErrorFormatter = str,
@@ -367,7 +410,7 @@ async def run_standard_cli_operations(
         CliOperationStage(
             "list_plugins",
             lambda: run_plugin_listing_operation(
-                settings_manager,
+                plugin_management,
                 request.plugin_listing_format,
                 stdout=stdout,
                 stderr=stderr,
@@ -408,9 +451,19 @@ async def run_standard_cli_operations(
             ),
         ),
     )
+    has_listing = any(
+        (
+            additional_listing_requested,
+            request.command_listing_format is not None,
+            request.diagnostics is not None,
+            request.skill_listing_format is not None,
+            request.plugin_listing_format is not None,
+            request.model_listing is not None,
+        )
+    )
     return await CliOperationSequence(
         compose_cli_operation_stages(stages, insertions)
-    ).run()
+    ).run(continue_after=frozenset({"export"}) if has_listing else frozenset())
 
 
 def run_session_listing_operation(
@@ -489,7 +542,7 @@ def run_model_listing_operation(
         stdout.write(format_model_metadata_table(entries))
     else:
         for selection in entries:
-            stdout.write(f"{selection['provider']}/{selection['model_id']}\n")
+            stdout.write(f"{selection['id']}\n")
     return 0
 
 
@@ -549,7 +602,7 @@ def run_skill_listing_operation(
 
 
 def run_plugin_listing_operation(
-    settings_manager: object | None,
+    plugin_management: PluginManagementCliBinding | None,
     output_format: str | None,
     *,
     stdout: TextIO,
@@ -559,7 +612,7 @@ def run_plugin_listing_operation(
     if output_format is None:
         return None
     try:
-        records = list_plugin_records(settings_manager)
+        records = list_plugin_records(plugin_management)
     except PluginListingError as error:
         return _write_error(stderr, error, format_error=format_error)
     stdout.write(format_plugin_records(records, output_format))
@@ -572,6 +625,7 @@ def run_resource_toggle_operation(
     *,
     stdout: TextIO,
     stderr: TextIO,
+    plugin_management: PluginManagementCliBinding | None = None,
     evaluate_plugin_source: PolicyEvaluator | None = None,
     is_remote_plugin_source: RemoteSourcePredicate | None = None,
     on_policy_denied: PolicyDeniedHandler | None = None,
@@ -579,13 +633,14 @@ def run_resource_toggle_operation(
 ) -> int | None:
     if request is None or not request.has_operations:
         return None
-    if settings_manager is None:
+    if settings_manager is None and request.requires_settings:
         stderr.write("Error: settings manager is not available.\n")
         return 1
     try:
         result = apply_resource_toggles(
             settings_manager,
             request,
+            plugin_management=plugin_management,
             evaluate_plugin_source=evaluate_plugin_source,
             is_remote_plugin_source=is_remote_plugin_source,
             on_policy_denied=on_policy_denied,

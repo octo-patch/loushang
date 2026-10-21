@@ -49,6 +49,7 @@ def test_prompt_command_renders_stable_transcript_and_worked() -> None:
         async def prompt(self, user_input: str, images=None) -> None:
             del user_input, images
             assistant = AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[TextPart(type="text", text="done")],
                 api="anthropic-messages",
@@ -125,7 +126,6 @@ def test_prompt_plan_command_preserves_transcript_and_uses_one_work_run() -> Non
             self.prompts: list[str] = []
             self.listeners = []
             self.runtime_listeners = []
-            self.wait_calls = 0
 
         def get_model_selection(self):
             return None
@@ -142,9 +142,6 @@ def test_prompt_plan_command_preserves_transcript_and_uses_one_work_run() -> Non
             del images
             self.prompts.append(text)
 
-        async def wait_for_idle(self) -> None:
-            self.wait_calls += 1
-
     async def scenario() -> None:
         runtime = FakeRuntime()
         session = FakeSession()
@@ -153,9 +150,7 @@ def test_prompt_plan_command_preserves_transcript_and_uses_one_work_run() -> Non
             SessionWorkTurn(
                 "inspect", plan_id="plan-1", step_id="step-1", step_index=0
             ),
-            SessionWorkTurn(
-                "verify", plan_id="plan-1", step_id="step-2", step_index=1
-            ),
+            SessionWorkTurn("verify", plan_id="plan-1", step_id="step-2", step_index=1),
         )
         stdout = StringIO()
 
@@ -170,7 +165,6 @@ def test_prompt_plan_command_preserves_transcript_and_uses_one_work_run() -> Non
 
         assert exit_code == 0
         assert session.prompts == ["inspect", "verify"]
-        assert session.wait_calls == 2
         assert runtime.dispose_calls == 1
         assert "› inspect\n" in stdout.getvalue()
         assert "› verify\n" in stdout.getvalue()
@@ -201,7 +195,9 @@ def test_prompt_command_selects_usable_model_before_prompt() -> None:
 
     class FakeSession:
         def __init__(self) -> None:
-            self.current_model = ModelSelection(provider="unknown", model_id="unknown")
+            self.current_model = ModelSelection(
+                endpoint_id="test-endpoint", provider="unknown", model_id="unknown"
+            )
             self.set_model_calls = []
             self.listeners = []
             self.prompt_calls = []
@@ -215,7 +211,9 @@ def test_prompt_command_selects_usable_model_before_prompt() -> None:
         async def set_model(self, selection):
             self.set_model_calls.append(selection)
             self.current_model = ModelSelection(
-                provider=selection.provider_id, model_id=selection.id
+                endpoint_id="test-endpoint",
+                provider=selection.provider_id,
+                model_id=selection.id,
             )
 
         def subscribe(self, listener):
@@ -245,7 +243,14 @@ def test_prompt_command_selects_usable_model_before_prompt() -> None:
         assert exit_code == 0
         assert session.set_model_calls == [kimi]
         assert session.prompt_calls == [
-            ("hello", ModelSelection(provider="kimi-code", model_id="kimi-for-coding"))
+            (
+                "hello",
+                ModelSelection(
+                    endpoint_id="test-endpoint",
+                    provider="kimi-code",
+                    model_id="kimi-for-coding",
+                ),
+            )
         ]
 
     asyncio.run(scenario())
@@ -399,7 +404,6 @@ def test_prompt_command_runs_follow_ups_with_images_only_on_first_turn() -> None
         def __init__(self) -> None:
             self.listeners = []
             self.prompt_calls = []
-            self.wait_calls = 0
 
         def subscribe(self, listener):
             self.listeners.append(listener)
@@ -411,9 +415,6 @@ def test_prompt_command_runs_follow_ups_with_images_only_on_first_turn() -> None
 
         async def prompt(self, user_input: str, images=None) -> None:
             self.prompt_calls.append((user_input, images))
-
-        async def wait_for_idle(self) -> None:
-            self.wait_calls += 1
 
     async def scenario() -> None:
         session = FakeSession()
@@ -435,7 +436,6 @@ def test_prompt_command_runs_follow_ups_with_images_only_on_first_turn() -> None
             ("second", None),
             ("third", None),
         ]
-        assert session.wait_calls == 3
         assert session.listeners == []
         assert stdout.getvalue().count("─ Worked for ") == 3
 

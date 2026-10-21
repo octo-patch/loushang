@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import errno
 import inspect
+import os
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Generic, Literal, Protocol, TypeVar
 
 from loushang.harness.runtime import (
     CancelledSessionOperation,
+    FileCopy,
     SessionOperationCandidate,
     SessionOperationCoordinator,
     SessionOperationFailure,
     SessionOperationPhase,
     SessionOperationResult,
     SessionTransitionHost,
+    VerifiedFileCopy,
     copy_file_exclusive,
     stage_file_import,
 )
@@ -35,7 +39,9 @@ TransitionReleaseCallback = Callable[
     Awaitable[None] | None,
 ]
 LifecycleCallback = Callable[[], Awaitable[None] | None]
-FileCopy = Callable[[Path, Path], None]
+def _absolute_path_preserving_leaf(path: str | Path) -> Path:
+    absolute = Path(os.path.abspath(Path(path).expanduser()))
+    return absolute.parent.resolve(strict=False) / absolute.name
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,14 @@ class SessionLifecycleTransition:
     fork_entry_id: str | None = None
     fork_position: str | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+
+
+ImportCandidate = Callable[
+    [SessionT | None, SessionLifecycleTransition], Awaitable[SessionT]
+]
+ImportCandidateFactory = Callable[
+    [Path, Path, str | None, str | None], ImportCandidate[SessionT] | None
+]
 
 
 @dataclass(frozen=True)
@@ -99,7 +113,8 @@ class PreparedSessionLifecycleOperation(Generic[SessionT, PayloadT]):
         self._transition = transition
         self._previous = previous
         self._candidate = candidate
-        self._state: Literal["prepared", "consuming", "consumed", "closed"] = "prepared"
+        self._state: Literal["prepared", "consuming", "consumed", "aborting", "closed"] = "prepared"
+        self._abort_task: asyncio.Task[None] | None = None
 
     @property
     def consumed(self) -> bool:
@@ -115,20 +130,55 @@ class PreparedSessionLifecycleOperation(Generic[SessionT, PayloadT]):
             result = await self._runtime._consume_prepared(
                 transition=self._transition,
                 previous=self._previous,
-                candidate=self._candidate,
+                candidate=replace(self._candidate, rollback=self._rollback_unpublished),
+                on_delivered=self._mark_delivered,
             )
         except BaseException:
-            self._state = "closed"
+            if self._state == "consuming":
+                self._state = "aborting"
+            if self._state == "aborting":
+                # The coordinator has released its transition lock. Product
+                # cleanup may acquire that lock from the retained abort task.
+                await self.abort()
             raise
         self._state = "consumed"
         return result
 
+    def _mark_delivered(self) -> None:
+        # Called before product activation, while the transition owns the slot.
+        # Delivery remains true even if a later hook replaces the current slot.
+        self._state = "consumed"
+
+    async def _rollback_unpublished(self) -> None:
+        # Called under the coordinator's transition lock: retain responsibility
+        # in consuming (including during failure observers), then switch to
+        # aborting and join cleanup after _consume_prepared has unwound.
+        return None
+
     async def abort(self) -> None:
-        if self._state != "prepared":
+        if self._state not in {"prepared", "aborting"}:
             return
-        self._state = "closed"
+        self._state = "aborting"
+        task = self._abort_task
+        if task is None or (task.done() and (task.cancelled() or task.exception() is not None)):
+            # Retain the cleanup independently of any individual close waiter.
+            # A failed attempt stays aborting and retries the same candidate.
+            task = asyncio.Task(self._abort_candidate(), loop=asyncio.get_running_loop())
+            self._abort_task = task
+            task.add_done_callback(self._observe_abort)
+        await asyncio.shield(task)
+
+    async def _abort_candidate(self) -> None:
         if self._candidate.rollback is not None:
             await _maybe_await(self._candidate.rollback())
+        self._state = "closed"
+
+    @staticmethod
+    def _observe_abort(task: asyncio.Task[None]) -> None:
+        # Retrieve failures even if every waiter was cancelled; the retained
+        # task still carries the error for the next explicit close/retry.
+        if not task.cancelled():
+            task.exception()
 
     async def close(self) -> None:
         await self.abort()
@@ -267,15 +317,21 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
         fork_profile: ForkProfile = DEFAULT_FORK_PROFILE,
         fork_target_resolver: ForkTargetResolver[SessionT, PayloadT] | None = None,
         copy_file: FileCopy = copy_file_exclusive,
+        verified_copy_file: VerifiedFileCopy | None = None,
+        prepare_import_candidate: ImportCandidateFactory[SessionT] | None = None,
+        mark_candidate_delivered: Callable[[SessionT], None] | None = None,
     ) -> None:
         if hooks.dispose_session is None:
             raise ValueError("Session lifecycle hooks require dispose_session.")
         self.store = store
+        self._mark_candidate_delivered = mark_candidate_delivered
         self.hooks = hooks
         self._dispose_session = hooks.dispose_session
         self.fork_profile = fork_profile
         self._fork_target_resolver = fork_target_resolver or _default_fork_target
         self._copy_file = copy_file
+        self._verified_copy_file = verified_copy_file
+        self._prepare_import_candidate = prepare_import_candidate
         self._host = SessionTransitionHost(
             current_session,
             dispose=self._dispose_session,
@@ -357,32 +413,16 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             metadata=metadata or {},
         )
 
-        async def _restore(current: SessionT | None) -> SessionT:
-            try:
-                session = await self.store.restore(current, transition, session_ref)
-            except MissingSessionCwdError as exc:
-                if missing_cwd != "fallback" or fallback_cwd is None:
-                    raise _with_fallback_cwd(exc, fallback_cwd) from exc
-                return await self.store.restore(
-                    current,
-                    transition,
-                    session_ref,
-                    cwd_override=fallback_cwd,
-                )
-            issue = self._missing_cwd_issue(session, fallback_cwd=fallback_cwd)
-            if issue is None:
-                return session
-            await _maybe_await(self._dispose_session(session))
-            if missing_cwd != "fallback" or fallback_cwd is None:
-                raise MissingSessionCwdError(issue)
-            return await self.store.restore(
+        return await self._run(
+            transition,
+            lambda current: self._restore_candidate(
                 current,
-                transition,
-                session_ref,
-                cwd_override=fallback_cwd,
-            )
-
-        return await self._run(transition, _restore)
+                transition=transition,
+                session_ref=session_ref,
+                fallback_cwd=fallback_cwd,
+                missing_cwd=missing_cwd,
+            ),
+        )
 
     async def prepare_restore(
         self,
@@ -399,44 +439,26 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             target_session_ref=str(session_ref),
             metadata=metadata or {},
         )
+        return await self._prepare_candidate(
+            transition,
+            lambda previous: self._restore_candidate(
+                previous, transition=transition, session_ref=session_ref,
+                fallback_cwd=fallback_cwd, missing_cwd=missing_cwd,
+            ),
+        )
 
-        async def _restore(current: SessionT | None) -> SessionT:
-            try:
-                session = await self.store.restore(current, transition, session_ref)
-            except MissingSessionCwdError as exc:
-                if missing_cwd != "fallback" or fallback_cwd is None:
-                    raise _with_fallback_cwd(exc, fallback_cwd) from exc
-                return await self.store.restore(
-                    current,
-                    transition,
-                    session_ref,
-                    cwd_override=fallback_cwd,
-                )
-            issue = self._missing_cwd_issue(session, fallback_cwd=fallback_cwd)
-            if issue is None:
-                return session
-            await _maybe_await(self._dispose_session(session))
-            if missing_cwd != "fallback" or fallback_cwd is None:
-                raise MissingSessionCwdError(issue)
-            return await self.store.restore(
-                current,
-                transition,
-                session_ref,
-                cwd_override=fallback_cwd,
-            )
-
+    async def _prepare_candidate(
+        self,
+        transition: SessionLifecycleTransition,
+        build: Callable[[SessionT | None], Awaitable[SessionT]],
+    ) -> PreparedSessionLifecycleOperation[SessionT, PayloadT]:
         async with self._host.transition():
             previous = self._host.current
-            decision = await _maybe_await(
-                self.hooks.before_transition(previous, transition)
-                if self.hooks.before_transition is not None
-                else None
-            )
-            if decision is not None and decision.cancelled:
+            if await self._transition_cancelled(previous, transition):
                 raise SessionLifecyclePreparationCancelledError(
                     "session lifecycle preparation was cancelled"
                 )
-            session = await _maybe_await(_restore(previous))
+            session = await build(previous)
 
             async def _rollback() -> None:
                 await _maybe_await(self._dispose_session(session))
@@ -455,6 +477,60 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             previous=previous,
             candidate=candidate,
         )
+
+    async def prepare_import_file(
+        self,
+        input_path: str | Path,
+        *,
+        destination_dir: Path,
+        cwd_override: str | None = None,
+        expected_source_fingerprint: str | None = None,
+        metadata: Mapping[str, object] | None = None,
+    ) -> PreparedSessionLifecycleOperation[SessionT, PayloadT]:
+        """Stage an external transcript as an abortable authority restore."""
+
+        source = Path(input_path).expanduser()
+        if self._prepare_import_candidate is not None:
+            build = self._prepare_import_candidate(
+                source, destination_dir, cwd_override, expected_source_fingerprint,
+            )
+            if build is not None:
+                transition = SessionLifecycleTransition(
+                    reason="resume", target_session_ref=str(source), metadata=metadata or {},
+                )
+                return await self._prepare_candidate(
+                    transition, lambda previous: build(previous, transition),
+                )
+        staged = stage_file_import(
+            source,
+            destination_dir,
+            copy_file=self._copy_file,
+            verified_copy_file=self._verified_copy_file,
+            expected_source_fingerprint=expected_source_fingerprint,
+        )
+        try:
+            prepared = await self.prepare_restore(
+                staged.destination,
+                fallback_cwd=cwd_override,
+                missing_cwd="fallback" if cwd_override is not None else "error",
+                metadata=metadata,
+            )
+        except BaseException:
+            staged.cleanup()
+            raise
+        original_rollback = prepared._candidate.rollback
+        original_rollback_complete = False
+
+        async def rollback() -> None:
+            nonlocal original_rollback_complete
+            if not original_rollback_complete:
+                if original_rollback is not None:
+                    await _maybe_await(original_rollback())
+                original_rollback_complete = True
+            staged.cleanup()
+
+        prepared._candidate = replace(prepared._candidate, rollback=rollback)
+        return prepared
 
     async def fork(
         self,
@@ -494,14 +570,21 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
         *,
         destination_dir: Path,
         cwd_override: str | None = None,
+        expected_source_fingerprint: str | None = None,
         metadata: Mapping[str, object] | None = None,
     ) -> SessionOperationResult[SessionT, PayloadT | None]:
-        source = Path(input_path).expanduser().resolve()
+        source = _absolute_path_preserving_leaf(input_path)
         preflight = SessionLifecycleTransition(
             reason="resume",
             target_session_ref=str(source),
             metadata=metadata or {},
         )
+        if self._prepare_import_candidate is not None:
+            build = self._prepare_import_candidate(
+                source, destination_dir, cwd_override, expected_source_fingerprint,
+            )
+            if build is not None:
+                return await self._run(preflight, lambda current: build(current, preflight))
         try:
             if not source.exists():
                 raise FileNotFoundError(
@@ -511,6 +594,8 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
                 source,
                 destination_dir,
                 copy_file=self._copy_file,
+                verified_copy_file=self._verified_copy_file,
+                expected_source_fingerprint=expected_source_fingerprint,
             )
         except Exception as exc:
             await self._notify_preflight_failure(preflight, exc)
@@ -565,6 +650,7 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
     ) -> None:
         current = self.current_session
         if current is None:
+            await self._host.dispose_current()
             return
         transition = SessionLifecycleTransition(
             reason=reason,
@@ -593,12 +679,7 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             SessionOperationCandidate[SessionT, PayloadT | None]
             | CancelledSessionOperation[PayloadT | None]
         ):
-            decision = await _maybe_await(
-                self.hooks.before_transition(current, transition)
-                if self.hooks.before_transition is not None
-                else None
-            )
-            if decision is not None and decision.cancelled:
+            if await self._transition_cancelled(current, transition):
                 return CancelledSessionOperation(payload, cleanup=rollback)
             session = await _maybe_await(create_session(current))
 
@@ -626,6 +707,7 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
         transition: SessionLifecycleTransition,
         previous: SessionT | None,
         candidate: SessionOperationCandidate[SessionT, PayloadT | None],
+        on_delivered: Callable[[], None] | None = None,
     ) -> SessionOperationResult[SessionT, PayloadT | None]:
         async def _prepared(
             current: SessionT | None,
@@ -638,7 +720,7 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
                 )
             return candidate
 
-        return await self._coordinate(transition, _prepared)
+        return await self._coordinate(transition, _prepared, on_delivered=on_delivered)
 
     async def _coordinate(
         self,
@@ -650,6 +732,8 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
                 | CancelledSessionOperation[PayloadT | None]
             ],
         ],
+        *,
+        on_delivered: Callable[[], None] | None = None,
     ) -> SessionOperationResult[SessionT, PayloadT | None]:
         async def _after_commit(
             result: SessionOperationResult[SessionT, PayloadT | None],
@@ -663,6 +747,18 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
 
         prepare_session = self.hooks.prepare_session
         activate_session = self.hooks.activate_session
+
+        async def _activate(
+            candidate: SessionOperationCandidate[SessionT, PayloadT | None],
+            previous: SessionT | None,
+        ) -> None:
+            if on_delivered is not None:
+                on_delivered()
+            if self._mark_candidate_delivered is not None:
+                self._mark_candidate_delivered(candidate.session)
+            if activate_session is not None:
+                await _maybe_await(activate_session(candidate.session, previous, transition))
+
         return await self._operations.run(
             prepare,
             prepare_session=(
@@ -679,10 +775,9 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             ),
             activate=(
                 None
-                if activate_session is None
-                else lambda candidate, previous: activate_session(
-                    candidate.session, previous, transition
-                )
+                if (activate_session is None and on_delivered is None
+                    and self._mark_candidate_delivered is None)
+                else _activate
             ),
             after_commit=_after_commit,
             on_failure=_on_failure,
@@ -699,6 +794,50 @@ class SessionLifecycleRuntime(Generic[SessionT, PayloadT]):
             await _maybe_await(
                 self.hooks.before_release(session, target_session, transition)
             )
+
+    async def _restore_candidate(
+        self,
+        current: SessionT | None,
+        *,
+        transition: SessionLifecycleTransition,
+        session_ref: str | Path,
+        fallback_cwd: str | None,
+        missing_cwd: MissingCwdPolicy,
+    ) -> SessionT:
+        try:
+            session = await self.store.restore(current, transition, session_ref)
+        except MissingSessionCwdError as error:
+            if missing_cwd != "fallback" or fallback_cwd is None:
+                raise _with_fallback_cwd(error, fallback_cwd) from error
+            return await self.store.restore(
+                current,
+                transition,
+                session_ref,
+                cwd_override=fallback_cwd,
+            )
+
+        issue = self._missing_cwd_issue(session, fallback_cwd=fallback_cwd)
+        if issue is None:
+            return session
+        await _maybe_await(self._dispose_session(session))
+        if missing_cwd != "fallback" or fallback_cwd is None:
+            raise MissingSessionCwdError(issue)
+        return await self.store.restore(
+            current,
+            transition,
+            session_ref,
+            cwd_override=fallback_cwd,
+        )
+
+    async def _transition_cancelled(
+        self,
+        session: SessionT | None,
+        transition: SessionLifecycleTransition,
+    ) -> bool:
+        if self.hooks.before_transition is None:
+            return False
+        decision = await _maybe_await(self.hooks.before_transition(session, transition))
+        return decision is not None and decision.cancelled
 
     def _missing_cwd_issue(
         self, session: SessionT, *, fallback_cwd: str | None
@@ -802,13 +941,17 @@ __all__ = [
     "ForkTargetResolver",
     "MissingCwdPolicy",
     "MissingSessionCwdError",
+    "PreparedSessionLifecycleOperation",
+    "PreparedSessionOperationStateError",
     "SessionCwdIssue",
     "SessionLifecycleDecision",
     "SessionLifecycleHooks",
+    "SessionLifecyclePreparationCancelledError",
     "SessionLifecycleReason",
     "SessionLifecycleRuntime",
     "SessionLifecycleStore",
     "SessionLifecycleTransition",
+    "VerifiedFileCopy",
     "TransitionCandidateCallback",
     "TransitionReleaseCallback",
 ]

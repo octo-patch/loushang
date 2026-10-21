@@ -4,6 +4,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
+from loushang.harnesstui.conversation.agent_binding import _standard_tool_title
 from loushang.harnesstui.conversation.tool_transcript import (
     ToolCallSnapshot,
     ToolCallView,
@@ -17,9 +18,7 @@ from loushang.harnesstui.conversation.tool_transcript import (
 from loushang.tui.transcript import ToolExecutionRecord
 
 
-def test_projection_binding_composes_raw_view_ports_with_neutral_projector() -> (
-    None
-):
+def test_projection_binding_composes_raw_view_ports_with_neutral_projector() -> None:
     calls: list[tuple[str, object]] = []
 
     def call_view(event: dict[str, object]) -> ToolCallView:
@@ -111,6 +110,39 @@ def test_mapping_projection_reuses_workspace_policy_with_injected_results() -> N
     assert block.body == "passed"
 
 
+def test_mapping_projection_preserves_collapsed_and_expanded_renderer_semantics() -> (
+    None
+):
+    render_modes: list[bool] = []
+
+    def render_event(_event: dict[str, object], expanded: bool) -> str:
+        render_modes.append(expanded)
+        return "EXPANDED" if expanded else "COLLAPSED"
+
+    binding = build_mapping_tool_transcript_projection(
+        result_text=lambda result, _max_lines: str(result),
+        expanded_result_text=lambda result, _max_lines: f"FULL {result}",
+        result_details=lambda _result: {},
+        result_terminated=lambda _result: False,
+        error_summary=lambda _result: None,
+        message_event=lambda _message: {},
+        render_event_text=render_event,
+    )
+
+    block = binding.project_result(
+        {
+            "type": "tool_execution_end",
+            "tool_call_id": "call-1",
+            "tool_name": "bash",
+            "result": "details",
+        }
+    )
+
+    assert render_modes == [False]
+    assert block.body == "COLLAPSED"
+    assert block.expanded_body == "FULL details"
+
+
 def test_neutral_projector_combines_call_snapshot_and_result_view() -> None:
     projector = ToolTranscriptProjector(
         verb_resolver=lambda tool_name, args: "Tested",
@@ -145,7 +177,32 @@ def test_neutral_projector_combines_call_snapshot_and_result_view() -> None:
         title="bash pytest tests/tui -q",
         body="... (1 earlier lines)\ntwo\nthree\nfour",
         command="bash pytest tests/tui -q",
+        expanded_body="one\ntwo\nthree\nfour",
     )
+
+
+def test_spawn_agent_transcript_shows_name_and_returned_path() -> None:
+    projector = ToolTranscriptProjector()
+    snapshot = projector.remember_call(
+        ToolCallView(
+            tool_call_id="spawn-1",
+            tool_name="spawn_agent",
+            args={"name": "pipeline_review", "agent_type": "reviewer"},
+        )
+    )
+    block = projector.project_result(
+        ToolResultView(
+            tool_call_id="spawn-1",
+            tool_name="spawn_agent",
+            status="ok",
+            details={"path": "/root/pipeline_review"},
+        ),
+        snapshot,
+    )
+    assert block.title == "spawn_agent pipeline_review"
+    assert block.detail == "created: /root/pipeline_review"
+    assert tool_block_to_record(block).output == "created: /root/pipeline_review"
+    assert _standard_tool_title(snapshot) == "spawn_agent pipeline_review"
 
 
 def test_neutral_projector_defaults_do_not_assume_product_policy() -> None:
@@ -246,6 +303,7 @@ def test_tool_block_projects_to_generic_tool_execution_record() -> None:
         elapsed_seconds=1.25,
         output="passed\n2 passed",
         command="uv run pytest tests/tui -q",
+        tool_name="bash",
     )
 
 

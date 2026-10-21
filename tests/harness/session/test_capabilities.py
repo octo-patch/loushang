@@ -4,21 +4,30 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import pytest
+
 from loushang.agent.types import AgentTool, AgentToolResult
 from loushang.ai.types import TextPart
+from loushang.harness.capabilities.commands import (
+    CommandRuntimeSource,
+    SessionCommandRuntime,
+)
+from loushang.harness.capabilities.tool_intent import DefaultToolProfileSnapshot
+from loushang.harness.capabilities.tools import ToolSelection
 from loushang.harness.commands import (
     CommandDescriptor,
     CommandDispatchOutcome,
 )
 from loushang.harness.conversation import CommandExecutionRecord
-from loushang.harness.session import (
-    CommandRuntimeSource,
+from loushang.harness.runtime.registration import RegistrationOwner
+from loushang.harness.session.bash import (
     SessionCommandExecutionRuntime,
-    SessionCommandRuntime,
-    SessionToolRuntime,
 )
+from loushang.harness.session.tool_runtime import SessionToolRuntime
 from loushang.harness.tools.contribution import ToolContribution
 from loushang.harness.tools.core import ToolDefinition
+from loushang.harness.tools.execution import direct_execution
+from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 from loushang.harness.workspace.exec import ExecOutputChunk
 
 
@@ -43,13 +52,14 @@ def _tool_definition(name: str) -> ToolDefinition:
             "required": [],
             "additionalProperties": False,
         },
-        execute=_noop_execute,
+        execution=direct_execution(_noop_execute),
     )
 
 
 class _Agent:
     def __init__(self) -> None:
         self.tools: list[AgentTool[Any]] = []
+        self.system_prompt = "base"
 
 
 class _ToolRegistry:
@@ -121,6 +131,110 @@ def test_session_tool_runtime_rebinds_only_product_selected_tools() -> None:
     assert prompt_rebuilds == [["bash"]]
 
 
+def test_session_tool_runtime_additive_activation_preserves_deferred_requests() -> None:
+    registry = _ToolRegistry([_tool_definition("spawn_agent")])
+    prompt_rebuilds: list[list[str]] = []
+    runtime = SessionToolRuntime(
+        agent=_Agent(),
+        tool_registry=registry,
+        allowed_tool_names=ToolSelection.ALL,
+        initial_active_tool_names=["read"],
+        default_active_tool_names=lambda: ["read"],
+        should_activate_new_tool=lambda _name, _definition: False,
+        build_tool_context=lambda *, tool_call_id: {"call_id": tool_call_id},
+        rebuild_prompt=lambda definitions: prompt_rebuilds.append(
+            [definition.name for definition in definitions or ()]
+        ),
+    )
+
+    runtime.activate_tool_names(["spawn_agent", "spawn_agent"])
+    runtime.register_runtime_tool(_tool_definition("read"))
+
+    assert runtime.get_active_tool_names() == ["read", "spawn_agent"]
+    assert registry.materialized == [
+        ["spawn_agent"],
+        ["read", "spawn_agent"],
+    ]
+    assert prompt_rebuilds == [
+        ["spawn_agent"],
+        ["read", "spawn_agent"],
+    ]
+
+
+def test_staged_disabled_runtime_tool_remains_on_demand_after_publication() -> None:
+    registry = WorkspaceToolRegistry()
+    runtime = SessionToolRuntime(
+        agent=_Agent(),
+        tool_registry=registry,
+        allowed_tool_names=ToolSelection.ALL,
+        initial_active_tool_names=(),
+        default_active_tool_names=lambda: (),
+        should_activate_new_tool=lambda _name, _definition: True,
+        build_tool_context=lambda *, tool_call_id: {"call_id": tool_call_id},
+        rebuild_prompt=lambda _definitions: None,
+    )
+    lease = runtime.stage_runtime_tool(
+        _tool_definition("semantic"),
+        owner=RegistrationOwner(
+            owner_kind="product",
+            owner_id="coding.tools",
+            runtime_id="session:test",
+            generation=1,
+        ),
+        enabled=False,
+    )
+
+    lease.activate()
+
+    assert runtime.get_active_tool_names() == []
+    assert [item.name for item in runtime.get_all_tools()] == ["semantic"]
+    runtime.apply_active_tools(["semantic"])
+    assert runtime.get_active_tool_names() == ["semantic"]
+
+
+def test_staged_tool_activation_cycles_do_not_leave_ghost_default_intent() -> None:
+    registry = WorkspaceToolRegistry()
+    selections: list[str] = []
+    runtime = SessionToolRuntime(
+        agent=_Agent(),
+        tool_registry=registry,
+        allowed_tool_names=ToolSelection.ALL,
+        initial_active_tool_names=(),
+        default_active_tool_names=lambda: (),
+        should_activate_new_tool=lambda name, _definition: (
+            selections.append(name) or True
+        ),
+        build_tool_context=lambda *, tool_call_id: {"call_id": tool_call_id},
+        rebuild_prompt=lambda _definitions: None,
+    )
+    owner = RegistrationOwner(
+        owner_kind="product",
+        owner_id="coding.tools",
+        runtime_id="session:test",
+        generation=1,
+    )
+    lease = runtime.stage_runtime_tool(
+        _tool_definition("plugin"),
+        owner=owner,
+    )
+
+    lease.activate()
+    lease.deactivate()
+    lease.activate()
+    assert lease.rollback_registration().state == "removed"
+    assert runtime.get_active_tool_names() == []
+
+    replacement = runtime.stage_runtime_tool(
+        _tool_definition("plugin"),
+        owner=owner,
+    )
+    replacement.activate()
+
+    assert selections == ["plugin", "plugin", "plugin"]
+    assert runtime.get_active_tool_names() == ["plugin"]
+    assert replacement.rollback_registration().state == "removed"
+
+
 def test_session_command_runtime_keeps_catalog_and_dispatch_precedence_separate() -> (
     None
 ):
@@ -176,6 +290,50 @@ def test_session_command_runtime_keeps_catalog_and_dispatch_precedence_separate(
     assert result == "extension"
 
 
+def test_session_command_runtime_stops_after_handled_none_result() -> None:
+    calls: list[str] = []
+
+    def _handled_none(command: object) -> CommandDispatchOutcome[str]:
+        del command
+        calls.append("handled-none")
+        return CommandDispatchOutcome.handled_result()
+
+    def _fallback(command: object) -> CommandDispatchOutcome[str]:
+        del command
+        calls.append("fallback")
+        return CommandDispatchOutcome.handled_result("fallback")
+
+    runtime = SessionCommandRuntime(
+        sources=(
+            CommandRuntimeSource(
+                pack_id="handled-none.commands",
+                source="product",
+                descriptor_priority=200,
+                handler_priority=200,
+                list_descriptors=tuple,
+                handler_name="handled-none",
+                handler=_handled_none,
+            ),
+            CommandRuntimeSource(
+                pack_id="fallback.commands",
+                source="extension",
+                descriptor_priority=100,
+                handler_priority=100,
+                list_descriptors=tuple,
+                handler_name="fallback",
+                handler=_fallback,
+            ),
+        )
+    )
+
+    outcome = asyncio.run(runtime.dispatch("review", ""))
+
+    assert outcome.handled is True
+    assert outcome.result is None
+    assert outcome.handler_name == "handled-none"
+    assert calls == ["handled-none"]
+
+
 def test_command_execution_runtime_streams_and_commits_one_record() -> None:
     records: list[CommandExecutionRecord] = []
     chunks: list[ExecOutputChunk] = []
@@ -214,12 +372,35 @@ def test_command_execution_runtime_streams_and_commits_one_record() -> None:
         label="Bash",
         description="Run a shell command",
         parameters={},
-        execute=_execute,
+        execution=direct_execution(_execute),
     )
+    from loushang.harness.tools.core import wrap_tool_definition
+
+    runtime_tool = wrap_tool_definition(definition)
+
+    async def _execute_definition(
+        selected_definition,
+        *,
+        tool_call_id,
+        arguments,
+        signal=None,
+        on_update=None,
+        operation_bindings=None,
+    ):
+        del operation_bindings
+        assert selected_definition is definition
+        return await runtime_tool.execute(
+            tool_call_id,
+            arguments,
+            signal=signal,
+            on_update=on_update,
+        )
+
     runtime = SessionCommandExecutionRuntime(
         command_name="Bash",
         get_cwd=lambda: "/project",
         get_definition=lambda: definition,
+        execute_definition=_execute_definition,
         build_execution_params=lambda command, cwd: {
             "command": ["/bin/bash", "-lc", command],
             "cwd": cwd,
@@ -247,7 +428,7 @@ def test_command_execution_runtime_streams_and_commits_one_record() -> None:
 
 
 def test_tool_activation_profile_selects_product_defaults() -> None:
-    from loushang.harness.session import ToolActivationProfile
+    from loushang.harness.session.tool_controller import ToolActivationProfile
 
     profile = ToolActivationProfile(
         preferred_names=("read", "bash"),
@@ -256,7 +437,129 @@ def test_tool_activation_profile_selects_product_defaults() -> None:
     )
     definitions = [_tool_definition("write"), _tool_definition("read")]
 
-    assert profile.default_names(definitions) == ["read", "write"]
+    assert profile.default_names(definitions, ToolSelection.ALL) == ["read", "write"]
     assert profile.default_names(definitions, {"read"}) == ["read"]
     assert profile.should_activate_new("custom", definitions[0]) is True
     assert profile.should_activate_new("read", definitions[1]) is False
+
+
+def test_tool_controller_uses_injected_revisioned_default_profile() -> None:
+    from loushang.harness.session.tool_controller import SessionToolController
+
+    registry = WorkspaceToolRegistry()
+    registry.register_tool(_tool_definition("product_tool"))
+    profile = DefaultToolProfileSnapshot(
+        profile_id="product.tools.default",
+        profile_revision=3,
+        static_default_names=("product_tool", "pending_tool"),
+        automatic_selection_policy_fingerprint="product.tools.auto.v1",
+        automatic_selection_enabled=False,
+    )
+
+    controller = SessionToolController(
+        agent=_Agent(),
+        get_cwd=lambda: "/project",
+        tool_registry=registry,
+        allowed_tool_names=ToolSelection.ALL,
+        initial_active_tool_names=[],
+        base_prompt="base",
+        get_resource_bundle=lambda: None,
+        get_diagnostics_service=lambda: None,
+        default_tool_profile=profile,
+    )
+
+    assert controller.default_active_tool_names() == [
+        "product_tool",
+        "pending_tool",
+    ]
+
+
+def test_tool_controller_missing_ceiling_denies_available_tools() -> None:
+    from loushang.harness.session.tool_controller import SessionToolController
+
+    registry = WorkspaceToolRegistry()
+    registry.register_tool(_tool_definition("read"))
+    with pytest.warns(RuntimeWarning, match="denies all tools"):
+        controller = SessionToolController(
+            agent=_Agent(),
+            get_cwd=lambda: "/project",
+            tool_registry=registry,
+            allowed_tool_names=None,
+            initial_active_tool_names=["read"],
+            base_prompt="base",
+            get_resource_bundle=lambda: None,
+            get_diagnostics_service=lambda: None,
+            default_tool_profile=DefaultToolProfileSnapshot(
+                profile_id="product.tools.default",
+                profile_revision=1,
+                static_default_names=("read",),
+                automatic_selection_policy_fingerprint="product.tools.auto.v1",
+                automatic_selection_enabled=True,
+            ),
+        )
+    assert controller.get_active_tool_names() == []
+    assert controller.get_all_tools() == []
+    assert not controller.is_tool_allowed("read")
+
+
+def test_revisioned_profile_preserves_product_automatic_exclusions() -> None:
+    from loushang.harness.session.tool_controller import SessionToolController
+
+    controller = SessionToolController(
+        agent=_Agent(),
+        get_cwd=lambda: "/project",
+        tool_registry=WorkspaceToolRegistry(),
+        allowed_tool_names=ToolSelection.ALL,
+        initial_active_tool_names=[],
+        base_prompt="base",
+        get_resource_bundle=lambda: None,
+        get_diagnostics_service=lambda: None,
+        default_tool_profile=DefaultToolProfileSnapshot(
+            profile_id="product.tools.default",
+            profile_revision=1,
+            static_default_names=(),
+            automatic_selection_policy_fingerprint="product.tools.auto.v1",
+            automatic_selection_enabled=True,
+            automatic_selection_excluded_names=("builtin",),
+        ),
+    )
+
+    controller.register_runtime_tool(_tool_definition("builtin"))
+    controller.register_runtime_tool(_tool_definition("plugin"))
+
+    assert controller.get_active_tool_names() == ["plugin"]
+
+
+def test_tool_controller_has_no_implicit_product_default_profile() -> None:
+    from loushang.harness.session.tool_controller import SessionToolController
+
+    with pytest.raises(TypeError, match="injected revisioned"):
+        SessionToolController(
+            agent=_Agent(),
+            get_cwd=lambda: "/project",
+            tool_registry=WorkspaceToolRegistry(),
+            allowed_tool_names=ToolSelection.ALL,
+            initial_active_tool_names=[],
+            base_prompt="base",
+            get_resource_bundle=lambda: None,
+            get_diagnostics_service=lambda: None,
+        )
+
+
+def test_capabilities_module_reexports_canonical_runtime_owners() -> None:
+    from loushang.harness.capabilities.commands import (
+        CommandRuntimeSource as CanonicalCommandRuntimeSource,
+    )
+    from loushang.harness.session import capabilities
+    from loushang.harness.session.bash import (
+        BashCommandExecutionRuntime,
+        bash_result_from_tool_result,
+    )
+    from loushang.harness.session.tool_runtime import (
+        SessionToolRuntime as CanonicalSessionToolRuntime,
+    )
+
+    assert capabilities.CommandRuntimeSource is CanonicalCommandRuntimeSource
+    assert capabilities.SessionCommandExecutionRuntime is BashCommandExecutionRuntime
+    assert capabilities.SessionToolRuntime is CanonicalSessionToolRuntime
+    assert capabilities.command_result_from_tool_result is bash_result_from_tool_result

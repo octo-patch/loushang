@@ -4,7 +4,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import ClassVar, Literal, Protocol
+from typing import ClassVar, Literal, Protocol, overload
 
 from loushang.tui.cell_width import normalize_terminal_output, visible_width
 from loushang.tui.core import (
@@ -25,6 +25,14 @@ from loushang.tui.terminal_image import (
 
 ClearScrollbackPolicy = Literal["disabled", "resize", "explicit"]
 SEGMENT_RESET = "\x1b[0m\x1b]8;;\x07"
+
+
+@dataclass(frozen=True, slots=True)
+class RenderBaselineReset:
+    """Describe a one-shot reset of the committed terminal render baseline."""
+
+    reason: str
+    replay_hidden_prefix: bool = False
 
 
 @dataclass(frozen=True, slots=True, eq=False)
@@ -54,6 +62,12 @@ class _SegmentedTextLines(Sequence[str]):
     def __iter__(self) -> Iterator[str]:
         for segment in self.segments:
             yield from self._segment_lines(segment)
+
+    @overload
+    def __getitem__(self, index: int) -> str: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[str, ...]: ...
 
     def __getitem__(self, index: int | slice) -> str | tuple[str, ...]:
         if isinstance(index, slice):
@@ -97,6 +111,7 @@ class ScreenRoot(Protocol):
 
 
 class RenderPlanStrategyKind(Enum):
+    SCROLLBACK_REPLAY = auto()
     FIRST_RENDER = auto()
     TRANSCRIPT_WINDOW_TRIMMED_RESET = auto()
     BASELINE_RESET = auto()
@@ -112,6 +127,7 @@ class RenderPlanStrategyKind(Enum):
 
 
 DEFAULT_STRATEGY_ORDER: tuple[RenderPlanStrategyKind, ...] = (
+    RenderPlanStrategyKind.SCROLLBACK_REPLAY,
     RenderPlanStrategyKind.FIRST_RENDER,
     RenderPlanStrategyKind.TRANSCRIPT_WINDOW_TRIMMED_RESET,
     RenderPlanStrategyKind.BASELINE_RESET,
@@ -131,9 +147,9 @@ DEFAULT_STRATEGY_ORDER: tuple[RenderPlanStrategyKind, ...] = (
 class RenderPlanContext:
     size: TerminalSize
     result: RenderResult
-    raw_current_lines: tuple[str, ...]
-    current_lines: tuple[str, ...]
-    previous_lines: tuple[str, ...]
+    raw_current_lines: Sequence[str]
+    current_lines: Sequence[str]
+    previous_lines: Sequence[str]
     previous_size: TerminalSize | None
     declared_cursor: CursorDeclaration | None
     cursor: CursorDeclaration
@@ -147,6 +163,9 @@ class RenderPlanContext:
     width_changed: bool
     height_changed: bool
     previous_kitty_delete_sequences: tuple[str, ...]
+    scrollback_replay_lines: Sequence[str] | None
+    scrollback_replay_cursor: CursorDeclaration | None
+    scrollback_replay_viewport_top: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -159,7 +178,7 @@ class RenderPlanRuntime:
     working_area_high_water_mark: int
     termux_session: bool
     clear_scrollback_policy: ClearScrollbackPolicy
-    baseline_reset_reason: str | None
+    baseline_reset: RenderBaselineReset | None
     unsafe_viewport_reason: str | None
     diagnostics: Callable[..., RenderDiagnostics]
     repaint_diagnostics: Callable[..., RenderDiagnostics]
@@ -173,6 +192,51 @@ class RenderPlanStrategy(Protocol):
     def match(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> bool: ...
 
     def plan(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> RenderDiagnostics: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ScrollbackReplayStrategy:
+    kind: ClassVar[RenderPlanStrategyKind] = RenderPlanStrategyKind.SCROLLBACK_REPLAY
+    name: ClassVar[str] = "scrollback_replay"
+
+    def match(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> bool:
+        del context
+        return bool(
+            runtime.baseline_reset is not None
+            and runtime.baseline_reset.replay_hidden_prefix
+        )
+
+    def plan(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> RenderDiagnostics:
+        reset = runtime.baseline_reset
+        if reset is None:
+            raise AssertionError("scrollback replay planned without a baseline reset")
+        replay_lines = context.scrollback_replay_lines
+        if replay_lines is None:
+            raise AssertionError("scrollback replay planned without expanded lines")
+        return runtime.diagnostics(
+            current_lines=context.current_lines,
+            previous_lines=context.previous_lines,
+            size=context.size,
+            operation_class="scrollback_replay",
+            operations=_scrollback_replay_operations(
+                replay_lines,
+                cursor=context.scrollback_replay_cursor,
+                viewport_top=context.scrollback_replay_viewport_top,
+                size=context.size,
+                delete_kitty_image_sequences=context.previous_kitty_delete_sequences,
+            ),
+            changed_range=context.changed_range,
+            viewport_top=context.viewport_top,
+            repaint_kind="recovery",
+            repaint_reason=reset.reason,
+            scrollback_frontier_rebased=True,
+            cursor=context.cursor,
+            hardware_cursor_row=_hardware_row_after_write(
+                context.current_lines,
+                cursor=context.declared_cursor,
+            ),
+            hardware_cursor_column=context.cursor.column,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,12 +368,12 @@ class TranscriptWindowTrimmedResetStrategy:
 
     def match(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> bool:
         return bool(
-            runtime.baseline_reset_reason is not None
-            and runtime.baseline_reset_reason.startswith("transcript_window_trimmed:")
+            runtime.baseline_reset is not None
+            and runtime.baseline_reset.reason.startswith("transcript_window_trimmed:")
         )
 
     def plan(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> RenderDiagnostics:
-        if runtime.baseline_reset_reason is None:
+        if runtime.baseline_reset is None:
             raise AssertionError("trimmed transcript reset strategy planned without a reason")
         return runtime.managed_viewport_repaint_diagnostics(
             current_lines=context.current_lines,
@@ -318,7 +382,8 @@ class TranscriptWindowTrimmedResetStrategy:
             changed_range=context.changed_range,
             cursor=context.cursor,
             declared_cursor=context.declared_cursor,
-            repaint_reason=runtime.baseline_reset_reason,
+            repaint_reason=runtime.baseline_reset.reason,
+            scrollback_frontier_rebased=True,
             delete_kitty_image_sequences=context.previous_kitty_delete_sequences,
         )
 
@@ -330,12 +395,12 @@ class BaselineResetStrategy:
 
     def match(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> bool:
         return bool(
-            runtime.baseline_reset_reason is not None
-            and not runtime.baseline_reset_reason.startswith("transcript_window_trimmed:")
+            runtime.baseline_reset is not None
+            and not runtime.baseline_reset.reason.startswith("transcript_window_trimmed:")
         )
 
     def plan(self, context: RenderPlanContext, *, runtime: RenderPlanRuntime) -> RenderDiagnostics:
-        if runtime.baseline_reset_reason is None:
+        if runtime.baseline_reset is None:
             raise AssertionError("baseline reset strategy planned without a reason")
         return runtime.repaint_diagnostics(
             current_lines=context.current_lines,
@@ -346,7 +411,10 @@ class BaselineResetStrategy:
             declared_cursor=context.declared_cursor,
             operation_class="baseline_repaint",
             repaint_kind="recovery",
-            repaint_reason=runtime.baseline_reset_reason,
+            repaint_reason=runtime.baseline_reset.reason,
+            scrollback_frontier_rebased=_is_transcript_window_replacement(
+                runtime.baseline_reset.reason
+            ),
             delete_kitty_image_sequences=context.previous_kitty_delete_sequences,
         )
 
@@ -583,6 +651,7 @@ class ChangedRangeStrategy:
 
 
 DEFAULT_STRATEGIES: dict[RenderPlanStrategyKind, RenderPlanStrategy] = {
+    RenderPlanStrategyKind.SCROLLBACK_REPLAY: ScrollbackReplayStrategy(),
     RenderPlanStrategyKind.FIRST_RENDER: FirstRenderStrategy(),
     RenderPlanStrategyKind.TRANSCRIPT_WINDOW_TRIMMED_RESET: TranscriptWindowTrimmedResetStrategy(),
     RenderPlanStrategyKind.BASELINE_RESET: BaselineResetStrategy(),
@@ -614,7 +683,7 @@ class RenderLoop:
     previous_cursor_row: int = 0
     previous_cursor_column: int = 0
     _unsafe_viewport_reason: str | None = None
-    _baseline_reset_reason: str | None = None
+    _baseline_reset: RenderBaselineReset | None = None
     _planned_raw_lines: Sequence[str] = ()
     _finalized_segment_cache: dict[tuple[object, object], _LogicalLineSegment] = field(
         default_factory=dict,
@@ -632,13 +701,37 @@ class RenderLoop:
     def mark_viewport_unsafe(self, reason: str) -> None:
         self._unsafe_viewport_reason = reason
 
-    def reset_baseline(self, reason: str = "baseline_reset") -> None:
-        self._baseline_reset_reason = reason
+    def reset_baseline(
+        self,
+        reset: str | RenderBaselineReset = "baseline_reset",
+    ) -> None:
+        self._baseline_reset = (
+            RenderBaselineReset(reason=reset) if isinstance(reset, str) else reset
+        )
 
     def _build_plan_context(self, size: TerminalSize) -> RenderPlanContext:
         self._planned_base_frame_revision = self.committed_frame_revision
         self._next_frame_revision += 1
         self._planned_frame_revision = self._next_frame_revision
+        scrollback_replay_lines: Sequence[str] | None = None
+        scrollback_replay_cursor: CursorDeclaration | None = None
+        scrollback_replay_viewport_top = 0
+        if self._baseline_reset is not None and self._baseline_reset.replay_hidden_prefix:
+            replay_result = self.screen_root.render(
+                RenderConstraints(
+                    width=size.columns,
+                    max_height=1_000_000,
+                    visible_height=None,
+                )
+            )
+            _replay_raw_lines, scrollback_replay_lines = self._logical_lines(
+                replay_result
+            )
+            scrollback_replay_cursor = replay_result.cursor
+            scrollback_replay_viewport_top = _viewport_top(
+                scrollback_replay_lines,
+                size,
+            )
         result = self.screen_root.render(
             RenderConstraints(width=size.columns, max_height=1_000_000, visible_height=size.rows)
         )
@@ -691,6 +784,9 @@ class RenderLoop:
             width_changed=width_changed,
             height_changed=height_changed,
             previous_kitty_delete_sequences=previous_kitty_delete_sequences,
+            scrollback_replay_lines=scrollback_replay_lines,
+            scrollback_replay_cursor=scrollback_replay_cursor,
+            scrollback_replay_viewport_top=scrollback_replay_viewport_top,
         )
 
     def _logical_lines(self, result: RenderResult) -> tuple[Sequence[str], Sequence[str]]:
@@ -698,11 +794,11 @@ class RenderLoop:
         self._planned_materialized_line_count = 0
         self._planned_flattened_line_count = 0
         if not isinstance(result.lines, SegmentedRenderLines):
-            raw_lines = tuple(line.text for line in result.lines)
-            self._planned_flattened_line_count = len(raw_lines)
-            self._planned_materialized_line_count = len(raw_lines)
-            return raw_lines, _finalize_rendered_lines(
-                raw_lines,
+            flat_raw_lines = tuple(line.text for line in result.lines)
+            self._planned_flattened_line_count = len(flat_raw_lines)
+            self._planned_materialized_line_count = len(flat_raw_lines)
+            return flat_raw_lines, _finalize_rendered_lines(
+                flat_raw_lines,
                 previous_raw_lines=self.previous_raw_lines,
                 previous_finalized_lines=self.previous_rendered_lines,
             )
@@ -743,7 +839,7 @@ class RenderLoop:
             working_area_high_water_mark=self.working_area_high_water_mark,
             termux_session=self.termux_session,
             clear_scrollback_policy=self.clear_scrollback_policy,
-            baseline_reset_reason=self._baseline_reset_reason,
+            baseline_reset=self._baseline_reset,
             unsafe_viewport_reason=self._unsafe_viewport_reason,
             diagnostics=self._diagnostics,
             repaint_diagnostics=self._repaint_diagnostics,
@@ -762,8 +858,8 @@ class RenderLoop:
     def _managed_viewport_repaint_diagnostics(
         self,
         *,
-        current_lines: tuple[str, ...],
-        previous_lines: tuple[str, ...],
+        current_lines: Sequence[str],
+        previous_lines: Sequence[str],
         size: TerminalSize,
         changed_range: tuple[int, int] | None,
         cursor: CursorDeclaration,
@@ -772,6 +868,7 @@ class RenderLoop:
         operation_class: str = "managed_viewport_repaint",
         repaint_kind: str | None = "recovery",
         append_start: int | None = None,
+        scrollback_frontier_rebased: bool = False,
         delete_kitty_image_sequences: tuple[str, ...] = (),
     ) -> RenderDiagnostics:
         viewport_top = _viewport_top(current_lines, size)
@@ -789,6 +886,7 @@ class RenderLoop:
                 scrollback_viewport_top=self.scrollback_viewport_top,
                 size=size,
                 hardware_cursor_row=self.hardware_cursor_row,
+                rebase_scrollback_frontier=scrollback_frontier_rebased,
                 delete_kitty_image_sequences=delete_kitty_image_sequences,
             ),
             changed_range=changed_range,
@@ -797,6 +895,7 @@ class RenderLoop:
             appended_lines=max(0, len(current_lines) - len(previous_lines)),
             repaint_kind=repaint_kind,
             repaint_reason=repaint_reason,
+            scrollback_frontier_rebased=scrollback_frontier_rebased,
             cursor=cursor,
             hardware_cursor_row=_hardware_row_after_write(current_lines, cursor=declared_cursor),
             hardware_cursor_column=cursor.column,
@@ -809,7 +908,7 @@ class RenderLoop:
         self.previous_raw_lines = diagnostics.raw_logical_lines
         self.previous_size = size
         self.previous_viewport_top = diagnostics.viewport_top
-        if diagnostics.clear_scrollback_emitted:
+        if diagnostics.clear_scrollback_emitted or diagnostics.scrollback_frontier_rebased:
             self.scrollback_viewport_top = diagnostics.viewport_top
         else:
             self.scrollback_viewport_top = max(
@@ -825,13 +924,13 @@ class RenderLoop:
         )
         self.committed_frame_revision = diagnostics.frame_revision
         self._unsafe_viewport_reason = None
-        self._baseline_reset_reason = None
+        self._baseline_reset = None
 
     def _repaint_diagnostics(
         self,
         *,
-        current_lines: tuple[str, ...],
-        previous_lines: tuple[str, ...],
+        current_lines: Sequence[str],
+        previous_lines: Sequence[str],
         size: TerminalSize,
         changed_range: tuple[int, int] | None,
         cursor: CursorDeclaration,
@@ -841,8 +940,18 @@ class RenderLoop:
         repaint_reason: str,
         width_changed: bool = False,
         height_changed: bool = False,
+        scrollback_frontier_rebased: bool = False,
         delete_kitty_image_sequences: tuple[str, ...] = (),
     ) -> RenderDiagnostics:
+        previous_visible_row_count = min(
+            size.rows,
+            (
+                self.previous_size.rows
+                if self.previous_size is not None
+                else size.rows
+            ),
+            len(previous_lines),
+        )
         return self._diagnostics(
             current_lines=current_lines,
             previous_lines=previous_lines,
@@ -856,12 +965,17 @@ class RenderLoop:
                 ),
                 cursor=declared_cursor,
                 viewport_top=_viewport_top(current_lines, size),
+                clear_row_count=max(
+                    min(size.rows, len(current_lines)),
+                    previous_visible_row_count,
+                ),
                 delete_kitty_image_sequences=delete_kitty_image_sequences,
             ),
             changed_range=changed_range,
             viewport_top=_viewport_top(current_lines, size),
             repaint_kind=repaint_kind,
             repaint_reason=repaint_reason,
+            scrollback_frontier_rebased=scrollback_frontier_rebased,
             width_changed=width_changed,
             height_changed=height_changed,
             cursor=cursor,
@@ -872,8 +986,8 @@ class RenderLoop:
     def _diagnostics(
         self,
         *,
-        current_lines: tuple[str, ...],
-        previous_lines: tuple[str, ...],
+        current_lines: Sequence[str],
+        previous_lines: Sequence[str],
         size: TerminalSize,
         operation_class: str,
         operations: tuple[TerminalOperation, ...],
@@ -884,6 +998,7 @@ class RenderLoop:
         render_end: int | None = None,
         repaint_kind: str | None = None,
         repaint_reason: str | None = None,
+        scrollback_frontier_rebased: bool = False,
         width_changed: bool = False,
         height_changed: bool = False,
         cursor: CursorDeclaration | None = None,
@@ -905,6 +1020,7 @@ class RenderLoop:
             render_end=render_end,
             viewport_top=viewport_top,
             previous_viewport_top=self.previous_viewport_top,
+            scrollback_frontier_rebased=scrollback_frontier_rebased,
             logical_cursor_row=logical_cursor.row,
             logical_cursor_column=logical_cursor.column,
             hardware_cursor_row=terminal_cursor_row,
@@ -988,14 +1104,14 @@ def _expand_changed_range_for_kitty_images(
 
 def _kitty_delete_sequences(lines: Sequence[str]) -> tuple[str, ...]:
     if isinstance(lines, _SegmentedTextLines):
-        deletes: list[str] = []
-        seen: set[int] = set()
+        segmented_deletes: list[str] = []
+        segmented_seen: set[int] = set()
         for _row, image_id, delete_sequence in lines.iter_kitty_images():
-            if image_id in seen:
+            if image_id in segmented_seen:
                 continue
-            seen.add(image_id)
-            deletes.append(delete_sequence)
-        return tuple(deletes)
+            segmented_seen.add(image_id)
+            segmented_deletes.append(delete_sequence)
+        return tuple(segmented_deletes)
     deletes: list[str] = []
     seen: set[int] = set()
     for line in lines:
@@ -1037,8 +1153,8 @@ def _line_uses_tmux_passthrough(line: str) -> bool:
 def _finalize_rendered_lines(
     lines: tuple[str, ...],
     *,
-    previous_raw_lines: tuple[str, ...] = (),
-    previous_finalized_lines: tuple[str, ...] = (),
+    previous_raw_lines: Sequence[str] = (),
+    previous_finalized_lines: Sequence[str] = (),
 ) -> tuple[str, ...]:
     finalized: list[str] = []
     reusable_count = min(len(lines), len(previous_raw_lines), len(previous_finalized_lines))
@@ -1090,7 +1206,7 @@ def _finalize_render_segment(segment: RenderLineSegmentLike) -> _LogicalLineSegm
     )
 
 
-def _viewport_top(lines: tuple[str, ...], size: TerminalSize) -> int:
+def _viewport_top(lines: Sequence[str], size: TerminalSize) -> int:
     return max(0, len(lines) - size.rows)
 
 
@@ -1107,7 +1223,7 @@ def _differential_viewport_top(
 
 
 def _full_write_operations(
-    lines: tuple[str, ...], *, cursor: CursorDeclaration | None, viewport_top: int
+    lines: Sequence[str], *, cursor: CursorDeclaration | None, viewport_top: int
 ) -> tuple[TerminalOperation, ...]:
     return _render_then_position_cursor(
         _write_lines(lines),
@@ -1117,40 +1233,99 @@ def _full_write_operations(
     )
 
 
+def _scrollback_replay_operations(
+    lines: Sequence[str],
+    *,
+    cursor: CursorDeclaration | None,
+    viewport_top: int,
+    size: TerminalSize,
+    delete_kitty_image_sequences: tuple[str, ...] = (),
+) -> tuple[TerminalOperation, ...]:
+    """Seed terminal scrollback from one complete logical frame.
+
+    Clearing only the visible screen before the write prevents the displaced
+    composer from being copied into scrollback.  The scrollback buffer itself
+    is deliberately preserved.
+    """
+
+    operations: list[TerminalOperation] = [
+        TerminalOperation.hide_cursor(),
+        TerminalOperation.begin_synchronized_update(),
+        TerminalOperation.reset_scroll_region(),
+        TerminalOperation.clear_screen(),
+        *_kitty_delete_operations(delete_kitty_image_sequences),
+        *_write_lines(lines),
+        TerminalOperation.end_synchronized_update(),
+    ]
+    if cursor is not None:
+        operations.extend(
+            (
+                TerminalOperation.move_cursor(
+                    row=max(0, min(cursor.row - viewport_top, size.rows - 1)),
+                    column=cursor.column,
+                ),
+                TerminalOperation.show_cursor(),
+            )
+        )
+    return tuple(operations)
+
+
 def _repaint_operations(
-    lines: tuple[str, ...],
+    lines: Sequence[str],
     *,
     clear_scrollback: bool,
     cursor: CursorDeclaration | None,
     viewport_top: int,
+    clear_row_count: int,
     delete_kitty_image_sequences: tuple[str, ...] = (),
 ) -> tuple[TerminalOperation, ...]:
     render_lines = lines if clear_scrollback else lines[viewport_top:]
-    operations: list[TerminalOperation] = [
-        *_kitty_delete_operations(delete_kitty_image_sequences),
-        TerminalOperation.clear_screen(),
-    ]
+    operations: list[TerminalOperation] = list(
+        _kitty_delete_operations(delete_kitty_image_sequences)
+    )
     if clear_scrollback:
-        operations.append(TerminalOperation.clear_scrollback())
-    operations.extend(_write_lines(render_lines))
+        operations.extend(
+            (
+                TerminalOperation.clear_screen(),
+                TerminalOperation.clear_scrollback(),
+                *_write_lines(render_lines),
+            )
+        )
+        # ``render_lines`` contains the complete logical frame in this branch,
+        # starting at row zero. Adding ``viewport_top`` again would overstate
+        # the cursor row after a long-frame resize and move the terminal cursor
+        # past the top of the viewport.
+        current_row = max(0, len(render_lines) - 1)
+    else:
+        operations.append(TerminalOperation.move_cursor(row=0, column=0))
+        operations.extend(
+            _write_cleared_lines(
+                (
+                    *render_lines,
+                    *("" for _ in range(clear_row_count - len(render_lines))),
+                )
+            )
+        )
+        current_row = viewport_top + max(0, clear_row_count - 1)
     return _render_then_position_cursor(
         tuple(operations),
         cursor=cursor,
         viewport_top=viewport_top,
-        current_row=viewport_top + max(0, len(render_lines) - 1),
+        current_row=current_row,
     )
 
 
 def _managed_viewport_repaint_operations(
-    lines: tuple[str, ...],
+    lines: Sequence[str],
     *,
-    previous_lines: tuple[str, ...],
+    previous_lines: Sequence[str],
     cursor: CursorDeclaration | None,
     viewport_top: int,
     previous_viewport_top: int,
     scrollback_viewport_top: int,
     size: TerminalSize,
     hardware_cursor_row: int,
+    rebase_scrollback_frontier: bool = False,
     delete_kitty_image_sequences: tuple[str, ...] = (),
 ) -> tuple[TerminalOperation, ...]:
     visible_lines = lines[viewport_top : viewport_top + size.rows]
@@ -1182,29 +1357,39 @@ def _managed_viewport_repaint_operations(
             operations.append(TerminalOperation.carriage_return())
         current_physical_row = row
 
-    # A terminal cannot edit a line after it enters scrollback. Refresh the
-    # logical rows that are about to leave the viewport before scrolling them.
-    for offset in range(scroll_count):
-        move_to(offset)
-        operations.append(TerminalOperation.clear_line())
-        line_index = scroll_start + offset
-        if line_index < len(lines):
-            operations.append(TerminalOperation.write(lines[line_index]))
-
-    if scroll_count:
-        move_to(size.rows - 1)
+    if rebase_scrollback_frontier:
+        # A replacement or prefix trim starts a new logical-row epoch. Preserve
+        # existing native scrollback, but do not replay the new epoch's hidden
+        # prefix through coordinates that belonged to the previous epoch.
+        move_to(0)
         operations.extend(
-            TerminalOperation.newline()
-            for _ in range(scroll_count)
+            _write_cleared_lines(
+                (*visible_lines, *("" for _ in range(size.rows - len(visible_lines))))
+            )
         )
         current_physical_row = size.rows - 1
-
-    # Clear once, then paint at most one screen. The final visible line does
-    # not emit a newline, so this phase cannot submit anything to scrollback.
-    move_to(0)
-    operations.append(TerminalOperation.clear_from_cursor())
-    operations.extend(_write_lines(visible_lines))
-    current_physical_row = max(0, len(visible_lines) - 1)
+    elif scroll_count:
+        # Stream the complete departing suffix from row zero so every logical
+        # row enters scrollback exactly once. Scrolling the existing viewport
+        # first would also commit stale snapshots of the protected bottom frame
+        # on real terminals before the repaint can replace them.
+        move_to(0)
+        operations.extend(
+            _write_cleared_lines(
+                lines[scroll_start : viewport_top + size.rows]
+            )
+        )
+        current_physical_row = max(0, len(visible_lines) - 1)
+    else:
+        # Clear and repaint each visible row without ED, which tmux may preserve
+        # as a complete old-screen snapshot in native scrollback.
+        move_to(0)
+        operations.extend(
+            _write_cleared_lines(
+                (*visible_lines, *("" for _ in range(size.rows - len(visible_lines))))
+            )
+        )
+        current_physical_row = size.rows - 1
 
     operations.append(TerminalOperation.end_synchronized_update())
     if cursor is not None:
@@ -1226,7 +1411,7 @@ def _managed_viewport_repaint_operations(
 
 
 def _append_operations(
-    lines: tuple[str, ...],
+    lines: Sequence[str],
     *,
     append_start: int,
     hardware_cursor_row: int,
@@ -1253,8 +1438,8 @@ def _append_operations(
 
 def _protected_append_plan(
     *,
-    current_lines: tuple[str, ...],
-    previous_lines: tuple[str, ...],
+    current_lines: Sequence[str],
+    previous_lines: Sequence[str],
     first_changed: int,
     appended_lines: int,
     cursor: CursorDeclaration | None,
@@ -1278,8 +1463,8 @@ def _protected_append_plan(
 
 def _protected_append_candidate(
     *,
-    current_lines: tuple[str, ...],
-    previous_lines: tuple[str, ...],
+    current_lines: Sequence[str],
+    previous_lines: Sequence[str],
     first_changed: int,
     appended_lines: int,
     cursor: CursorDeclaration | None,
@@ -1319,8 +1504,8 @@ def _cursor_update_operations(
 
 def _shrink_clear_operations(
     *,
-    previous_lines: tuple[str, ...],
-    current_lines: tuple[str, ...],
+    previous_lines: Sequence[str],
+    current_lines: Sequence[str],
     target_row: int,
     hardware_cursor_row: int,
     delete_kitty_image_sequences: tuple[str, ...] = (),
@@ -1344,8 +1529,8 @@ def _shrink_clear_operations(
 
 def _changed_range_operations(
     *,
-    current_lines: tuple[str, ...],
-    previous_lines: tuple[str, ...],
+    current_lines: Sequence[str],
+    previous_lines: Sequence[str],
     changed_range: tuple[int, int],
     previous_viewport_top: int,
     hardware_cursor_row: int,
@@ -1378,12 +1563,25 @@ def _changed_range_operations(
     )
 
 
-def _write_lines(lines: tuple[str, ...]) -> tuple[TerminalOperation, ...]:
+def _write_lines(lines: Sequence[str]) -> tuple[TerminalOperation, ...]:
     operations: list[TerminalOperation] = []
     for index, line in enumerate(lines):
         if index > 0:
             operations.append(TerminalOperation.newline())
         operations.append(TerminalOperation.write(line))
+    return tuple(operations)
+
+
+def _write_cleared_lines(lines: Sequence[str]) -> tuple[TerminalOperation, ...]:
+    operations: list[TerminalOperation] = []
+    last_index = len(lines) - 1
+    for index, line in enumerate(lines):
+        operations.append(TerminalOperation.clear_line())
+        operations.append(
+            TerminalOperation.write(
+                line if index == last_index else f"{line}\r\n"
+            )
+        )
     return tuple(operations)
 
 
@@ -1441,7 +1639,9 @@ def _cursor_position_operations(
     return tuple(operations)
 
 
-def _cursor_or_line_end(cursor: CursorDeclaration | None, lines: tuple[str, ...]) -> CursorDeclaration:
+def _cursor_or_line_end(
+    cursor: CursorDeclaration | None, lines: Sequence[str]
+) -> CursorDeclaration:
     if cursor is not None:
         return cursor
     row = max(0, len(lines) - 1)
@@ -1451,8 +1651,8 @@ def _cursor_or_line_end(cursor: CursorDeclaration | None, lines: tuple[str, ...]
 
 def _changed_range_hardware_cursor(
     *,
-    current_lines: tuple[str, ...],
-    previous_lines: tuple[str, ...],
+    current_lines: Sequence[str],
+    previous_lines: Sequence[str],
     render_end: int,
     declared_cursor: CursorDeclaration | None,
     size: TerminalSize,
@@ -1475,7 +1675,15 @@ def _should_clear_scrollback(*, policy: ClearScrollbackPolicy, repaint_kind: str
     return False
 
 
-def _hardware_row_after_write(lines: tuple[str, ...], *, cursor: CursorDeclaration | None) -> int:
+def _is_transcript_window_replacement(reason: str) -> bool:
+    return reason == "transcript_window_replaced" or reason.startswith(
+        "transcript_window_replaced:"
+    )
+
+
+def _hardware_row_after_write(
+    lines: Sequence[str], *, cursor: CursorDeclaration | None
+) -> int:
     if cursor is not None:
         return cursor.row
     return max(0, len(lines) - 1)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 from loushang.tui import (
     CursorDeclaration,
@@ -13,8 +13,7 @@ from loushang.tui import (
     RenderLine,
     RenderResult,
 )
-from loushang.tui.cell_width import truncate_to_width, wrap_cells
-from loushang.tui.input import InputIntentKind
+from loushang.tui.cell_width import truncate_to_width, wrap_ansi, wrap_cells
 from loushang.tui.theme import ThemeResolver, apply_theme_style
 
 ScreenSurfacePurpose = Literal[
@@ -41,11 +40,15 @@ class ScreenSurfaceView(FocusableMixin):
     content: Any
     footer: str = "Enter to select - Esc to close"
     subtitle: str = ""
+    feedback: str = ""
+    feedback_hint: str = ""
     presentation: ScreenSurfacePresentation = "bottom"
     preferred_height: int | None = None
     theme: ThemeResolver | None = None
     title_theme_token: str = "surface.title"
     subtitle_theme_token: str = "surface.subtitle"
+    feedback_theme_token: str = "widget.error"
+    feedback_hint_theme_token: str = "surface.hint"
     footer_theme_token: str = "surface.footer"
     _last_content_start_row: int = field(default=0, init=False, repr=False)
     _info_scroll_offset: int = field(default=0, init=False, repr=False)
@@ -67,7 +70,7 @@ class ScreenSurfaceView(FocusableMixin):
         target = getattr(self.content, "editor_input_target", None)
         return target() if callable(target) else None
 
-    def handle_input(self, event: InputEvent) -> InputIntent | None:
+    def handle_input(self, event: InputEvent) -> InputIntent[str] | None:
         if self.purpose == "info":
             if event.kind == "key" and event.key in {"enter", "space", "escape", "esc"}:
                 return InputIntent(kind="surface_close")
@@ -102,11 +105,18 @@ class ScreenSurfaceView(FocusableMixin):
                 )
             )
         lines.append("")
-        reserved_footer_lines = 2 if self.footer else 0
+        footer = self._footer_text()
+        feedback_lines = self._feedback_lines(width)
+        reserved_feedback_lines = len(feedback_lines) + (1 if feedback_lines else 0)
+        reserved_footer_lines = 2 if footer else 0
         body_constraints = RenderConstraints(
             width=width,
             max_height=max(
-                1, constraints.max_height - len(lines) - reserved_footer_lines
+                1,
+                constraints.max_height
+                - len(lines)
+                - reserved_feedback_lines
+                - reserved_footer_lines,
             ),
         )
         if isinstance(self.content, InfoPanel):
@@ -138,6 +148,11 @@ class ScreenSurfaceView(FocusableMixin):
                         row=cursor_row, column=result.cursor.column
                     )
         footer = self._footer_text()
+        if feedback_lines and len(lines) < constraints.max_height:
+            lines.append("")
+            lines.extend(
+                feedback_lines[: max(0, constraints.max_height - len(lines))]
+            )
         if footer and len(lines) < constraints.max_height:
             if len(lines) + 1 < constraints.max_height:
                 lines.append("")
@@ -158,7 +173,7 @@ class ScreenSurfaceView(FocusableMixin):
             return event
         return replace(event, mouse_row=event.mouse_row - self._last_content_start_row)
 
-    def _handle_info_scroll_input(self, key: str) -> InputIntent | None:
+    def _handle_info_scroll_input(self, key: str) -> InputIntent[str] | None:
         page = max(1, self._last_info_body_height)
         if key == "down":
             return self._scroll_info(1)
@@ -174,10 +189,10 @@ class ScreenSurfaceView(FocusableMixin):
             return self._set_info_scroll(self._max_info_scroll_offset())
         return None
 
-    def _scroll_info(self, delta: int) -> InputIntent | None:
+    def _scroll_info(self, delta: int) -> InputIntent[str] | None:
         return self._set_info_scroll(self._info_scroll_offset + delta)
 
-    def _set_info_scroll(self, offset: int) -> InputIntent | None:
+    def _set_info_scroll(self, offset: int) -> InputIntent[str] | None:
         max_offset = self._max_info_scroll_offset()
         next_offset = max(0, min(offset, max_offset))
         if next_offset == self._info_scroll_offset:
@@ -197,20 +212,38 @@ class ScreenSurfaceView(FocusableMixin):
             return f"Up/Down/Page to scroll - {footer}"
         return footer
 
+    def _feedback_lines(self, width: int) -> list[str]:
+        lines: list[str] = []
+        if self.feedback:
+            lines.extend(
+                wrap_ansi(
+                    self._styled(self.feedback, self.feedback_theme_token),
+                    width=width,
+                )
+            )
+        if self.feedback_hint:
+            lines.extend(
+                wrap_ansi(
+                    self._styled(self.feedback_hint, self.feedback_hint_theme_token),
+                    width=width,
+                )
+            )
+        return lines
+
     def _styled(self, text: str, token: str) -> str:
         if self.theme is None:
             return text
         return apply_theme_style(text, self.theme.resolve(token))
 
 
-def _screen_input_intent_or_none(result: object) -> InputIntent | None:
+def _screen_input_intent_or_none(result: object) -> InputIntent[str] | None:
     if isinstance(result, InputIntent):
         return result
     kind = getattr(result, "kind", None)
     if not isinstance(kind, str):
         return None
     return InputIntent(
-        kind=cast(InputIntentKind, kind),
+        kind=kind,
         text=str(getattr(result, "text", "")),
         note=str(getattr(result, "note", "")),
     )

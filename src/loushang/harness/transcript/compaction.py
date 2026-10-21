@@ -9,19 +9,19 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from loushang.foundation.json import JSONValue, require_json_mapping
 from loushang.harness.context import ConversationCompactionPlanner
+from loushang.harness.transcript.context_usage import estimate_context_tokens
 from loushang.harness.transcript.maintenance import (
     CompactionPlan,
     CompactionPreparation,
     TranscriptCompactionPolicy,
-    estimate_context_tokens,
 )
 from loushang.harness.transcript.profile import AgentTranscriptProfile
 from loushang.harness.transcript.types import (
     AgentTranscriptRecord,
     ContextCompactionCheckpoint,
 )
-from loushang.protocol import JSONValue, require_json_mapping
 
 TURN_AWARE_SUMMARY_IMPLEMENTATION = "agent_transcript.turn_aware_summary"
 TURN_AWARE_SUMMARY_VERSION = 1

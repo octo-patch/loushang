@@ -2,40 +2,24 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import InitVar, dataclass, field
-from typing import Literal, Protocol, cast
+from dataclasses import KW_ONLY, InitVar, dataclass, field
+from typing import Generic, Literal, Protocol, TypeAlias, TypeVar, cast
 
 from loushang.tui.framework import SurfaceHost
 from loushang.tui.keybindings import KeybindingManager, normalize_key_id
 from loushang.tui.ui_parts import Composer
 
 InputEventKind = Literal["key", "text", "paste", "resize", "focus", "mouse", "signal"]
-InputIntentKind = Literal[
-    "submit",
-    "follow_up",
-    "steer",
-    "abort",
-    "surface_close",
-    "invalidate_render",
-    "select",
-    "complete",
-    "command",
-    "setting",
-    "approve",
-    "approve_session",
-    "approval_decision",
-    "permission_profile_action",
-    "reject",
-    "dialog_confirm",
-    "dialog_cancel",
-    "question_submit",
-    "question_cancel",
-    "command_select",
-    "command_cancel",
-    "consumed",
+_InputIntentKindT = TypeVar("_InputIntentKindT", bound=str, covariant=True)
+# Temporary import-path compatibility; production annotations use precise envelopes.
+InputIntentKind: TypeAlias = str
+PromptInputIntentKind: TypeAlias = Literal[
+    "submit", "prompt_cancel", "invalidate_render"
 ]
-SubmitMode = Literal["submit", "follow_up", "steer"]
+PromptJumpDirection: TypeAlias = Literal["forward", "backward"]
 KeyEventType = Literal["press", "repeat", "release"]
+MouseAction = Literal["press", "release", "drag", "scroll_up", "scroll_down", "move"]
+MouseModifier = Literal["shift", "alt", "ctrl"]
 
 ESC = "\x1b"
 BRACKETED_PASTE_START = "\x1b[200~"
@@ -49,7 +33,12 @@ _MOD_SUPER = 8
 _LOCK_MASK = 64 + 128
 _SYMBOL_KEYS = set("`-=[]\\;',./!@#$%^&*()_+|~{}:<>?")
 
-_ARROW_CODEPOINTS = {"A": ("up", -1), "B": ("down", -2), "C": ("right", -3), "D": ("left", -4)}
+_ARROW_CODEPOINTS = {
+    "A": ("up", -1),
+    "B": ("down", -2),
+    "C": ("right", -3),
+    "D": ("left", -4),
+}
 _FUNCTIONAL_CODEPOINTS = {
     2: "insert",
     3: "delete",
@@ -239,6 +228,7 @@ _CONTROL_KEY_MAP = {
     "\x0b": "ctrl+k",
     "\x0f": "ctrl+o",
     "\x0d": "enter",
+    "\x14": "ctrl+t",
     "\x15": "ctrl+u",
     "\x16": "ctrl+v",
     "\x17": "ctrl+w",
@@ -248,7 +238,9 @@ _CONTROL_KEY_MAP = {
     "\x7f": "backspace",
 }
 _ALT_CONTROL_KEY_MAP = {
-    control: f"ctrl+alt+{key.removeprefix('ctrl+')}" if key.startswith("ctrl+") else f"alt+{key}"
+    control: f"ctrl+alt+{key.removeprefix('ctrl+')}"
+    if key.startswith("ctrl+")
+    else f"alt+{key}"
     for control, key in _CONTROL_KEY_MAP.items()
 }
 _ALT_CONTROL_KEY_MAP["\x08"] = "alt+backspace"
@@ -270,6 +262,7 @@ class InputEvent:
     mouse_column: int | None = None
     mouse_row: int | None = None
     mouse_action: str = ""
+    mouse_modifiers: frozenset[MouseModifier] = frozenset()
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, InputEvent):
@@ -287,15 +280,28 @@ class InputEvent:
             and self.mouse_column == other.mouse_column
             and self.mouse_row == other.mouse_row
             and self.mouse_action == other.mouse_action
+            and self.mouse_modifiers == other.mouse_modifiers
             and (self.raw == other.raw or not other.raw)
         )
 
 
 @dataclass(frozen=True, slots=True)
-class InputIntent:
-    kind: InputIntentKind
+class InputIntent(Generic[_InputIntentKindT]):
+    kind: _InputIntentKindT
     text: str = ""
     note: str = ""
+
+
+PromptInputIntent: TypeAlias = InputIntent[PromptInputIntentKind]
+
+
+def _prompt_input_intent(
+    kind: PromptInputIntentKind,
+    *,
+    text: str = "",
+    note: str = "",
+) -> PromptInputIntent:
+    return InputIntent(kind=kind, text=text, note=note)
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,9 +389,11 @@ class PromptInputTarget(EditorInputTarget, Protocol):
 
     def move_visual_page_down(self, *, width: int, visible_lines: int) -> None: ...
 
-    def jump_to_char(self, text: str, *, direction: Literal["forward", "backward"]) -> None: ...
+    def jump_to_char(self, text: str, *, direction: PromptJumpDirection) -> None: ...
 
-    def refresh_completions(self, *, force: bool = False, explicit: bool = False) -> None: ...
+    def refresh_completions(
+        self, *, force: bool = False, explicit: bool = False
+    ) -> None: ...
 
     def apply_selected_completion(self) -> None: ...
 
@@ -511,10 +519,12 @@ class ComposerInputTarget:
     def move_visual_page_down(self, *, width: int, visible_lines: int) -> None:
         self.composer.move_visual_page_down(width=width, visible_lines=visible_lines)
 
-    def jump_to_char(self, text: str, *, direction: Literal["forward", "backward"]) -> None:
+    def jump_to_char(self, text: str, *, direction: PromptJumpDirection) -> None:
         self.composer.jump_to_char(text, direction=direction)
 
-    def refresh_completions(self, *, force: bool = False, explicit: bool = False) -> None:
+    def refresh_completions(
+        self, *, force: bool = False, explicit: bool = False
+    ) -> None:
         self.composer.refresh_completions(force=force, explicit=explicit)
 
     def apply_selected_completion(self) -> None:
@@ -557,12 +567,18 @@ class InputReader:
             if self._in_paste:
                 end_index = self._buffer.find(BRACKETED_PASTE_END)
                 if end_index == -1:
-                    payload, pending_end_marker = _split_paste_payload_and_pending_end_marker(self._buffer)
+                    payload, pending_end_marker = (
+                        _split_paste_payload_and_pending_end_marker(self._buffer)
+                    )
                     self._paste_buffer += payload
                     self._buffer = pending_end_marker
                     break
                 self._paste_buffer += self._buffer[:end_index]
-                events.append(InputEvent(kind="paste", text=sanitize_paste_text(self._paste_buffer)))
+                events.append(
+                    InputEvent(
+                        kind="paste", text=sanitize_paste_text(self._paste_buffer)
+                    )
+                )
                 self._buffer = self._buffer[end_index + len(BRACKETED_PASTE_END) :]
                 self._paste_buffer = ""
                 self._in_paste = False
@@ -577,7 +593,9 @@ class InputReader:
                 self._pending_kitty_printable_codepoint = None
                 continue
 
-            parse_source = self._buffer if paste_start == -1 else self._buffer[:paste_start]
+            parse_source = (
+                self._buffer if paste_start == -1 else self._buffer[:paste_start]
+            )
             sequences, remainder = _extract_complete_sequences(parse_source)
             events.extend(self._events_from_sequences(sequences))
             if paste_start == -1:
@@ -629,7 +647,9 @@ class InputReader:
             if sequence in _CONTROL_KEY_MAP:
                 if sequence == "\x08" and _is_windows_terminal_session():
                     return InputEvent(kind="key", key="ctrl+backspace", raw=sequence)
-                return InputEvent(kind="key", key=_CONTROL_KEY_MAP[sequence], raw=sequence)
+                return InputEvent(
+                    kind="key", key=_CONTROL_KEY_MAP[sequence], raw=sequence
+                )
             return InputEvent(kind="text", text=sequence)
 
         focus = _parse_focus_sequence(sequence)
@@ -644,7 +664,7 @@ class InputReader:
 
         mouse = _parse_mouse_sequence(sequence)
         if mouse is not None:
-            button, column, row, action = mouse
+            button, column, row, action, modifiers = mouse
             self._pending_kitty_printable_codepoint = None
             return InputEvent(
                 kind="mouse",
@@ -652,18 +672,26 @@ class InputReader:
                 mouse_column=column,
                 mouse_row=row,
                 mouse_action=action,
+                mouse_modifiers=modifiers,
                 raw=sequence,
             )
 
         kitty_response = _parse_kitty_protocol_response(sequence)
         if kitty_response is not None:
             self._pending_kitty_printable_codepoint = None
-            return InputEvent(kind="signal", signal="kitty_protocol", text=kitty_response, raw=sequence)
+            return InputEvent(
+                kind="signal",
+                signal="kitty_protocol",
+                text=kitty_response,
+                raw=sequence,
+            )
 
         cell_size = _parse_cell_size_response(sequence)
         if cell_size is not None:
             self._pending_kitty_printable_codepoint = None
-            return InputEvent(kind="signal", signal="cell_size", text=cell_size, raw=sequence)
+            return InputEvent(
+                kind="signal", signal="cell_size", text=cell_size, raw=sequence
+            )
 
         terminal_response = _parse_terminal_control_response(sequence)
         if terminal_response is not None:
@@ -693,7 +721,7 @@ class InputReader:
 
 @dataclass(frozen=True, slots=True)
 class _SurfaceRoute:
-    intents: tuple[InputIntent, ...] = ()
+    intents: tuple[InputIntent[str], ...] = ()
     consumed: bool = False
 
 
@@ -701,13 +729,12 @@ class _SurfaceRoute:
 class InputRouter:
     composer: Composer | None = None
     surface_host: SurfaceHost | None = None
-    running: bool = False
-    steering_supported: bool = False
+    _: KW_ONLY
     width: int = 80
     height: int = 24
     keybindings: KeybindingManager | None = None
-    _jump_mode: Literal["forward", "backward"] | None = None
     target: InitVar[PromptInputTarget | None] = None
+    _jump_mode: PromptJumpDirection | None = field(default=None, init=False)
     _target: PromptInputTarget = field(init=False, repr=False)
 
     def __post_init__(self, target: PromptInputTarget | None) -> None:
@@ -721,21 +748,26 @@ class InputRouter:
             return
         raise TypeError("InputRouter requires composer or target")
 
-    def route(self, event: InputEvent) -> tuple[InputIntent, ...]:
+    def route(self, event: InputEvent) -> tuple[InputIntent[str], ...]:
         target = self._target
         if event.kind == "key" and event.event_type == "release":
             return ()
         if event.kind == "key":
-            if self._jump_mode is not None:
-                keybindings = self._keybindings()
-                if keybindings.matches(event.key, "tui.editor.jumpForward") or keybindings.matches(
-                    event.key,
-                    "tui.editor.jumpBackward",
-                ):
-                    self._jump_mode = None
-                    return ()
-                self._jump_mode = None
             keybindings = self._keybindings()
+            is_cancel = keybindings.matches(event.key, "tui.select.cancel")
+            jump_direction = prompt_jump_direction_for_key(
+                event.key,
+                keybindings=keybindings,
+            )
+            cancelled_pending_jump = False
+            if self._jump_mode is not None:
+                if jump_direction is not None:
+                    self._jump_mode = None
+                    if not is_cancel:
+                        return ()
+                else:
+                    self._jump_mode = None
+                cancelled_pending_jump = is_cancel
             surface_route = self._route_surface_first(event)
             if surface_route.intents:
                 return surface_route.intents
@@ -743,46 +775,46 @@ class InputRouter:
                 return ()
             focused_target = self._focused_editor_target()
             if focused_target is not None:
-                if route_editor_selection_key(focused_target, event.key, keybindings=keybindings):
+                if route_editor_selection_key(
+                    focused_target, event.key, keybindings=keybindings
+                ):
                     return ()
-                if route_editor_editing_key(focused_target, event.key, keybindings=keybindings):
+                if route_editor_editing_key(
+                    focused_target, event.key, keybindings=keybindings
+                ):
                     return ()
                 return ()
             if route_editor_selection_key(target, event.key, keybindings=keybindings):
                 return ()
-            if target.has_completions and route_prompt_completion_key(target, event.key, keybindings=keybindings):
+            if target.has_completions and route_prompt_completion_key(
+                target, event.key, keybindings=keybindings
+            ):
                 return ()
-            if keybindings.matches(event.key, "tui.select.cancel") and self.running:
-                return (InputIntent(kind="abort"),)
-            if keybindings.matches(event.key, "tui.editor.jumpForward"):
-                self._jump_mode = "forward"
+            if is_cancel:
+                if cancelled_pending_jump:
+                    return ()
+                return (_prompt_input_intent("prompt_cancel"),)
+            if jump_direction is not None:
+                self._jump_mode = jump_direction
                 return ()
-            if keybindings.matches(event.key, "tui.editor.jumpBackward"):
-                self._jump_mode = "backward"
-                return ()
-            if keybindings.matches(event.key, "tui.queue.editLast"):
-                return (InputIntent(kind="command", note="edit_last_queued_prompt"),)
-            if keybindings.matches(event.key, "tui.input.tab"):
-                target.refresh_completions(force=True, explicit=True)
-                if target.has_completions:
-                    target.apply_selected_completion()
+            if route_prompt_explicit_completion_key(
+                target,
+                event.key,
+                keybindings=keybindings,
+            ):
                 return ()
             if keybindings.matches(event.key, "tui.input.submit"):
                 return self.submit()
             if keybindings.matches(event.key, "tui.input.newLine"):
                 target.insert_newline()
                 return ()
-            if keybindings.matches(event.key, "tui.editor.cursorUp"):
-                self._move_up_or_history()
-                return ()
-            if keybindings.matches(event.key, "tui.editor.cursorDown"):
-                self._move_down_or_history()
-                return ()
-            if keybindings.matches(event.key, "tui.editor.pageUp"):
-                target.move_visual_page_up(width=self.width, visible_lines=self._composer_page_lines())
-                return ()
-            if keybindings.matches(event.key, "tui.editor.pageDown"):
-                target.move_visual_page_down(width=self.width, visible_lines=self._composer_page_lines())
+            if route_prompt_vertical_navigation_key(
+                target,
+                event.key,
+                keybindings=keybindings,
+                width=self.width,
+                height=self.height,
+            ):
                 return ()
             if route_editor_editing_key(target, event.key, keybindings=keybindings):
                 return ()
@@ -795,13 +827,17 @@ class InputRouter:
                 return ()
             focused_target = self._focused_editor_target()
             if focused_target is not None:
-                focused_target.paste(event.text)
+                apply_prompt_paste(focused_target, event.text)
                 return ()
-            target.paste(event.text)
+            apply_prompt_paste(target, event.text)
             return ()
         if event.kind == "text":
             if self._jump_mode is not None:
-                target.jump_to_char(event.text, direction=self._jump_mode)
+                apply_prompt_text(
+                    target,
+                    event.text,
+                    jump_direction=self._jump_mode,
+                )
                 self._jump_mode = None
                 return ()
             surface_route = self._route_surface_first(event)
@@ -813,26 +849,22 @@ class InputRouter:
             if focused_target is not None:
                 focused_target.insert_text(event.text)
                 return ()
-            target.insert_text(event.text)
+            apply_prompt_text(target, event.text)
             return ()
-        if event.kind == "resize" or (event.kind == "signal" and event.signal == "sigwinch"):
-            return (InputIntent(kind="invalidate_render"),)
+        if event.kind == "resize" or (
+            event.kind == "signal" and event.signal == "sigwinch"
+        ):
+            return (_prompt_input_intent("invalidate_render"),)
         return ()
 
-    def submit(self, *, mode: SubmitMode = "submit") -> tuple[InputIntent, ...]:
+    def submit(self) -> tuple[PromptInputIntent, ...]:
         target = self._target
         text = target.value
         if not text:
             return ()
         target.add_history(text)
         target.clear()
-        if not self.running:
-            return (InputIntent(kind="submit", text=text),)
-        if mode == "steer":
-            if self.steering_supported:
-                return (InputIntent(kind="steer", text=text),)
-            return (InputIntent(kind="follow_up", text=text, note="steer_unavailable"),)
-        return (InputIntent(kind="follow_up", text=text),)
+        return (_prompt_input_intent("submit", text=text),)
 
     def _route_surface_first(self, event: InputEvent) -> _SurfaceRoute:
         if self.surface_host is None:
@@ -849,7 +881,9 @@ class InputRouter:
             result = route_input(_legacy_event(event))
         else:
             result = self.surface_host.handle_input(_legacy_event(event))
-        return _SurfaceRoute(intents=_input_intents(result), consumed=_input_result_consumed(result))
+        return _SurfaceRoute(
+            intents=_input_intents(result), consumed=_input_result_consumed(result)
+        )
 
     def _focused_editor_target(self) -> EditorInputTarget | None:
         if self.surface_host is None:
@@ -860,30 +894,13 @@ class InputRouter:
         target = current()
         return cast(EditorInputTarget, target) if target is not None else None
 
-    def _move_up_or_history(self) -> None:
-        target = self._target
-        if target.browsing_history:
-            target.history_previous()
-        elif not target.value or not target.move_visual_up(width=self.width):
-            target.history_previous()
-
-    def _move_down_or_history(self) -> None:
-        target = self._target
-        if target.browsing_history:
-            target.history_next()
-        elif not target.value or not target.move_visual_down(width=self.width):
-            target.history_next()
-
     def _keybindings(self) -> KeybindingManager:
         if self.keybindings is None:
             self.keybindings = KeybindingManager()
         return self.keybindings
 
-    def _composer_page_lines(self) -> int:
-        return max(2, min(10, self.height))
 
-
-def _input_intents(result: object) -> tuple[InputIntent, ...]:
+def _input_intents(result: object) -> tuple[InputIntent[str], ...]:
     if result is None:
         return ()
     if isinstance(result, InputIntent):
@@ -937,6 +954,81 @@ def _split_paste_payload_and_pending_end_marker(text: str) -> tuple[str, str]:
         if BRACKETED_PASTE_END.startswith(suffix):
             return text[:-length], suffix
     return text, ""
+
+
+def prompt_jump_direction_for_key(
+    key: str,
+    *,
+    keybindings: KeybindingManager | None = None,
+) -> PromptJumpDirection | None:
+    keybindings = keybindings or KeybindingManager()
+    if keybindings.matches(key, "tui.editor.jumpForward"):
+        return "forward"
+    if keybindings.matches(key, "tui.editor.jumpBackward"):
+        return "backward"
+    return None
+
+
+def apply_prompt_text(
+    target: PromptInputTarget,
+    text: str,
+    *,
+    jump_direction: PromptJumpDirection | None = None,
+) -> None:
+    if jump_direction is not None:
+        target.jump_to_char(text, direction=jump_direction)
+        return
+    target.insert_text(text)
+
+
+def apply_prompt_paste(target: EditorInputTarget, text: str) -> None:
+    target.paste(text)
+
+
+def route_prompt_explicit_completion_key(
+    target: PromptInputTarget,
+    key: str,
+    *,
+    keybindings: KeybindingManager | None = None,
+) -> bool:
+    keybindings = keybindings or KeybindingManager()
+    if not keybindings.matches(key, "tui.input.tab"):
+        return False
+    target.refresh_completions(force=True, explicit=True)
+    if target.has_completions:
+        target.apply_selected_completion()
+    return True
+
+
+def route_prompt_vertical_navigation_key(
+    target: PromptInputTarget,
+    key: str,
+    *,
+    width: int,
+    height: int,
+    keybindings: KeybindingManager | None = None,
+) -> bool:
+    keybindings = keybindings or KeybindingManager()
+    if keybindings.matches(key, "tui.editor.cursorUp"):
+        if target.browsing_history:
+            target.history_previous()
+        elif not target.value or not target.move_visual_up(width=width):
+            target.history_previous()
+        return True
+    if keybindings.matches(key, "tui.editor.cursorDown"):
+        if target.browsing_history:
+            target.history_next()
+        elif not target.value or not target.move_visual_down(width=width):
+            target.history_next()
+        return True
+    visible_lines = max(2, min(10, height))
+    if keybindings.matches(key, "tui.editor.pageUp"):
+        target.move_visual_page_up(width=width, visible_lines=visible_lines)
+        return True
+    if keybindings.matches(key, "tui.editor.pageDown"):
+        target.move_visual_page_down(width=width, visible_lines=visible_lines)
+        return True
+    return False
 
 
 def route_editor_editing_key(
@@ -1053,7 +1145,9 @@ def route_composer_editing_key(
     *,
     keybindings: KeybindingManager | None = None,
 ) -> bool:
-    return route_editor_editing_key(ComposerInputTarget(composer), key, keybindings=keybindings)
+    return route_editor_editing_key(
+        ComposerInputTarget(composer), key, keybindings=keybindings
+    )
 
 
 def route_composer_selection_key(
@@ -1062,7 +1156,9 @@ def route_composer_selection_key(
     *,
     keybindings: KeybindingManager | None = None,
 ) -> bool:
-    return route_editor_selection_key(ComposerInputTarget(composer), key, keybindings=keybindings)
+    return route_editor_selection_key(
+        ComposerInputTarget(composer), key, keybindings=keybindings
+    )
 
 
 def _extract_complete_sequences(buffer: str) -> tuple[tuple[str, ...], str]:
@@ -1089,7 +1185,9 @@ def _extract_complete_sequences(buffer: str) -> tuple[tuple[str, ...], str]:
             candidate = remaining[:sequence_end]
             status = _complete_escape_status(candidate)
             if status == "complete":
-                if candidate == "\x1b\x1b" and _starts_escape_tail(remaining[sequence_end : sequence_end + 1]):
+                if candidate == "\x1b\x1b" and _starts_escape_tail(
+                    remaining[sequence_end : sequence_end + 1]
+                ):
                     sequences.append(ESC)
                     index += 1
                     break
@@ -1106,7 +1204,9 @@ def _extract_complete_sequences(buffer: str) -> tuple[tuple[str, ...], str]:
     return tuple(sequences), ""
 
 
-def _complete_alt_wrapped_legacy_status(data: str) -> Literal["complete", "incomplete", "not-escape"]:
+def _complete_alt_wrapped_legacy_status(
+    data: str,
+) -> Literal["complete", "incomplete", "not-escape"]:
     if not data.startswith(ESC + ESC):
         return "not-escape"
     if _matching_alt_wrapped_legacy_sequence(data) is not None:
@@ -1123,7 +1223,9 @@ def _matching_alt_wrapped_legacy_sequence(data: str) -> str | None:
     return None
 
 
-def _complete_escape_status(data: str) -> Literal["complete", "incomplete", "not-escape"]:
+def _complete_escape_status(
+    data: str,
+) -> Literal["complete", "incomplete", "not-escape"]:
     if not data.startswith(ESC):
         return "not-escape"
     if len(data) == 1:
@@ -1132,7 +1234,11 @@ def _complete_escape_status(data: str) -> Literal["complete", "incomplete", "not
     if after_esc.startswith("["):
         return _complete_csi_status(data)
     if after_esc.startswith("]"):
-        return "complete" if data.endswith("\x07") or data.endswith("\x1b\\") else "incomplete"
+        return (
+            "complete"
+            if data.endswith("\x07") or data.endswith("\x1b\\")
+            else "incomplete"
+        )
     if after_esc.startswith("P") or after_esc.startswith("_"):
         return "complete" if data.endswith("\x1b\\") else "incomplete"
     if after_esc.startswith("O"):
@@ -1164,7 +1270,9 @@ def _parse_key_sequence(sequence: str) -> tuple[str, KeyEventType] | None:
     kitty = _parse_kitty_sequence(sequence)
     if kitty is not None:
         codepoint, modifier, event_type, base_layout_key = kitty
-        return _format_key_from_codepoint(codepoint, modifier, base_layout_key=base_layout_key), event_type
+        return _format_key_from_codepoint(
+            codepoint, modifier, base_layout_key=base_layout_key
+        ), event_type
     modify_other = _parse_modify_other_keys(sequence)
     if modify_other is not None:
         codepoint, modifier = modify_other
@@ -1195,7 +1303,9 @@ def _parse_cell_size_response(sequence: str) -> str | None:
 
 
 def _parse_terminal_control_response(sequence: str) -> tuple[str, str] | None:
-    if sequence.startswith("\x1b]") and (sequence.endswith("\x07") or sequence.endswith("\x1b\\")):
+    if sequence.startswith("\x1b]") and (
+        sequence.endswith("\x07") or sequence.endswith("\x1b\\")
+    ):
         terminator_length = 1 if sequence.endswith("\x07") else 2
         return "osc", sequence[2:-terminator_length]
     if sequence.startswith("\x1bP") and sequence.endswith("\x1b\\"):
@@ -1205,37 +1315,72 @@ def _parse_terminal_control_response(sequence: str) -> tuple[str, str] | None:
     return None
 
 
-def _parse_mouse_sequence(sequence: str) -> tuple[int, int, int, str] | None:
+def _parse_mouse_sequence(
+    sequence: str,
+) -> tuple[int, int, int, MouseAction, frozenset[MouseModifier]] | None:
     sgr = _parse_sgr_mouse_sequence(sequence)
     if sgr is not None:
         return sgr
     return _parse_x10_mouse_sequence(sequence)
 
 
-def _parse_sgr_mouse_sequence(sequence: str) -> tuple[int, int, int, str] | None:
+def _parse_sgr_mouse_sequence(
+    sequence: str,
+) -> tuple[int, int, int, MouseAction, frozenset[MouseModifier]] | None:
     match = re.match(r"^\x1b\[<(\d+);(\d+);(\d+)([Mm])$", sequence)
     if match is None:
         return None
-    button = int(match.group(1))
+    code = int(match.group(1))
     column = max(0, int(match.group(2)) - 1)
     row = max(0, int(match.group(3)) - 1)
-    action = "press" if match.group(4) == "M" else "release"
-    return button, column, row, action
+    button, action, modifiers = _decode_mouse_code(code, released=match.group(4) == "m")
+    return button, column, row, action, modifiers
 
 
-def _parse_x10_mouse_sequence(sequence: str) -> tuple[int, int, int, str] | None:
+def _parse_x10_mouse_sequence(
+    sequence: str,
+) -> tuple[int, int, int, MouseAction, frozenset[MouseModifier]] | None:
     if not sequence.startswith("\x1b[M") or len(sequence) < 6:
         return None
     button_code = max(0, ord(sequence[3]) - 32)
-    button = button_code & 0b11
     column = max(0, ord(sequence[4]) - 33)
     row = max(0, ord(sequence[5]) - 33)
-    action = "release" if button == 3 else "press"
-    return button, column, row, action
+    button, action, modifiers = _decode_mouse_code(button_code, released=False)
+    return button, column, row, action, modifiers
 
 
-def _parse_kitty_sequence(sequence: str) -> tuple[int, int, KeyEventType, int | None] | None:
-    csi_u = re.match(r"^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$", sequence)
+def _decode_mouse_code(
+    code: int, *, released: bool
+) -> tuple[int, MouseAction, frozenset[MouseModifier]]:
+    modifiers: set[MouseModifier] = set()
+    if code & 4:
+        modifiers.add("shift")
+    if code & 8:
+        modifiers.add("alt")
+    if code & 16:
+        modifiers.add("ctrl")
+    button = code & 3
+    if code & 64:
+        action: MouseAction = "scroll_up" if button == 0 else "scroll_down"
+    elif released or (button == 3 and not code & 32):
+        action = "release"
+        if button == 3:
+            # X10 release does not identify the button. Match the primary
+            # button so a left press/release remains usable on older terminals.
+            button = 0
+    elif code & 32:
+        action = "move" if button == 3 else "drag"
+    else:
+        action = "press"
+    return button, action, frozenset(modifiers)
+
+
+def _parse_kitty_sequence(
+    sequence: str,
+) -> tuple[int, int, KeyEventType, int | None] | None:
+    csi_u = re.match(
+        r"^\x1b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$", sequence
+    )
     if csi_u:
         codepoint = int(csi_u.group(1))
         base_layout_key = int(csi_u.group(3)) if csi_u.group(3) else None
@@ -1258,12 +1403,19 @@ def _parse_kitty_sequence(sequence: str) -> tuple[int, int, KeyEventType, int | 
         return codepoint, modifier, _event_type(func.group(3)), None
     ss3_function = re.match(r"^\x1bO([PQRSE])$", sequence)
     if ss3_function:
-        name = {"P": "f1", "Q": "f2", "R": "f3", "S": "f4", "E": "clear"}[ss3_function.group(1)]
+        name = {"P": "f1", "Q": "f2", "R": "f3", "S": "f4", "E": "clear"}[
+            ss3_function.group(1)
+        ]
         return _FUNCTIONAL_NAME_CODEPOINTS[name], 0, "press", None
     home_end = re.match(r"^\x1b\[1;(\d+)(?::(\d+))?([HF])$", sequence)
     if home_end:
         codepoint = -14 if home_end.group(3) == "H" else -15
-        return codepoint, int(home_end.group(1)) - 1, _event_type(home_end.group(2)), None
+        return (
+            codepoint,
+            int(home_end.group(1)) - 1,
+            _event_type(home_end.group(2)),
+            None,
+        )
     return None
 
 
@@ -1282,7 +1434,9 @@ def _event_type(value: str | None) -> KeyEventType:
     return "press"
 
 
-def _format_key_from_codepoint(codepoint: int, modifier: int, *, base_layout_key: int | None = None) -> str:
+def _format_key_from_codepoint(
+    codepoint: int, modifier: int, *, base_layout_key: int | None = None
+) -> str:
     normalized_codepoint = _KITTY_FUNCTIONAL_EQUIVALENTS.get(codepoint, codepoint)
     if normalized_codepoint in _NEGATIVE_FUNCTIONAL_CODEPOINTS:
         base = _NEGATIVE_FUNCTIONAL_CODEPOINTS[normalized_codepoint]
@@ -1315,7 +1469,11 @@ def _normalize_shifted_letter(codepoint: int, modifier: int) -> int:
 
 
 def _is_authoritative_keyboard_codepoint(codepoint: int) -> bool:
-    return 97 <= codepoint <= 122 or 48 <= codepoint <= 57 or chr(codepoint) in _SYMBOL_KEYS
+    return (
+        97 <= codepoint <= 122
+        or 48 <= codepoint <= 57
+        or chr(codepoint) in _SYMBOL_KEYS
+    )
 
 
 def _is_windows_terminal_session() -> bool:
@@ -1376,7 +1534,9 @@ def _coalesce_text_events(events: list[InputEvent]) -> tuple[InputEvent, ...]:
             pending_raw += event.raw
             continue
         if pending_text:
-            coalesced.append(InputEvent(kind="text", text=pending_text, raw=pending_raw))
+            coalesced.append(
+                InputEvent(kind="text", text=pending_text, raw=pending_raw)
+            )
             pending_text = ""
             pending_raw = ""
         coalesced.append(event)

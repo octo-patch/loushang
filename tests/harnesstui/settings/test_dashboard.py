@@ -11,6 +11,7 @@ from loushang.harnesstui.settings.dashboard import (
     usage_lines,
 )
 from loushang.harnesstui.settings.page import ConfigSettingsPage
+from loushang.harnesstui.status.snapshot import StatusSnapshot
 from loushang.tui import InputEvent, InputIntent, RenderConstraints, TabGroup, TabPage
 from loushang.tui.cell_width import strip_control_sequences
 from loushang.tui.settings import ConfigRow
@@ -69,7 +70,9 @@ def test_static_lines_page_truncates_and_consumes_horizontal_navigation() -> Non
 
     rendered = page.render(RenderConstraints(width=4, max_height=1))
 
-    assert tuple(strip_control_sequences(line.text) for line in rendered.lines) == ("1234",)
+    assert tuple(strip_control_sequences(line.text) for line in rendered.lines) == (
+        "1234",
+    )
     assert page.handle_input(InputEvent(kind="key", key="left")) is True
 
 
@@ -99,3 +102,107 @@ def test_dashboard_usage_view_model_contains_provider_failures() -> None:
         raise RuntimeError("secret product failure")
 
     assert usage_lines(_failed_provider) == ("Usage", "", "Usage data unavailable")
+
+
+def test_session_details_keep_the_full_id_even_when_named() -> None:
+    snapshot = StatusSnapshot(
+        model_label="model",
+        cwd="/repo",
+        branch="main",
+        session_label="Renamed",
+        thinking_level=None,
+        running=False,
+        statusline_visible=True,
+        session_id="d8525f5ecd8c42e2974dd451b640c5f8",
+    )
+    for lines in (status_lines(snapshot), stats_overview_lines(snapshot)):
+        assert "Session            Renamed" in lines
+        assert "Session ID         d8525f5ecd8c42e2974dd451b640c5f8" in lines
+
+
+def test_dashboard_usage_view_formats_context_and_cumulative_coverage() -> None:
+    lines = usage_lines(
+        lambda: {
+            "context": {
+                "tokens": 84_000,
+                "contextWindow": 128_000,
+                "percent": 65.625,
+                "source": "estimated_from_last_usage",
+                "staleAfterCompaction": False,
+            },
+            "tokens": {
+                "input": 100,
+                "output": 20,
+                "cacheRead": 30,
+                "cacheWrite": 40,
+                "total": 190,
+                "source": "logical_outcome_derived",
+                "incompleteAttempts": True,
+            },
+        }
+    )
+
+    assert lines[2:] == (
+        "Current context    ≈84,000",
+        "Context window     128,000",
+        "Percent used       65.6%",
+        "Context source     estimated_from_last_usage",
+        "Freshness          current",
+        "",
+        "Cumulative input  100",
+        "Cumulative output 20",
+        "Cache read        30",
+        "Cache write       40",
+        "Cumulative total  190",
+        "Coverage source   logical_outcome_derived",
+        "Usage accuracy    Historical estimate",
+    )
+
+
+def test_dashboard_usage_view_explains_accuracy_without_hiding_source() -> None:
+    def _lines(source: str, incomplete: bool) -> tuple[str, ...]:
+        return usage_lines(
+            lambda: {
+                "context": None,
+                "tokens": {
+                    "input": 1,
+                    "output": 2,
+                    "cacheRead": 3,
+                    "cacheWrite": 4,
+                    "total": 10,
+                    "source": source,
+                    "incompleteAttempts": incomplete,
+                },
+            }
+        )
+
+    exact = _lines("attempt_usage_facts", False)
+    partial = _lines("mixed_derived", True)
+    historical = _lines("legacy_derived", True)
+    unknown = _lines("unexpected", False)
+
+    assert "Coverage source   attempt_usage_facts" in exact
+    assert "Usage accuracy    Exact" in exact
+    assert "Usage accuracy    Partial estimate" in partial
+    assert "Usage accuracy    Historical estimate" in historical
+    assert "Usage accuracy    Unavailable" in unknown
+
+
+def test_dashboard_usage_view_exposes_context_projection_quality() -> None:
+    lines = usage_lines(
+        lambda: {
+            "context": {
+                "tokens": 84_000,
+                "contextWindow": 128_000,
+                "percent": 65.625,
+                "source": "assistant_usage",
+                "accuracy": "projected",
+                "structuralEnvelopeStatus": "logical_mismatch",
+            },
+            "tokens": None,
+        }
+    )
+
+    assert "Current context    ≈84,000" in lines
+    assert "Context accuracy   Projected" in lines
+    assert "Freshness          logical envelope changed" in lines

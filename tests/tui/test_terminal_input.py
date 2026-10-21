@@ -1,14 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
-import os
-import sys
-import threading
-import time
-from contextlib import suppress
+from dataclasses import dataclass
 from io import StringIO
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,11 +12,6 @@ from loushang.tui.input import (
     BRACKETED_PASTE_START,
     InputEvent,
     InputReader,
-)
-from loushang.tui.keyboard_protocol import (
-    KITTY_QUERY_SEQUENCE,
-    MODIFY_OTHER_KEYS_DISABLE_SEQUENCE,
-    MODIFY_OTHER_KEYS_ENABLE_SEQUENCE,
 )
 from loushang.tui.terminal_input import (
     TerminalInputMode,
@@ -41,194 +30,41 @@ def test_terminal_input_mode_does_not_write_modes_for_non_tty_streams() -> None:
     assert stdout.getvalue() == ""
 
 
-def test_terminal_input_mode_enables_and_restores_tty_modes(monkeypatch: Any) -> None:
-    termios = pytest.importorskip("termios")
-    pytest.importorskip("tty")
-    stdin = _TtyInput()
+def test_terminal_input_mode_holds_native_lease_until_protocol_cleanup(
+    monkeypatch: Any,
+) -> None:
+    lease = _ModeLease()
+    factory = _ModeFactory(lease)
     stdout = StringIO()
-    original_attrs = [
-        getattr(termios, "ICRNL", 0),
-        0,
-        0,
-        termios.ECHO
-        | termios.ICANON
-        | getattr(termios, "ISIG", 0)
-        | getattr(termios, "IEXTEN", 0),
-        0,
-        0,
-        [0] * 32,
-    ]
-    tcsetattr_calls: list[tuple[int, int, list[Any]]] = []
-
-    monkeypatch.setattr("termios.tcgetattr", lambda fd: original_attrs)
     monkeypatch.setattr(
-        "termios.tcsetattr",
-        lambda fd, when, attrs: tcsetattr_calls.append((fd, when, attrs)),
+        "loushang.tui.terminal_input.native_terminal_mode_factory",
+        lambda _platform: factory,
     )
-    monkeypatch.setattr("tty.setcbreak", lambda fd: None)
     monkeypatch.setattr(
         "loushang.tui.terminal_input.drain_input", lambda *args, **kwargs: ""
     )
 
-    with TerminalInputMode(stdin=stdin, stdout=stdout):
-        pass
-
-    output = stdout.getvalue()
-    assert "\x1b[?2004h" in output
-    assert "\x1b[?1004h" in output
-    assert KITTY_QUERY_SEQUENCE in output
-    assert MODIFY_OTHER_KEYS_ENABLE_SEQUENCE in output
-    assert "\x1b[?2004l" in output
-    assert "\x1b[?1004l" in output
-    assert MODIFY_OTHER_KEYS_DISABLE_SEQUENCE in output
-    active_attrs = tcsetattr_calls[0][2]
-    assert active_attrs[3] & getattr(termios, "IEXTEN", 0) == 0
-    assert tcsetattr_calls[-1] == (stdin.fileno(), termios.TCSADRAIN, original_attrs)
-
-
-def test_terminal_input_mode_delivers_control_v() -> None:
-    if os.name == "nt":
-        pytest.skip("PTY input test uses POSIX termios")
-    pty = pytest.importorskip("pty")
-    select = pytest.importorskip("select")
-    master_fd, slave_fd = pty.openpty()
-    try:
-        with os.fdopen(slave_fd, "r", closefd=False) as stdin:
-            with TerminalInputMode(
-                stdin=stdin,
-                stdout=StringIO(),
-                bracketed_paste=False,
-                focus_events=False,
-                keyboard_protocols=False,
-                drain_on_exit=False,
-            ):
-                os.write(master_fd, b"\x16")
-                readable, _, _ = select.select([slave_fd], [], [], 1.0)
-                assert readable == [slave_fd]
-                assert os.read(slave_fd, 1) == b"\x16"
-    finally:
-        os.close(master_fd)
-        os.close(slave_fd)
-
-
-def test_terminal_input_mode_writes_control_modes_on_windows_without_posix_modules(
-    monkeypatch: Any,
-) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-
-    original_import_module = importlib.import_module
-
-    def fake_import_module(name: str, package: str | None = None) -> object:
-        if name in {"termios", "tty"}:
-            raise ModuleNotFoundError(f"No module named {name!r}")
-        return original_import_module(name, package)
-
-    monkeypatch.setattr("importlib.import_module", fake_import_module)
-    stdout = StringIO()
-
     with TerminalInputMode(stdin=_TtyInput(), stdout=stdout, keyboard_protocols=False):
-        pass
+        assert lease.restore_calls == 0
 
+    assert factory.open_calls == 1
+    assert lease.restore_calls == 1
     assert stdout.getvalue() == "\x1b[?2004h\x1b[?1004h\x1b[?2004l\x1b[?1004l"
 
 
-def test_read_input_chunk_or_render_tick_waits_for_windows_tty_input(
+def test_terminal_input_mode_restores_native_lease_when_protocol_startup_fails(
     monkeypatch: Any,
 ) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-    _install_fake_msvcrt(monkeypatch, kbhit=lambda: False)
-
-    result = asyncio.run(
-        read_input_chunk_or_render_tick(
-            _TtyInput(), runtime=_Runtime(), active_task=None, idle_wakeup_ms=1
-        )
+    lease = _ModeLease()
+    monkeypatch.setattr(
+        "loushang.tui.terminal_input.native_terminal_mode_factory",
+        lambda _platform: _ModeFactory(lease),
     )
 
-    assert result is None
+    with pytest.raises(RuntimeError, match="write failed"):
+        TerminalInputMode(stdin=_TtyInput(), stdout=_FailingOutput()).__enter__()
 
-
-def test_read_input_chunk_reads_windows_tty_key(monkeypatch: Any) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-    _install_fake_msvcrt(monkeypatch, chars=["x"])
-
-    result = asyncio.run(read_input_chunk(_TtyInput()))
-
-    assert result == "x"
-
-
-def test_windows_blocking_key_read_does_not_block_render_wakeup(monkeypatch: Any) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-
-    def slow_getwch() -> str:
-        time.sleep(0.05)
-        return "x"
-
-    _install_fake_msvcrt(monkeypatch, kbhit=lambda: True, getwch=slow_getwch)
-
-    async def run() -> tuple[str | None, int]:
-        runtime = _DeferredRuntime()
-        render_wakeup = asyncio.Event()
-
-        async def active() -> None:
-            await asyncio.sleep(0.02)
-
-        async def wake_later() -> None:
-            await asyncio.sleep(0.001)
-            render_wakeup.set()
-
-        active_task = asyncio.create_task(active())
-        wake_task = asyncio.create_task(wake_later())
-        result = await read_input_chunk_or_render_tick(
-            _TtyInput(),
-            runtime=runtime,
-            active_task=active_task,
-            render_wakeup=render_wakeup,
-        )
-        await wake_task
-        return result, runtime.rendered
-
-    result, rendered = asyncio.run(run())
-
-    assert result is None
-    assert rendered >= 1
-
-
-def test_windows_canceled_key_read_is_reused_by_next_reader(monkeypatch: Any) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
-    calls: list[str] = []
-    started = threading.Event()
-    kbhit_calls = 0
-
-    def kbhit() -> bool:
-        nonlocal kbhit_calls
-        kbhit_calls += 1
-        return kbhit_calls == 1
-
-    def slow_getwch() -> str:
-        calls.append("start")
-        started.set()
-        time.sleep(0.02)
-        calls.append("end")
-        return "h"
-
-    _install_fake_msvcrt(monkeypatch, kbhit=kbhit, getwch=slow_getwch)
-
-    async def run() -> str:
-        first = asyncio.create_task(read_input_chunk(_TtyInput()))
-        while not started.is_set():
-            await asyncio.sleep(0.001)
-        first.cancel()
-        with suppress(asyncio.CancelledError):
-            await first
-        while calls != ["start", "end"]:
-            await asyncio.sleep(0.001)
-        return await asyncio.wait_for(read_input_chunk(_TtyInput()), timeout=0.1)
-
-    result = asyncio.run(run())
-
-    assert result == "h"
-    assert calls == ["start", "end"]
-    assert kbhit_calls == 1
+    assert lease.restore_calls == 1
 
 
 def test_read_input_chunk_or_render_tick_reads_raw_stringio_escape_without_tail_joining() -> (
@@ -260,16 +96,24 @@ def test_read_input_chunk_or_render_tick_wakes_for_deferred_render_request() -> 
     async def run() -> tuple[str | None, int, int]:
         runtime = _DeferredRuntime()
         render_wakeup = asyncio.Event()
+        release_input = asyncio.Event()
+
+        async def read_after_render(_stdin: object) -> str:
+            await release_input.wait()
+            return ""
 
         async def wake_later() -> None:
-            await asyncio.sleep(0.001)
             render_wakeup.set()
+            while runtime.rendered == 0:
+                await asyncio.sleep(0)
+            release_input.set()
 
         wake_task = asyncio.create_task(wake_later())
         result = await read_input_chunk_or_render_tick(
-            _BlockingOnceInput(block_seconds=0.01),
+            StringIO(""),
             runtime=runtime,
             active_task=None,
+            input_chunk_reader=read_after_render,
             render_wakeup=render_wakeup,
         )
         await wake_task
@@ -282,13 +126,94 @@ def test_read_input_chunk_or_render_tick_wakes_for_deferred_render_request() -> 
     assert decisions >= 2
 
 
+def test_render_waiter_is_cleaned_after_immediate_render() -> None:
+    async def run() -> tuple[str | None, int]:
+        release_input = asyncio.Event()
+
+        class ImmediateOnceRuntime:
+            decisions = 0
+
+            def request_next_animation_frame(self):
+                self.decisions += 1
+                return (
+                    _ImmediateDecision() if self.decisions == 1 else _DelayedDecision()
+                )
+
+            def render_now(self) -> None:
+                release_input.set()
+
+        async def read_after_render(_stdin: object) -> str:
+            await release_input.wait()
+            return "x"
+
+        existing = asyncio.all_tasks()
+        result = await read_input_chunk_or_render_tick(
+            StringIO(),
+            runtime=ImmediateOnceRuntime(),
+            active_task=None,
+            input_chunk_reader=read_after_render,
+            render_wakeup=asyncio.Event(),
+        )
+        pending = asyncio.all_tasks() - existing
+        try:
+            return result, len(pending)
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert asyncio.run(run()) == ("x", 0)
+
+
+def test_render_waiter_is_cleaned_when_input_wait_is_cancelled() -> None:
+    async def run() -> int:
+        waiting = asyncio.Event()
+
+        class WaitingRuntime:
+            def request_next_animation_frame(self):
+                waiting.set()
+                return _DelayedDecision()
+
+            def render_now(self) -> None:
+                pass
+
+        async def blocked_read(_stdin: object) -> str:
+            await asyncio.Event().wait()
+            return "x"
+
+        existing = asyncio.all_tasks()
+        reader = asyncio.create_task(
+            read_input_chunk_or_render_tick(
+                StringIO(),
+                runtime=WaitingRuntime(),
+                active_task=None,
+                input_chunk_reader=blocked_read,
+                render_wakeup=asyncio.Event(),
+            )
+        )
+        await waiting.wait()
+        await asyncio.sleep(0)
+        reader.cancel()
+        await asyncio.gather(reader, return_exceptions=True)
+        pending = asyncio.all_tasks() - existing
+        try:
+            return len(pending)
+        finally:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    assert asyncio.run(run()) == 0
+
+
 def test_read_input_chunk_or_render_tick_wakes_for_terminal_runtime_deadline() -> None:
     async def run() -> tuple[str | None, int]:
         runtime = _Runtime()
         result = await read_input_chunk_or_render_tick(
-            _BlockingOnceInput(block_seconds=0.01),
+            StringIO(""),
             runtime=runtime,
             active_task=None,
+            input_chunk_reader=_DelayedInputReader(block_seconds=0.01),
             idle_wakeup_ms=1,
         )
         return result, runtime.rendered
@@ -299,6 +224,57 @@ def test_read_input_chunk_or_render_tick_wakes_for_terminal_runtime_deadline() -
     assert rendered == 0
 
 
+@pytest.mark.parametrize("wake", ["turn_completed", "terminal_deadline"])
+@pytest.mark.parametrize("chunk", ["\x1b", "next prompt", ""])
+def test_input_completed_during_render_waiter_cleanup_is_delivered(
+    wake: str, chunk: str
+) -> None:
+    async def run() -> None:
+        existing = asyncio.all_tasks()
+        render_waiting = asyncio.Event()
+        input_ready = asyncio.Event()
+        input_completed = asyncio.Event()
+
+        class RenderWakeup(asyncio.Event):
+            async def wait(self) -> bool:
+                render_waiting.set()
+                try:
+                    return await super().wait()
+                finally:
+                    # A real terminal read can finish while the cancelled
+                    # render waiter is being joined. Coordinate that ordering
+                    # without relying on wall-clock delays or asyncio.wait mocks.
+                    input_ready.set()
+                    await input_completed.wait()
+
+        async def read(_stdin: object) -> str:
+            await input_ready.wait()
+            input_completed.set()
+            return chunk
+
+        async def turn() -> None:
+            await render_waiting.wait()
+
+        active = asyncio.create_task(turn()) if wake == "turn_completed" else None
+        try:
+            assert await read_input_chunk_or_render_tick(
+                StringIO(),
+                runtime=_Runtime(),
+                active_task=active,
+                input_chunk_reader=read,
+                render_wakeup=RenderWakeup(),
+                idle_wakeup_ms=0 if wake == "terminal_deadline" else None,
+            ) == chunk
+            assert input_completed.is_set()
+            assert not asyncio.all_tasks() - existing
+        finally:
+            if active is not None:
+                active.cancel()
+                await asyncio.gather(active, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_drain_input_consumes_buffered_stringio_text() -> None:
     stdin = StringIO("leftover")
 
@@ -306,31 +282,6 @@ def test_drain_input_consumes_buffered_stringio_text() -> None:
 
     assert drained == "leftover"
     assert stdin.read() == ""
-
-
-def test_drain_input_respects_max_duration_for_continuous_tty_input(
-    monkeypatch,
-) -> None:
-    calls: list[int] = []
-
-    def fake_select(
-        read_list: list[int], _write: list[Any], _error: list[Any], _timeout: float
-    ):
-        return read_list, [], []
-
-    def fake_read(_fd: int, size: int) -> bytes:
-        calls.append(size)
-        return b"x"
-
-    clock = _FloatClock(step=0.004)
-    monkeypatch.setattr("select.select", fake_select)
-    monkeypatch.setattr("os.read", fake_read)
-
-    drained = drain_input(
-        _TtyInput(), max_bytes=1_000, idle_timeout=0.01, max_duration=0.01, now=clock
-    )
-
-    assert 1 <= len(drained) < 1_000
 
 
 def test_input_batch_routes_kitty_protocol_response_as_control_event() -> None:
@@ -593,56 +544,39 @@ class _ImmediateDecision:
     delay_ms = 0
 
 
-class _BlockingOnceInput:
+class _DelayedInputReader:
     def __init__(self, *, block_seconds: float) -> None:
         self.block_seconds = block_seconds
 
-    def read(self, _size: int) -> str:
-        import time
-
-        time.sleep(self.block_seconds)
+    async def __call__(self, _stdin: object) -> str:
+        await asyncio.sleep(self.block_seconds)
         return ""
-
-    def isatty(self) -> bool:
-        return False
 
 
 class _TtyInput:
-    def fileno(self) -> int:
-        return 42
-
     def isatty(self) -> bool:
         return True
 
 
-class _FloatClock:
-    def __init__(self, *, step: float) -> None:
-        self.value = 0.0
-        self.step = step
+@dataclass
+class _ModeLease:
+    restore_calls: int = 0
 
-    def __call__(self) -> float:
-        current = self.value
-        self.value += self.step
-        return current
+    def restore(self) -> None:
+        self.restore_calls += 1
 
 
-def _install_fake_msvcrt(
-    monkeypatch: Any,
-    *,
-    chars: list[str] | None = None,
-    kbhit: object | None = None,
-    getwch: object | None = None,
-) -> None:
-    pending = list(chars or ())
-    fake_msvcrt = SimpleNamespace(
-        kbhit=kbhit or (lambda: bool(pending)),
-        getwch=getwch or (lambda: pending.pop(0)),
-    )
-    original_import_module = importlib.import_module
+@dataclass
+class _ModeFactory:
+    lease: _ModeLease
+    open_calls: int = 0
 
-    def fake_import_module(name: str, package: str | None = None) -> object:
-        if name == "msvcrt":
-            return fake_msvcrt
-        return original_import_module(name, package)
+    def open(self, _stdin: object) -> _ModeLease:
+        self.open_calls += 1
+        return self.lease
 
-    monkeypatch.setattr("importlib.import_module", fake_import_module)
+
+class _FailingOutput(StringIO):
+    def write(self, value: str) -> int:
+        del value
+        raise RuntimeError("write failed")

@@ -11,6 +11,11 @@ from loushang.coding.ui.completion import coding_inline_completion_provider
 from loushang.coding.ui.screen_app import ScreenCodingTuiApp
 from loushang.coding.ui.screen_input import build_screen_input_router
 from loushang.coding.ui.screen_surfaces import ScreenSurfaceManager
+from loushang.harnesstui.conversation.input import (
+    ConversationAbortResult,
+    ConversationLocalResult,
+    ConversationSurfaceResult,
+)
 from loushang.harnesstui.status.provider import StatusProvider
 from loushang.tui import (
     FakeTerminalPort,
@@ -52,11 +57,12 @@ def test_screen_tui_playback_applies_model_argument_completion() -> None:
     steps = playback.play([PlaybackEvent.input("/model gpt\t")])
 
     assert all(step.flush_succeeded for step in steps)
-    assert app.composer.value == "/model openai/gpt-5.4"
+    assert app.composer.value == "/model openai:test-endpoint:gpt-5.4"
     lines = _plain_lines(steps[-1].diagnostics)
-    assert "› /model openai/gpt-5.4" in lines
-    assert lines[-1] == (
-        "moonshot/kimi-for-coding | repo | main | abcd | idle | perm=standard"
+    assert "› /model openai:test-endpoint:gpt-5.4" in lines
+    assert (
+        "kimi-for-coding | repo | main | abcd | idle"
+        in lines[-1]
     )
 
 
@@ -221,7 +227,8 @@ def test_screen_tui_playback_escape_clears_idle_draft_without_abort() -> None:
     assert all(step.flush_succeeded for step in result)
     assert app.composer.value == ""
     assert not any(
-        input_result.abort_requested for input_result in playback.input_results
+        isinstance(input_result, ConversationAbortResult)
+        for input_result in playback.input_results
     )
     assert "› draft" not in _plain_lines(result[-1].diagnostics)
     for step in result:
@@ -346,7 +353,7 @@ def test_screen_tui_playback_smokes_surfaces_editor_and_image_fallback(
     assert not any(line.strip() == "Terminal" for line in final_lines)
     assert "› abc!" in final_lines
     assert (
-        "moonshot/kimi-for-coding | repo | main | abcd | idle | perm=standard"
+        "kimi-for-coding | repo | main | abcd | idle | standard"
         in final_lines
     )
 
@@ -422,7 +429,8 @@ def test_screen_tui_playback_settings_page_toggles_statusline_and_exits() -> Non
     assert "Settings" not in lines
     assert not any("Status line: off" in line for line in lines)
     assert not any(
-        "moonshot/kimi-for-coding | repo | main | abcd | idle" in line for line in lines
+        "kimi-for-coding | repo | main | abcd | idle" in line
+        for line in lines
     )
     for step in steps:
         step.assert_no_clear_scrollback()
@@ -574,7 +582,7 @@ def test_screen_tui_playback_settings_escape_restores_single_prompt_with_status_
     status_rows = [
         index
         for index, line in enumerate(lines)
-        if "moonshot/kimi-for-coding | repo | main | abcd | idle" in line
+        if "kimi-for-coding | repo | main | abcd | idle" in line
     ]
     assert prompt_rows == [status_rows[0] - 2]
     assert lines[prompt_rows[0] + 1] == ""
@@ -602,7 +610,7 @@ def test_screen_tui_playback_settings_page_model_tab_is_available() -> None:
     assert all(step.flush_succeeded for step in steps)
     lines = _plain_lines(steps[-1].diagnostics)
     assert any("Search models..." in line for line in lines)
-    assert any("moonshot/kimi-for-coding" in line for line in lines)
+    assert any("moonshot:test-endpoint:kimi-for-coding" in line for line in lines)
     for step in steps:
         step.assert_no_clear_scrollback()
 
@@ -629,6 +637,7 @@ def test_screen_tui_playback_smokes_terminal_context_model_selector_and_resize()
         [
             PlaybackEvent.input("\x1b[?7u\x1b[6;18;9t"),
             PlaybackEvent.input("/terminal\r"),
+            PlaybackEvent.input("\x1b[B"),
             PlaybackEvent.input("\x1b"),
             PlaybackEvent.input("/model\r"),
             PlaybackEvent.input("\x1b[B\r"),
@@ -638,13 +647,16 @@ def test_screen_tui_playback_smokes_terminal_context_model_selector_and_resize()
 
     assert all(step.flush_succeeded for step in steps)
     assert [event.signal for event in context.events] == ["kitty_protocol", "cell_size"]
-    terminal_lines = _plain_lines(steps[1].diagnostics)
-    assert any("keyboard_protocol_state: kitty" in line for line in terminal_lines)
-    assert any("cell_size: 9x18" in line for line in terminal_lines)
-    assert session.current_model == ModelSelection(
-        provider="openai", model_id="gpt-5.4"
+    initial_terminal_lines = _plain_lines(steps[1].diagnostics)
+    scrolled_terminal_lines = _plain_lines(steps[2].diagnostics)
+    assert any(
+        "keyboard_protocol_state: kitty" in line for line in initial_terminal_lines
     )
-    assert app.state.model_label == "openai/gpt-5.4"
+    assert any("cell_size: 9x18" in line for line in scrolled_terminal_lines)
+    assert session.current_model == ModelSelection(
+        endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
+    )
+    assert app.state.model_label == "openai:test-endpoint:gpt-5.4"
     assert steps[-1].size == TerminalSize(columns=72, rows=10)
     assert steps[-1].diagnostics.operation_class == "resize_repaint"
 
@@ -652,9 +664,19 @@ def test_screen_tui_playback_smokes_terminal_context_model_selector_and_resize()
 def test_screen_tui_model_selector_ignores_key_release_events() -> None:
     session = _Session(
         models=(
-            ModelSelection(provider="moonshot", model_id="kimi-for-coding"),
-            ModelSelection(provider="openai", model_id="gpt-5.4"),
-            ModelSelection(provider="anthropic", model_id="claude-sonnet"),
+            ModelSelection(
+                endpoint_id="test-endpoint",
+                provider="moonshot",
+                model_id="kimi-for-coding",
+            ),
+            ModelSelection(
+                endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
+            ),
+            ModelSelection(
+                endpoint_id="test-endpoint",
+                provider="anthropic",
+                model_id="claude-sonnet",
+            ),
         )
     )
     app = _app()
@@ -676,11 +698,11 @@ def test_screen_tui_model_selector_ignores_key_release_events() -> None:
 
     assert all(step.flush_succeeded for step in steps)
     assert session.current_model == ModelSelection(
-        provider="openai", model_id="gpt-5.4"
+        endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
     )
-    assert app.state.model_label == "openai/gpt-5.4"
+    assert app.state.model_label == "openai:test-endpoint:gpt-5.4"
     lines = _plain_lines(steps[-1].diagnostics)
-    assert "Model set: openai/gpt-5.4" in lines[-1]
+    assert "Model set: openai:test-endpoint:gpt-5.4" in lines[-1]
     assert not any("claude-sonnet" in line for line in lines)
 
 
@@ -814,11 +836,11 @@ class _ScreenInteractivePlayback:
             )
         for event in events:
             result = self.router.handle(event)
-            if result.local_text is not None:
-                asyncio.run(self.surface_manager.handle_text(result.local_text))
-            if result.surface_intent is not None:
+            if isinstance(result, ConversationLocalResult):
+                asyncio.run(self.surface_manager.handle_text(result.text))
+            if isinstance(result, ConversationSurfaceResult):
                 asyncio.run(
-                    self.surface_manager.handle_surface_intent(result.surface_intent)
+                    self.surface_manager.handle_surface_intent(result.intent)
                 )
 
 
@@ -911,11 +933,17 @@ class _Session:
             SimpleNamespace(get_cwd=lambda: str(cwd)) if cwd is not None else None
         )
         self.current_model = ModelSelection(
-            provider="moonshot", model_id="kimi-for-coding"
+            endpoint_id="test-endpoint", provider="moonshot", model_id="kimi-for-coding"
         )
         self.models = models or (
-            ModelSelection(provider="moonshot", model_id="kimi-for-coding"),
-            ModelSelection(provider="openai", model_id="gpt-5.4"),
+            ModelSelection(
+                endpoint_id="test-endpoint",
+                provider="moonshot",
+                model_id="kimi-for-coding",
+            ),
+            ModelSelection(
+                endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
+            ),
         )
 
     def list_commands(self) -> list[object]:
@@ -942,7 +970,7 @@ class _Session:
 
 def _app(*, cwd: str = "/repo") -> ScreenCodingTuiApp:
     return ScreenCodingTuiApp(
-        model_label="moonshot/kimi-for-coding",
+        model_label="moonshot:test-endpoint:kimi-for-coding",
         cwd=cwd,
         branch="main",
         session_label="abcd",
@@ -975,8 +1003,13 @@ def _clear_image_protocol_env(monkeypatch: Any) -> None:
     for name in (
         "TERM",
         "TERM_PROGRAM",
+        "ITERM_SESSION_ID",
         "KITTY_WINDOW_ID",
+        "TMUX",
+        "STY",
+        "WEZTERM_PANE",
         "WEZTERM_EXECUTABLE",
         "GHOSTTY_RESOURCES_DIR",
+        "LOUSHANG_TUI_TMUX_PASSTHROUGH",
     ):
         monkeypatch.delenv(name, raising=False)

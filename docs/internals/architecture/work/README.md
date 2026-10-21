@@ -4,7 +4,13 @@
 
 ## Status
 
-Canonical architecture note for `loushang.work`.
+Canonical compatibility note for the legacy `loushang.work` namespace.
+
+The product-neutral kernel is being migrated to `loushang.harnesswork`; see the accepted
+[HarnessWork Architecture](../harnesswork/README.md) and active
+[Migration Ledger](../harnesswork/migration-ledger.md). During migration this document remains the
+contract for existing Work semantics, while `loushang.work` forwards migrated kernel symbols to the
+single canonical implementation.
 
 代码和测试定义当前已实现契约。本文件同时记录目标边界，但所有尚未落地的对象或
 语义都明确标为 target；不得把 target 描述当作当前公共 API。
@@ -86,6 +92,12 @@ plan identity 之前，调用方不得跨 run 复用会产生歧义的 `plan_id`
 | `InvocationRef` | Work step 与 Harness/Agent invocation 的相关引用，不把 invocation 生命周期提升为 Work 生命周期 |
 | `WorkOutcome` | 可结构化验证的业务结果、失败或取消结论 |
 | `WorkPlanRevision` | 保留原始计划与证据链的显式计划修订，而不是静默改写历史 |
+
+Target `WorkPlanSpec` may carry opaque Product capability requirement facts that
+were bound by the Product work preparer. Work preserves and correlates those
+facts with the run/step but does not resolve Product Capability Bundles,
+Capability Packs, tool definitions, or authorization. The Product executor
+performs that resolution before invoking Harness.
 
 目标语义关系是：
 

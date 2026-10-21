@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 def test_testing_docs_use_screen_tui_playback_name() -> None:
     assert Path("docs/internals/testing/screen-tui-playback.md").exists()
@@ -43,10 +45,7 @@ def test_testing_strategy_documents_composer_selection_manual_smoke() -> None:
     ).read_text(encoding="utf-8")
 
     assert "composer-selection-stress" in text
-    assert (
-        "scripts/run_tui_playback.py composer-selection-stress"
-        in text
-    )
+    assert "scripts/run_tui_playback.py composer-selection-stress" in text
     assert "Shift+Left" in text
     assert "Shift+Home" in text
     assert "Shift+End" in text
@@ -85,6 +84,90 @@ def test_testing_strategy_documents_streaming_control_and_live_smoke() -> None:
     assert "Live Terminal Smoke Checklist" in strategy
     assert "IME candidate window" in strategy
     assert "Kitty, iTerm2, WezTerm, Ghostty, VS Code terminal" in strategy
+
+
+def test_testing_strategy_separates_native_terminal_and_tmux_evidence() -> None:
+    strategy = Path(
+        "docs/internals/architecture/tui/native-terminal-core/testing-strategy.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Native Terminal Transport Tests" in strategy
+    assert "test-only `ctypes`" in strategy
+    assert "explicitly selects ConPTY" in strategy
+    assert "test_cli_terminal_contract.py" in strategy
+    assert "tmux is a separate terminal-implementation integration" in strategy
+    assert "make test-tui-input-playback" in strategy
+    assert "make test-tui-native" in strategy
+    assert "ConPTY exposes a reconstructed" in strategy
+    assert "POSIX PTY additionally proves the full" in strategy
+    assert "The real CLI contract follows the same split" in strategy
+    assert "fails closed" in strategy
+
+
+def test_terminal_test_entrypoints_separate_simulated_and_host_runtime() -> None:
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    runner = Path("scripts/run_tui_platform_tests.py").read_text(encoding="utf-8")
+    native_runner = Path("scripts/run_tui_native_tests.py").read_text(encoding="utf-8")
+    backend = Path("tests/tui/test_terminal_process_backend.py").read_text(
+        encoding="utf-8"
+    )
+    product = Path("tests/coding/test_cli_terminal_contract.py").read_text(
+        encoding="utf-8"
+    )
+    posix = Path("tests/tui/test_terminal_input_posix.py").read_text(encoding="utf-8")
+
+    assert "test-tui-input-playback:" in makefile
+    assert "scripts/run_tui_platform_tests.py current" in makefile
+    assert "test_terminal_input_windows.py" in runner
+    assert "test_terminal_input_posix_backend.py" in runner
+    assert "SHARED_TEST_PATHS" in runner
+    assert "WINDOWS_TEST_PATHS" in runner
+    assert "POSIX_TEST_PATHS" in runner
+    assert "test_terminal_process_backend_posix.py" in native_runner
+    assert "test_terminal_process_backend_windows.py" in native_runner
+    assert "selected_test_paths" in native_runner
+    assert "requires_host_runtime" in backend
+    assert "requires_host_runtime" in product
+    assert 'os.name == "nt"' in posix
+
+
+@pytest.mark.tui_render_contract
+def test_required_terminal_workflows_fail_fast_and_publish_stable_gate() -> None:
+    strategy = Path(
+        "docs/internals/architecture/tui/native-terminal-core/testing-strategy.md"
+    ).read_text(encoding="utf-8")
+    harnesstui = Path(".github/workflows/harnesstui-quality.yml").read_text(
+        encoding="utf-8"
+    )
+    terminal = Path(".github/workflows/tui-render-contract.yml").read_text(
+        encoding="utf-8"
+    )
+    entrypoint = Path(".github/workflows/quality.yml").read_text(encoding="utf-8")
+
+    assert "BlockingPromptController" in strategy
+    assert "`quality-gate`" in strategy
+
+    for workflow in (harnesstui, terminal):
+        assert "workflow_call:" in workflow
+        assert "faulthandler_timeout=60" in workflow
+        assert "timeout-minutes:" in workflow
+        assert "verify_gate.py" not in workflow
+        assert "selected-checks:" not in workflow
+
+    assert (
+        "cancel-in-progress: ${{ github.event_name == 'pull_request' }}" in entrypoint
+    )
+    for report in ("harnesstui-core", "coding-ui"):
+        assert f"--junitxml=.artifacts/{report}.xml" in harnesstui
+        assert f"verify_pytest_xml.py .artifacts/{report}.xml" in harnesstui
+    gate = entrypoint.split("\n  quality-gate:\n", 1)[1]
+    gate_needs = gate.split("needs: [", 1)[1].split("]", 1)[0].split(", ")
+    assert {"tui", "harnesstui"} <= set(gate_needs)
+    assert "    if: always()" in gate
+    assert "verify_gate.py" in gate
+    assert "tui-cross-platform-contracts:" not in entrypoint
+    assert "checks.tui_playback" in terminal
+    assert "checks.tui_native" in terminal
 
 
 def test_theme_key_design_lists_editor_selection_token() -> None:
@@ -138,9 +221,7 @@ def test_public_tui_reference_documents_editing_foundation() -> None:
 
 
 def test_public_tui_reference_documents_runner_and_playback_examples() -> None:
-    english_runner = Path("docs/en/reference/tui-runner.md").read_text(
-        encoding="utf-8"
-    )
+    english_runner = Path("docs/en/reference/tui-runner.md").read_text(encoding="utf-8")
     chinese_runner = Path("docs/zh-CN/reference/tui-runner.md").read_text(
         encoding="utf-8"
     )

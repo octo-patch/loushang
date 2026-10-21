@@ -18,13 +18,17 @@ from loushang.coding.multiagent import (
     CodingSubagentFactory,
     coding_agent_types,
 )
-from loushang.coding.tool_pack import register_coding_builtin_tools
+from loushang.coding.tool_pack import (
+    coding_workspace_tool_profile,
+    register_coding_builtin_tools,
+)
 from loushang.coding.ui.screen_surfaces import ScreenSurfaceManager
 from loushang.coding.worktree import CodingGitWorktreeLeasePort
 from loushang.harness.approval import (
     HeadlessApprovalResolver,
     InteractiveApprovalResolver,
 )
+from loushang.harness.environment import LocalHostEnvironmentProbe
 from loushang.harness.multiagent import (
     AgentCaller,
     AgentCompletionNotice,
@@ -37,6 +41,7 @@ from loushang.harness.multiagent import (
     MultiAgentControl,
     MultiAgentError,
     RecipeRunRequest,
+    SubagentDisposeResult,
     SubagentRoundResult,
     core_recipe_catalog,
 )
@@ -45,10 +50,15 @@ from loushang.harness.runtime import HostInputQueue
 from loushang.harness.session.multiagent import (
     AgentInputFacade,
     SessionMultiAgentRuntime,
+    SessionSubagentBinding,
     SessionSubagentRequest,
 )
 from loushang.harness.tools.core import ToolDefinition
-from loushang.harness.tools.multiagent import MultiAgentToolPack
+from loushang.harness.tools.execution import direct_execution
+from loushang.harness.tools.multiagent import (
+    MULTIAGENT_TOOL_NAMES,
+    MultiAgentToolPack,
+)
 from loushang.harness.tools.workspace import ToolContext
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 from loushang.harness.workspace.exec import ExecRequest, ExecResult, ExecService
@@ -56,6 +66,7 @@ from loushang.harnesstui.multiagent import build_agent_tree_surface_view
 from loushang.harnesstui.status.provider import StatusProvider
 from loushang.tui import (
     ApprovalChoice,
+    InputIntent,
     PlaybackResult,
     Surface,
     strip_control_sequences,
@@ -77,6 +88,9 @@ _RESULTS = {
 }
 _COMPLETION_ORDER = ("random-1", "random-3", "random-2")
 _NOW = datetime(2026, 7, 27, tzinfo=UTC)
+_SELECTED_EXACT_TOOL_NAMES = coding_workspace_tool_profile(
+    LocalHostEnvironmentProbe().detect()
+).builtin_tool_names
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,18 +218,19 @@ class _Driver:
                 )
             )
 
-    async def dispose(self) -> None:
+    async def dispose(self) -> SubagentDisposeResult:
         self.disposed = True
+        return SubagentDisposeResult()
 
 
 class _Factory:
     def __init__(self) -> None:
         self.drivers: dict[str, _Driver] = {}
 
-    async def create_driver(self, request: SessionSubagentRequest) -> _Driver:
+    async def create(self, request: SessionSubagentRequest) -> SessionSubagentBinding:
         driver = _Driver()
         self.drivers[request.record.path.name] = driver
-        return driver
+        return SessionSubagentBinding(driver=driver)
 
 
 @dataclass(slots=True)
@@ -235,7 +250,9 @@ class _Fixture:
                 "agent_type": "explorer",
                 "prompt": "Generate one deterministic playback value.",
             }
-            self.recorder.add("tool", "spawn.started", call_id=f"spawn:{name}", params=params)
+            self.recorder.add(
+                "tool", "spawn.started", call_id=f"spawn:{name}", params=params
+            )
             result = await self.tools["spawn_agent"].execute(
                 f"spawn:{name}",
                 params,
@@ -300,6 +317,14 @@ class _Fixture:
         await self.runtime.dispose()
 
 
+def _materialize_multiagent_tools(
+    pack: MultiAgentToolPack,
+) -> dict[str, Any]:
+    registry = WorkspaceToolRegistry()
+    pack.register(registry)
+    return {name: registry.materialize_tool(name) for name in MULTIAGENT_TOOL_NAMES}
+
+
 def _fixture(
     recorder: _Recorder,
     *,
@@ -353,7 +378,7 @@ def _fixture(
         runtime=runtime,
         root_queue=root_queue,
         factory=factory,
-        tools={definition.name: definition for definition in pack.definitions()},
+        tools=_materialize_multiagent_tools(pack),
     )
 
 
@@ -756,21 +781,22 @@ class _ImmediateDriver:
     def abort(self) -> None:
         return None
 
-    async def dispose(self) -> None:
+    async def dispose(self) -> SubagentDisposeResult:
         self.disposed = True
+        return SubagentDisposeResult()
 
 
 class _ImmediateFactory:
     def __init__(self) -> None:
         self.drivers: dict[AgentPath, _ImmediateDriver] = {}
 
-    async def create_driver(
+    async def create(
         self,
         request: SessionSubagentRequest,
-    ) -> _ImmediateDriver:
+    ) -> SessionSubagentBinding:
         driver = _ImmediateDriver(request.record.path)
         self.drivers[request.record.path] = driver
-        return driver
+        return SessionSubagentBinding(driver=driver)
 
 
 class _SharedState:
@@ -798,6 +824,7 @@ class _SharedSession:
             (
                 UserMessage(role="user", content=text, timestamp=0),
                 AssistantMessage(
+                    endpoint="test-endpoint",
                     role="assistant",
                     content=[
                         TextPart(
@@ -890,7 +917,7 @@ def _shared_tool_registry(names: tuple[str, ...]) -> WorkspaceToolRegistry:
                 label=name,
                 description=f"Playback {name}",
                 parameters={"type": "object", "properties": {}},
-                execute=unused_execute,
+                execution=direct_execution(unused_execute),
             )
         )
     return registry
@@ -924,7 +951,6 @@ def _shared_workspace_playback() -> MultiAgentPlaybackResult:
         recorder = _Recorder()
         with TemporaryDirectory(
             prefix="loushang-shared-worker-",
-            dir="/tmp",
         ) as directory:
             root = Path(directory).resolve()
             target = root / "shared.txt"
@@ -951,6 +977,7 @@ def _shared_workspace_playback() -> MultiAgentPlaybackResult:
                     cwd=root,
                     tool_registry=_shared_tool_registry(spec.allowed_tools),
                     runtime_builder=build_runtime,
+                    selected_exact_tool_names=_SELECTED_EXACT_TOOL_NAMES,
                 ),
                 root_input=AgentInputFacade(
                     queue=root_queue,
@@ -958,14 +985,13 @@ def _shared_workspace_playback() -> MultiAgentPlaybackResult:
                     submit_mailbox=root_queue.append_next_turn,
                 ),
             )
-            tools = {
-                definition.name: definition
-                for definition in MultiAgentToolPack(
+            tools = _materialize_multiagent_tools(
+                MultiAgentToolPack(
                     runtime=runtime,
                     caller=AgentCaller(control.root_ref),
                     default_wait_seconds=1,
-                ).definitions()
-            }
+                )
+            )
             try:
                 await tools["spawn_agent"].execute(
                     "spawn:shared-writer",
@@ -1015,7 +1041,6 @@ def _isolated_artifact_playback() -> MultiAgentPlaybackResult:
         recorder = _Recorder()
         with TemporaryDirectory(
             prefix="loushang-isolated-artifact-",
-            dir="/tmp",
         ) as directory:
             root = Path(directory).resolve()
             repo = root / "repo"
@@ -1059,6 +1084,7 @@ def _isolated_artifact_playback() -> MultiAgentPlaybackResult:
                     tool_registry=_shared_tool_registry(spec.allowed_tools),
                     runtime_builder=lambda **_kwargs: child_runtime,
                     workspace_leases=leases,
+                    selected_exact_tool_names=_SELECTED_EXACT_TOOL_NAMES,
                 ),
                 root_input=AgentInputFacade(
                     queue=root_queue,
@@ -1066,14 +1092,13 @@ def _isolated_artifact_playback() -> MultiAgentPlaybackResult:
                     submit_mailbox=root_queue.append_next_turn,
                 ),
             )
-            tools = {
-                definition.name: definition
-                for definition in MultiAgentToolPack(
+            tools = _materialize_multiagent_tools(
+                MultiAgentToolPack(
                     runtime=runtime,
                     caller=caller,
                     default_wait_seconds=1,
-                ).definitions()
-            }
+                )
+            )
             target = AgentPath.root().child("isolated-writer")
             try:
                 await tools["spawn_agent"].execute(
@@ -1148,7 +1173,6 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
         recorder = _Recorder()
         with TemporaryDirectory(
             prefix="loushang-shared-parallel-workers-",
-            dir="/tmp",
         ) as directory:
             root = Path(directory).resolve()
             targets = {
@@ -1157,9 +1181,9 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
             }
             for target in targets.values():
                 target.write_text("before\n", encoding="utf-8")
-            spec = coding_agent_types(
-                maximum_children=2
-            ).resolve("shared_implementation_worker")
+            spec = coding_agent_types(maximum_children=2).resolve(
+                "shared_implementation_worker"
+            )
             assert spec is not None
             release = asyncio.Event()
             started = {name: asyncio.Event() for name in targets}
@@ -1205,6 +1229,7 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
                     cwd=root,
                     tool_registry=_shared_tool_registry(spec.allowed_tools),
                     runtime_builder=build_runtime,
+                    selected_exact_tool_names=_SELECTED_EXACT_TOOL_NAMES,
                 ),
                 root_input=AgentInputFacade(
                     queue=root_queue,
@@ -1212,17 +1237,14 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
                     submit_mailbox=root_queue.append_next_turn,
                 ),
             )
-            tools = {
-                definition.name: definition
-                for definition in MultiAgentToolPack(
+            tools = _materialize_multiagent_tools(
+                MultiAgentToolPack(
                     runtime=runtime,
                     caller=caller,
                     default_wait_seconds=1,
-                ).definitions()
-            }
-            paths = tuple(
-                AgentPath.root().child(name) for name in targets
+                )
             )
+            paths = tuple(AgentPath.root().child(name) for name in targets)
             try:
                 await asyncio.gather(
                     *(
@@ -1254,9 +1276,7 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
                     "topology",
                     "shared_parallel.running",
                     agents=running,
-                    ownership={
-                        name: [target.name] for name, target in targets.items()
-                    },
+                    ownership={name: [target.name] for name, target in targets.items()},
                     maximum_children=spec.maximum_children,
                 )
                 assert running == {
@@ -1280,17 +1300,12 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
                 recorder.add(
                     "topology",
                     "shared_parallel.completed",
-                    cwd=[
-                        child_runtime.create_cwds
-                        for child_runtime in child_runtimes
-                    ],
+                    cwd=[child_runtime.create_cwds for child_runtime in child_runtimes],
                     files={
                         target.name: target.read_text(encoding="utf-8")
                         for target in targets.values()
                     },
-                    notice_paths=[
-                        str(notice.sender_ref.path) for notice in notices
-                    ],
+                    notice_paths=[str(notice.sender_ref.path) for notice in notices],
                     mailbox=[message.text for message in mailbox],
                 )
 
@@ -1311,9 +1326,7 @@ def _shared_parallel_writers_playback() -> MultiAgentPlaybackResult:
             finally:
                 release.set()
                 await runtime.dispose()
-                assert all(
-                    child_runtime.disposed for child_runtime in child_runtimes
-                )
+                assert all(child_runtime.disposed for child_runtime in child_runtimes)
 
     return asyncio.run(scenario())
 
@@ -1364,9 +1377,7 @@ def _recipe_playback(recipe_id: str) -> MultiAgentPlaybackResult:
                 RecipeRunRequest(
                     prompt=f"Deterministic {recipe_id} playback.",
                     replicas=(
-                        {"reviewer": 3}
-                        if recipe_id == "parallel-review"
-                        else {}
+                        {"reviewer": 3} if recipe_id == "parallel-review" else {}
                     ),
                     timeout=1,
                 ),
@@ -1379,9 +1390,7 @@ def _recipe_playback(recipe_id: str) -> MultiAgentPlaybackResult:
                 recipe_id=recipe_id,
                 agents=names,
                 final_message=result.final_message,
-                mailbox=[
-                    message.text for message in root_queue.drain_next_turn()
-                ],
+                mailbox=[message.text for message in root_queue.drain_next_turn()],
             )
             expected = (
                 ["reviewer-1", "reviewer-2", "reviewer-3", "synthesizer"]
@@ -1413,8 +1422,7 @@ def _messaging_playback() -> MultiAgentPlaybackResult:
         try:
             await fixture.spawn_three()
             waits = [
-                await fixture.complete_and_wait(name)
-                for name in _COMPLETION_ORDER
+                await fixture.complete_and_wait(name) for name in _COMPLETION_ORDER
             ]
             notices = fixture.control.notices()
             followups = fixture.root_queue.texts("follow_up")
@@ -1614,10 +1622,7 @@ def _render_playback() -> MultiAgentPlaybackResult:
                 assistant(f"{name} 完成，结果是 {_RESULTS[name]}。")
                 render(f"wait.{name}.completed")
 
-            assistant(
-                "汇总：95、51、35；平均值为 "
-                f"{(95 + 51 + 35) / 3:.2f}。"
-            )
+            assistant(f"汇总：95、51、35；平均值为 {(95 + 51 + 35) / 3:.2f}。")
             screen.app.complete_run(elapsed_seconds=1.23)
             render("run.completed")
 
@@ -1716,7 +1721,6 @@ class _ApprovalPlaybackSession:
                 tool_call_id=tool_call_id,
                 cwd=self._cwd,
                 exec_service=self._exec_service,
-                approval_resolver=self._approval_resolver,
                 event_sink=emit_event,
             ),
         )
@@ -1728,6 +1732,7 @@ class _ApprovalPlaybackSession:
             (
                 UserMessage(role="user", content=prompt, timestamp=0),
                 AssistantMessage(
+                    endpoint="test-endpoint",
                     role="assistant",
                     content=[
                         TextPart(
@@ -1773,7 +1778,6 @@ def _child_approval_playback() -> object:
 
     with TemporaryDirectory(
         prefix="loushang-child-approval-",
-        dir="/tmp",
     ) as directory:
         cwd = Path(directory).resolve()
         playback = ScreenTuiLoopPlayback(
@@ -1802,8 +1806,6 @@ def _child_approval_playback() -> object:
         root_registry = WorkspaceToolRegistry()
         register_coding_builtin_tools(
             root_registry,
-            policy_engine=PolicyEngine(),
-            approval_resolver=resolver,
             exec_service=ExecService(backend=exec_backend),
         )
 
@@ -1812,18 +1814,42 @@ def _child_approval_playback() -> object:
             actor_id = str(getattr(profile, "actor_ref"))
             profiles[actor_id] = profile
             commands = (
-                ("git push origin main", "git push origin release")
+                (
+                    "printf safe > child-note.txt",
+                    "git push origin main",
+                    "git push origin release",
+                    "rm -r reusable-delete",
+                )
                 if "/reusable@" in actor_id
-                else ("git push origin main",)
+                else ("rm -r sibling-delete",)
             )
             exec_service = ExecService(
                 backend=exec_backend,
                 execution_profile=getattr(profile, "execution_profile_ceiling"),
             )
+            peer_registry = kwargs["tool_registry"]
+            assert isinstance(peer_registry, WorkspaceToolRegistry)
+            assert peer_registry.list_definitions() == []
+            catalog_registry = WorkspaceToolRegistry()
+            register_coding_builtin_tools(
+                catalog_registry,
+                exec_service=exec_service,
+            )
+            child_registry = catalog_registry.select(kwargs["allowed_tool_names"])
+            from loushang.harness.tools.workspace.authorization import (
+                create_workspace_tool_execution_host,
+            )
+
+            child_registry.bind_execution_host(
+                create_workspace_tool_execution_host(
+                    policy_evaluator=PolicyEngine(),
+                    approval_resolver=kwargs["approval_resolver"],  # type: ignore[arg-type]
+                )
+            )
             session = _ApprovalPlaybackSession(
                 cwd=str(cwd),
                 commands=commands,
-                registry=kwargs["tool_registry"],
+                registry=child_registry,
                 approval_resolver=kwargs["approval_resolver"],
                 exec_service=exec_service,
                 audit_events=audit_events,
@@ -1838,6 +1864,7 @@ def _child_approval_playback() -> object:
             tool_registry=root_registry,
             runtime_builder=build_runtime,
             approval_resolver=resolver,
+            selected_exact_tool_names=_SELECTED_EXACT_TOOL_NAMES,
         )
         types = coding_agent_types(maximum_children=3)
         control = MultiAgentControl(agent_types=types)
@@ -1865,30 +1892,7 @@ def _child_approval_playback() -> object:
 
         def present(payload: dict[str, object]) -> None:
             approval_payloads.append(dict(payload))
-            options = payload.get("approval_options")
-            choices = tuple(
-                ApprovalChoice(
-                    value=str(option["outcome"]),
-                    label=str(option["label"]),
-                    shortcut=str(option["shortcut"]),
-                    tone=str(option["tone"]),
-                )
-                for option in options
-                if isinstance(option, dict)
-            ) if isinstance(options, (tuple, list)) else ()
-            manager.open_approval(
-                action=str(payload.get("action") or "Approve child tool call"),
-                risk=str(payload.get("risk") or ""),
-                requester=str(payload.get("actor_id") or "root"),
-                cwd=str(payload.get("cwd") or ""),
-                environment=str(payload.get("environment") or ""),
-                grant_summary=str(payload.get("grant_summary") or ""),
-                action_id=str(payload["action_id"]),
-                allow_session=any(
-                    choice.value == "allow_session" for choice in choices
-                ),
-                options=choices,
-            )
+            _open_approval_payload(manager, payload)
 
         resolver.set_request_presenter(
             present,
@@ -1901,7 +1905,7 @@ def _child_approval_playback() -> object:
                 parent_path=AgentPath.root(),
                 name="reusable",
                 agent_type="explorer",
-                initial_prompt="Publish main.",
+                initial_prompt="Write one ordinary note without approval.",
             )
             await runtime.await_completion(
                 caller=caller,
@@ -1911,7 +1915,27 @@ def _child_approval_playback() -> object:
             await runtime.send_message(
                 caller=caller,
                 target=reusable.path,
-                text="Publish release with the same non-force remote permission.",
+                text="Publish main after Root grants this child session access.",
+            )
+            await runtime.await_completion(
+                caller=caller,
+                target=reusable.path,
+                timeout=2,
+            )
+            await runtime.send_message(
+                caller=caller,
+                target=reusable.path,
+                text="Reuse the same child-scoped publication grant.",
+            )
+            await runtime.await_completion(
+                caller=caller,
+                target=reusable.path,
+                timeout=2,
+            )
+            await runtime.send_message(
+                caller=caller,
+                target=reusable.path,
+                text="Delete the test directory after one-time Root approval.",
             )
             await runtime.await_completion(
                 caller=caller,
@@ -1923,7 +1947,7 @@ def _child_approval_playback() -> object:
                 parent_path=AgentPath.root(),
                 name="sibling",
                 agent_type="explorer",
-                initial_prompt="Publish main independently.",
+                initial_prompt="Request an independent deletion that Root denies.",
             )
             await runtime.await_terminal(
                 caller=caller,
@@ -1935,17 +1959,19 @@ def _child_approval_playback() -> object:
             sibling_actor = str(sibling.ref)
             assert [payload.get("actor_id") for payload in approval_payloads] == [
                 reusable_actor,
+                reusable_actor,
                 sibling_actor,
             ]
-            assert len(executed) == 2
+            assert len(executed) == 4
             assert [command for _cwd, command in executed] == [
+                "printf safe > child-note.txt",
                 "git push origin main",
                 "git push origin release",
+                "rm -r reusable-delete",
             ]
             assert set(profiles) == {reusable_actor, sibling_actor}
             assert {
-                getattr(profile, "approval_actor_id")
-                for profile in profiles.values()
+                getattr(profile, "approval_actor_id") for profile in profiles.values()
             } == {reusable_actor, sibling_actor}
             grants = resolver.permissions_snapshot().grants
             assert [(grant.actor_id, grant.capability) for grant in grants] == [
@@ -1960,17 +1986,19 @@ def _child_approval_playback() -> object:
         result = playback.run(
             (0.00, "run child approval\r"),
             (0.10, "s"),
-            (0.25, "\x1b"),
-            (0.40, ""),
+            (0.25, "y"),
+            (0.40, "\x1b"),
+            (0.55, ""),
             handle_prompt=handle_prompt,
             handle_surface_intent=manager.handle_surface_intent,
         )
 
-        result.assert_exit_code(0)
+        assert result.exit_code == 0, result.text
         result.assert_text_contains("Approval")
         result.assert_text_contains("/root/sibling@1")
         result.assert_no_clear_screen()
         assert result.app.active_surface is None
+        assert result.app.state.running is False
         assert all(child_runtime.disposed for child_runtime in child_runtimes)
         assert {
             event.get("actor_id")
@@ -1978,6 +2006,256 @@ def _child_approval_playback() -> object:
             if event.get("type") == "tool_policy_evaluated"
         } == {"/root/reusable@1", "/root/sibling@1"}
         return result
+
+
+def _concurrent_child_approval_playback() -> object:
+    """Resolve simultaneous child approvals without crossing actor boundaries."""
+
+    with TemporaryDirectory(
+        prefix="loushang-concurrent-child-approval-",
+    ) as directory:
+        cwd = Path(directory).resolve()
+        playback = ScreenTuiLoopPlayback(
+            width=112,
+            height=22,
+            model_label="playback/concurrent-child-approval",
+            cwd=str(cwd),
+            branch="lane/harness",
+        )
+        resolver = InteractiveApprovalResolver(
+            fallback=HeadlessApprovalResolver(mode="deny")
+        )
+        approval_payloads: list[dict[str, object]] = []
+        approval_queue: asyncio.Queue[dict[str, object]] = asyncio.Queue()
+        audit_events: list[dict[str, object]] = []
+        executed: list[str] = []
+        child_runtimes: list[_ApprovalPlaybackRuntime] = []
+
+        def exec_backend(
+            request: ExecRequest,
+            **_kwargs: object,
+        ) -> ExecResult:
+            command = request.command[-1]
+            executed.append(command)
+            return ExecResult(exit_code=0, stdout="deleted\n")
+
+        root_registry = WorkspaceToolRegistry()
+        register_coding_builtin_tools(
+            root_registry,
+            exec_service=ExecService(backend=exec_backend),
+        )
+
+        def build_runtime(**kwargs: object) -> _ApprovalPlaybackRuntime:
+            profile = kwargs["delegated_execution_profile"]
+            actor_id = str(getattr(profile, "actor_ref"))
+            command = (
+                "rm -r allowed-delete"
+                if "/allowed@" in actor_id
+                else "rm -r denied-delete"
+            )
+            peer_registry = kwargs["tool_registry"]
+            assert isinstance(peer_registry, WorkspaceToolRegistry)
+            assert peer_registry.list_definitions() == []
+            exec_service = ExecService(
+                backend=exec_backend,
+                execution_profile=getattr(
+                    profile,
+                    "execution_profile_ceiling",
+                ),
+            )
+            catalog_registry = WorkspaceToolRegistry()
+            register_coding_builtin_tools(
+                catalog_registry,
+                exec_service=exec_service,
+            )
+            child_registry = catalog_registry.select(kwargs["allowed_tool_names"])
+            from loushang.harness.tools.workspace.authorization import (
+                create_workspace_tool_execution_host,
+            )
+
+            child_registry.bind_execution_host(
+                create_workspace_tool_execution_host(
+                    policy_evaluator=PolicyEngine(),
+                    approval_resolver=kwargs["approval_resolver"],  # type: ignore[arg-type]
+                )
+            )
+            session = _ApprovalPlaybackSession(
+                cwd=str(cwd),
+                commands=(command,),
+                registry=child_registry,
+                approval_resolver=kwargs["approval_resolver"],
+                exec_service=exec_service,
+                audit_events=audit_events,
+            )
+            runtime = _ApprovalPlaybackRuntime(session)
+            child_runtimes.append(runtime)
+            return runtime
+
+        factory = CodingSubagentFactory(
+            session_dir=cwd / ".sessions",
+            cwd=cwd,
+            tool_registry=root_registry,
+            runtime_builder=build_runtime,
+            approval_resolver=resolver,
+            selected_exact_tool_names=_SELECTED_EXACT_TOOL_NAMES,
+        )
+        control = MultiAgentControl(agent_types=coding_agent_types(maximum_children=3))
+        runtime = SessionMultiAgentRuntime(
+            control=control,
+            child_factory=factory,
+        )
+        caller = AgentCaller(control.root_ref)
+
+        async def on_approval(payload: dict[str, object]) -> bool:
+            action_id = payload.get("action_id")
+            assert isinstance(action_id, str)
+            return await resolver.handle_result(
+                action_id,
+                outcome=str(payload["outcome"]),
+            )
+
+        manager = ScreenSurfaceManager(
+            app=playback.app,
+            session=object(),
+            status_provider=_approval_status_provider(playback.app),
+            on_approval=on_approval,
+        )
+
+        def present(payload: dict[str, object]) -> None:
+            frozen = dict(payload)
+            approval_payloads.append(frozen)
+            _open_approval_payload(manager, payload)
+            approval_queue.put_nowait(frozen)
+
+        resolver.set_request_presenter(
+            present,
+            dismisser=manager.dismiss_approval,
+        )
+
+        async def handle_prompt(_text: str) -> None:
+            allowed, denied = await asyncio.gather(
+                runtime.spawn_child(
+                    caller=caller,
+                    parent_path=AgentPath.root(),
+                    name="allowed",
+                    agent_type="explorer",
+                    initial_prompt="Request deletion and wait for Root.",
+                ),
+                runtime.spawn_child(
+                    caller=caller,
+                    parent_path=AgentPath.root(),
+                    name="denied",
+                    agent_type="explorer",
+                    initial_prompt="Request an independent deletion and wait for Root.",
+                ),
+            )
+
+            async def resolve_next_approval() -> None:
+                payload = await asyncio.wait_for(approval_queue.get(), timeout=1)
+                surface = manager.current
+                assert getattr(surface, "purpose", None) == "approval"
+                assert (
+                    getattr(
+                        getattr(surface, "content", None),
+                        "action_id",
+                        None,
+                    )
+                    == payload["action_id"]
+                )
+                actor_id = str(payload["actor_id"])
+                outcome = "allow_once" if actor_id == str(allowed.ref) else "deny"
+                await manager.handle_surface_intent(
+                    InputIntent(
+                        kind="approval_decision",
+                        text=outcome,
+                        note=str(payload["action_id"]),
+                    )
+                )
+
+            await resolve_next_approval()
+            await resolve_next_approval()
+            terminal = await asyncio.gather(
+                runtime.await_terminal(
+                    caller=caller,
+                    target=allowed.path,
+                    timeout=2,
+                ),
+                runtime.await_terminal(
+                    caller=caller,
+                    target=denied.path,
+                    timeout=2,
+                ),
+            )
+
+            assert len(approval_payloads) == 2
+            action_ids = [str(payload["action_id"]) for payload in approval_payloads]
+            assert len(set(action_ids)) == 2
+            assert {payload["actor_id"] for payload in approval_payloads} == {
+                str(allowed.ref),
+                str(denied.ref),
+            }
+            assert [record.status for record in terminal] == [
+                "completed",
+                "failed",
+            ]
+            assert executed == ["rm -r allowed-delete"]
+            assert resolver.permissions_snapshot().pending == ()
+            assert resolver.permissions_snapshot().grants == ()
+
+            await runtime.close_agent(caller=caller, target=allowed.path)
+            await runtime.close_agent(caller=caller, target=denied.path)
+            await runtime.dispose()
+
+        result = playback.run(
+            (0.00, "run concurrent child approvals\r"),
+            (0.35, ""),
+            handle_prompt=handle_prompt,
+            handle_surface_intent=manager.handle_surface_intent,
+        )
+
+        assert result.exit_code == 0, result.text
+        result.assert_no_clear_screen()
+        assert result.app.active_surface is None
+        assert result.app.state.running is False
+        assert all(child_runtime.disposed for child_runtime in child_runtimes)
+        assert {
+            event.get("actor_id")
+            for event in audit_events
+            if event.get("type") == "tool_policy_evaluated"
+        } == {"/root/allowed@1", "/root/denied@1"}
+        return result
+
+
+def _open_approval_payload(
+    manager: ScreenSurfaceManager,
+    payload: dict[str, object],
+) -> None:
+    options = payload.get("approval_options")
+    choices = (
+        tuple(
+            ApprovalChoice(
+                value=str(option["outcome"]),
+                label=str(option["label"]),
+                shortcut=str(option["shortcut"]),
+                tone=str(option["tone"]),
+            )
+            for option in options
+            if isinstance(option, dict)
+        )
+        if isinstance(options, (tuple, list))
+        else ()
+    )
+    manager.open_approval(
+        action=str(payload.get("action") or "Approve child tool call"),
+        risk=str(payload.get("risk") or ""),
+        requester=str(payload.get("actor_id") or "root"),
+        cwd=str(payload.get("cwd") or ""),
+        environment=str(payload.get("environment") or ""),
+        grant_summary=str(payload.get("grant_summary") or ""),
+        action_id=str(payload["action_id"]),
+        allow_session=any(choice.value == "allow_session" for choice in choices),
+        options=choices,
+    )
 
 
 def _approval_status_provider(app: object) -> StatusProvider:
@@ -2109,11 +2387,21 @@ MULTIAGENT_SCENARIOS = (
     PlaybackScenarioSpec(
         name="multiagent-child-approval",
         description=(
-            "Replay child-scoped approval presentation, same-child grant reuse, "
-            "sibling isolation, and close-time grant cleanup."
+            "Replay an unprompted child write, same-child publication grant "
+            "reuse, approved deletion and automatic resume, sibling Esc denial, "
+            "and cleanup."
         ),
         run=_child_approval_playback,
         tags=("multiagent", "approval", "surface", "gateway"),
+    ),
+    PlaybackScenarioSpec(
+        name="multiagent-concurrent-child-approval",
+        description=(
+            "Replay two simultaneous child deletion approvals with one allow, "
+            "one denial, isolated action ids, and no grant leakage."
+        ),
+        run=_concurrent_child_approval_playback,
+        tags=("multiagent", "approval", "surface", "gateway", "concurrency"),
     ),
     PlaybackScenarioSpec(
         name="multiagent-render",

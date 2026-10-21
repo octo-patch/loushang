@@ -35,6 +35,62 @@ def test_workspace_read_tool_executes_without_product_adapter(tmp_path: Path) ->
     assert result.details["path"] == str(target.resolve())
 
 
+def test_workspace_read_prefers_the_session_consumer_without_overriding_explicit_ops(
+    tmp_path: Path,
+) -> None:
+    from loushang.harness.tools.workspace import (
+        ToolContext,
+        create_read_tool_definition,
+    )
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
+
+    class _VirtualReadOperations:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+        def exists(self, path: Path) -> bool:
+            del path
+            return True
+
+        def is_file(self, path: Path) -> bool:
+            del path
+            return True
+
+        def read_bytes(self, path: Path) -> bytes:
+            del path
+            return self.content
+
+    target = tmp_path / "notes.txt"
+    target.write_text("disk", encoding="utf-8")
+    session_operations = _VirtualReadOperations(b"consumer")
+
+    def context(*, tool_call_id: str) -> ToolContext:
+        return ToolContext(
+            tool_call_id=tool_call_id,
+            cwd=str(tmp_path),
+            operation_binding=session_operations,
+        )
+
+    default_tool = wrap_tool_definition(
+        create_read_tool_definition(),
+        context_provider=context,
+    )
+    explicit_tool = wrap_tool_definition(
+        create_read_tool_definition(operations=_VirtualReadOperations(b"explicit")),
+        context_provider=context,
+    )
+
+    default_result = asyncio.run(
+        default_tool.execute("read-consumer", {"path": "notes.txt"})
+    )
+    explicit_result = asyncio.run(
+        explicit_tool.execute("read-explicit", {"path": "notes.txt"})
+    )
+
+    assert default_result.content[0].text == "consumer"
+    assert explicit_result.content[0].text == "explicit"
+
+
 def test_bash_tool_uses_the_live_session_execution_service(
     tmp_path: Path,
 ) -> None:
@@ -106,14 +162,42 @@ def test_workspace_policy_accepts_product_neutral_evaluator(tmp_path: Path) -> N
 
     (tmp_path / "notes.txt").write_text("content", encoding="utf-8")
     tool = wrap_tool_definition(
-        create_read_tool_definition(policy_engine=_DenyReads()),
+        create_read_tool_definition(),
         context_provider=_context_provider(tmp_path),
+        policy_evaluator=_DenyReads(),
     )
 
     with pytest.raises(PolicyEnforcementError, match="read disabled") as exc_info:
         asyncio.run(tool.execute("read-2", {"path": "notes.txt"}))
 
     assert exc_info.value.tool_result_details["policy_code"] == "disabled"
+
+
+def test_legacy_bash_tool_policy_maps_to_stable_command_capability() -> None:
+    from types import SimpleNamespace
+
+    from loushang.harness.policy import build_tool_policy_subject
+    from loushang.harness.tools.workspace import workspace_tool_runtime_settings
+
+    manager = SimpleNamespace(
+        get_tool_settings=lambda: SimpleNamespace(
+            blocked_tools=("bash",),
+            ask_tools=(),
+        )
+    )
+    runtime = workspace_tool_runtime_settings(manager)
+    assert runtime.policy_engine is not None
+
+    decision = runtime.policy_engine.evaluate(
+        build_tool_policy_subject(
+            tool_name="shell",
+            capability_id="workspace.command",
+            arguments={"command": "Get-Location"},
+        )
+    )
+
+    assert decision.disposition == "deny"
+    assert decision.code == "capability_blocked"
 
 
 def test_file_tools_enforce_the_live_session_execution_profile(

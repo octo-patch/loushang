@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TextIO
 
-from loushang.coding.domain.work import create_coding_work_runtime
+from loushang.coding.adapters.harnesswork import create_coding_work_runtime
 from loushang.coding.model_selection import ensure_usable_session_model
 from loushang.coding.presentation.tui.plain import PlainCodingUiRenderer
 from loushang.harnesstui.conversation.agent_binding import (
@@ -11,8 +11,8 @@ from loushang.harnesstui.conversation.agent_binding import (
     run_agent_plain_prompt_plan,
 )
 from loushang.harnesstui.conversation.plain_prompt_host import session_identity
-from loushang.work import EventLogBackend
-from loushang.work.session import (
+from loushang.harnesswork import EventLogBackend
+from loushang.harnesswork.integrations.session import (
     SessionWorkRuntime,
     SessionWorkTurn,
     require_session_work_turn,
@@ -125,7 +125,6 @@ async def run_prompt_plan_command(
             session_id=session_identity(session),
             before_turn=before_turn,
             after_turn=after_turn,
-            wait_for_idle_after_prompt=True,
         )
 
     return await run_agent_plain_prompt_plan(

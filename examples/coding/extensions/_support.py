@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SRC_ROOT = REPO_ROOT / "src"
@@ -24,7 +24,6 @@ from loushang.ai.model import (
 from loushang.ai.model.registry import ModelRegistry
 from loushang.ai.types import AssistantMessage, TextPart, ToolCall, Usage, UserMessage
 from loushang.coding import (
-    AgentSession,
     AgentSessionRuntime,
     create_agent_session_runtime,
     create_services,
@@ -33,6 +32,14 @@ from loushang.harness.tools.core import ToolDefinition
 
 ENV_EXAMPLES_MODEL_CATALOG = "LOUSHANG_EXAMPLES_MODEL_CATALOG"
 ENV_EXAMPLES_SESSION_DIR = "LOUSHANG_EXAMPLES_SESSION_DIR"
+
+
+class CodingSession(Protocol):
+    """Public example view of the factory-returned Coding Session."""
+
+    agent: Any
+
+    def __getattr__(self, name: str) -> Any: ...
 
 _OVERRIDE_REGISTRY: ModelRegistry | None = None
 
@@ -58,7 +65,9 @@ def _resolve_model(provider: str, endpoint: str, model_id: str) -> Model:
         try:
             return registry.get_model(provider, endpoint, model_id)
         except Exception as exc:
-            raise RuntimeError(f"resolve model from custom catalog failed: {catalog}") from exc
+            raise RuntimeError(
+                f"resolve model from custom catalog failed: {catalog}"
+            ) from exc
     return get_model(provider, endpoint, model_id)
 
 
@@ -143,7 +152,9 @@ def describe_model(model: Model) -> dict[str, str | None]:
 def resolve_api_key() -> str:
     api_key = os.environ.get("KIMI_CODE_API_KEY")
     if not api_key:
-        raise RuntimeError("Please export KIMI_CODE_API_KEY before running online extension examples.")
+        raise RuntimeError(
+            "Please export KIMI_CODE_API_KEY before running online extension examples."
+        )
     return api_key
 
 
@@ -164,6 +175,7 @@ def assistant_text_message(text: str) -> AssistantMessage:
         content=[TextPart(type="text", text=text)],
         api="anthropic-messages",
         provider="offline",
+        endpoint="offline",
         model="offline-extension-demo",
         response_id=None,
         usage=usage(),
@@ -173,7 +185,9 @@ def assistant_text_message(text: str) -> AssistantMessage:
     )
 
 
-def assistant_tool_call_message(tool_name: str, arguments: dict[str, object]) -> AssistantMessage:
+def assistant_tool_call_message(
+    tool_name: str, arguments: dict[str, object]
+) -> AssistantMessage:
     return AssistantMessage(
         role="assistant",
         content=[
@@ -186,6 +200,7 @@ def assistant_tool_call_message(tool_name: str, arguments: dict[str, object]) ->
         ],
         api="anthropic-messages",
         provider="offline",
+        endpoint="offline",
         model="offline-extension-demo",
         response_id=None,
         usage=usage(),
@@ -202,12 +217,42 @@ def stream_with_final_message(message: AssistantMessage) -> AssistantMessageEven
         stream.push({"type": "start", "partial": message})
         if message.content and isinstance(message.content[0], TextPart):
             stream.push({"type": "text_start", "content_index": 0, "partial": message})
-            stream.push({"type": "text_delta", "content_index": 0, "delta": message.content[0].text, "partial": message})
-            stream.push({"type": "text_end", "content_index": 0, "content": message.content[0].text, "partial": message})
+            stream.push(
+                {
+                    "type": "text_delta",
+                    "content_index": 0,
+                    "delta": message.content[0].text,
+                    "partial": message,
+                }
+            )
+            stream.push(
+                {
+                    "type": "text_end",
+                    "content_index": 0,
+                    "content": message.content[0].text,
+                    "partial": message,
+                }
+            )
         elif message.content and isinstance(message.content[0], ToolCall):
-            stream.push({"type": "toolcall_start", "content_index": 0, "partial": message})
-            stream.push({"type": "toolcall_delta", "content_index": 0, "delta": str(message.content[0].arguments), "partial": message})
-            stream.push({"type": "toolcall_end", "content_index": 0, "tool_call": message.content[0], "partial": message})
+            stream.push(
+                {"type": "toolcall_start", "content_index": 0, "partial": message}
+            )
+            stream.push(
+                {
+                    "type": "toolcall_delta",
+                    "content_index": 0,
+                    "delta": str(message.content[0].arguments),
+                    "partial": message,
+                }
+            )
+            stream.push(
+                {
+                    "type": "toolcall_end",
+                    "content_index": 0,
+                    "tool_call": message.content[0],
+                    "partial": message,
+                }
+            )
         stream.push({"type": "done", "reason": message.stop_reason, "message": message})  # type: ignore[typeddict-item]
 
     asyncio.create_task(_feed())
@@ -222,7 +267,6 @@ def build_runtime(
     tools: list[ToolDefinition] | None = None,
     persist: bool = False,
 ):
-    services = _build_bootstrap_services()
     return create_agent_session_runtime(
         session_dir=session_dir,
         model=offline_model(),
@@ -230,7 +274,6 @@ def build_runtime(
         system_prompt=system_prompt,
         tools=tools or [],
         persist=persist,
-        services=services,
     )
 
 
@@ -269,7 +312,7 @@ async def create_kimi_runtime_session(
     system_prompt: str,
     tools: list[AgentTool[Any]] | None = None,
     persist: bool = False,
-) -> tuple[AgentSessionRuntime, AgentSession]:
+) -> tuple[AgentSessionRuntime, CodingSession]:
     working_dir = Path(cwd).resolve()
     runtime = create_kimi_runtime(
         cwd=working_dir,
@@ -293,7 +336,9 @@ def print_messages(session) -> None:
         print(f"{index}. {role}: {text}")
 
 
-def attach_stream_printer(session: AgentSession, *, show_thinking: bool = False) -> None:
+def attach_stream_printer(
+    session: CodingSession, *, show_thinking: bool = False
+) -> None:
     thinking_open = False
 
     def on_event(event: dict) -> None:
@@ -307,7 +352,11 @@ def attach_stream_printer(session: AgentSession, *, show_thinking: bool = False)
                     print("\n[thinking] ", end="", flush=True)
                     thinking_open = True
                 print(assistant_event.get("delta", ""), end="", flush=True)
-            elif assistant_event_type == "thinking_end" and show_thinking and thinking_open:
+            elif (
+                assistant_event_type == "thinking_end"
+                and show_thinking
+                and thinking_open
+            ):
                 print()
                 thinking_open = False
             elif assistant_event_type == "text_delta":
@@ -326,7 +375,9 @@ def attach_stream_printer(session: AgentSession, *, show_thinking: bool = False)
             result = event.get("result")
             if result and hasattr(result, "content"):
                 content_text = "".join(
-                    part.text for part in result.content if getattr(part, "type", None) == "text"
+                    part.text
+                    for part in result.content
+                    if getattr(part, "type", None) == "text"
                 )
                 print(f"[tool end: {content_text}]")
 
@@ -347,6 +398,8 @@ def latest_user_text(context_messages: list[object]) -> str:
         if isinstance(last_message.content, str):
             return last_message.content
         return " ".join(
-            part.text for part in last_message.content if getattr(part, "type", None) == "text"
+            part.text
+            for part in last_message.content
+            if getattr(part, "type", None) == "text"
         )
     return ""

@@ -5,12 +5,14 @@ from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
-from loushang.coding.presentation.tui.plain import (
-    PlainCodingUiRenderer,
+from loushang.coding.continuity_bootstrap import (
+    bind_coding_configured_continuity,
+    get_coding_configured_continuity_composition,
 )
 from loushang.coding.ui.completion import coding_inline_completion_provider
-from loushang.coding.ui.plain_app import build_plain_coding_tui_app
+from loushang.coding.ui.plugin_theme import apply_coding_plugin_theme_to_screen
 from loushang.coding.ui.product_binding import (
+    ScreenCodingDebugBinding,
     build_coding_ui_controller,
     build_screen_coding_action_host,
 )
@@ -18,28 +20,29 @@ from loushang.coding.ui.screen_app import ScreenCodingTuiApp
 from loushang.coding.ui.screen_input import CODING_SCREEN_RUN_PROFILE
 from loushang.coding.ui.screen_surfaces import ScreenSurfaceManager
 from loushang.coding.ui.startup import load_coding_tui_startup_view
+from loushang.foundation.observability import get_log, log_context
+from loushang.foundation.platform_paths import resolve_platform_paths
 from loushang.harness.diagnostics import observability_runtime
 from loushang.harnesstui.conversation.agent_application import (
     AgentPlainConversationApplicationBinding,
     AgentScreenConversationApplicationBinding,
-    bind_agent_screen_approval_presenter,
-    bind_agent_screen_session_transition,
     current_agent_runtime_session,
     handle_agent_screen_approval,
-    refresh_agent_screen_session,
 )
 from loushang.harnesstui.conversation.application_host import (
+    ActionHostScreenRunner,
     run_prepared_plain_conversation,
     run_prepared_screen_conversation,
 )
 from loushang.harnesstui.conversation.host import (
+    ConversationScreenRunProfile,
     run_action_host_conversation_screen,
 )
 from loushang.harnesstui.conversation.run_context import (
     RebindableEventSource,
     StableEmit,
 )
-from loushang.observability import get_log, log_context
+from loushang.harnesstui.conversation.session_view import session_observability_id
 from loushang.tui import CompletionProvider
 from loushang.tui.launch import TuiLaunchProfile, run_tui_launch_shell
 from loushang.tui.prompt import run_non_interactive_prompt_loop
@@ -55,6 +58,9 @@ async def run_coding_tui(
     stdout: TextIO,
     stderr: TextIO,
     verbose: bool = False,
+    screen_run_profile: ConversationScreenRunProfile = CODING_SCREEN_RUN_PROFILE,
+    startup_app: ScreenCodingTuiApp | None = None,
+    prepared_screen_runner: ActionHostScreenRunner | None = None,
 ) -> int:
     return await run_tui_launch_shell(
         stdin=stdin,
@@ -69,6 +75,9 @@ async def run_coding_tui(
                 stdout=stdout,
                 stderr=stderr,
                 verbose=verbose,
+                screen_run_profile=screen_run_profile,
+                startup_app=startup_app,
+                prepared_screen_runner=prepared_screen_runner,
             ),
             run_plain=partial(
                 _run_plain_tui,
@@ -93,137 +102,146 @@ async def _run_screen_interactive_tui(
     stdout: TextIO,
     stderr: TextIO,
     verbose: bool,
+    screen_run_profile: ConversationScreenRunProfile,
+    startup_app: ScreenCodingTuiApp | None = None,
+    prepared_screen_runner: ActionHostScreenRunner | None = None,
 ) -> int:
+    current = current_agent_runtime_session(runtime, session)
     snapshot = await load_coding_tui_startup_view(runtime=runtime, session=session)
-    app = ScreenCodingTuiApp(
+    composition = get_coding_configured_continuity_composition(runtime)
+    if composition is None:
+        composition = await bind_coding_configured_continuity(
+            runtime,
+            settings_manager=getattr(current, "settings_manager", None),
+            session_dir=getattr(
+                runtime,
+                "session_dir",
+                resolve_platform_paths().data / "sessions",
+            ),
+            cwd=snapshot.cwd,
+            diagnostics_service=getattr(current, "diagnostics_service", None),
+        )
+    continuity_reference = composition.hub.reference()
+    try:
+        return await _run_bound_screen_interactive_tui(
+            runtime=runtime,
+            session=session,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            verbose=verbose,
+            screen_run_profile=screen_run_profile,
+            continuity_reference=continuity_reference,
+            startup_snapshot=snapshot,
+            startup_app=startup_app,
+            prepared_screen_runner=prepared_screen_runner,
+        )
+    finally:
+        continuity_reference.release()
+
+
+async def _run_bound_screen_interactive_tui(
+    *,
+    runtime: Any,
+    session: Any,
+    stdin: TextIO,
+    stdout: TextIO,
+    stderr: TextIO,
+    verbose: bool,
+    screen_run_profile: ConversationScreenRunProfile,
+    continuity_reference: Any,
+    startup_snapshot: Any,
+    startup_app: ScreenCodingTuiApp | None = None,
+    prepared_screen_runner: ActionHostScreenRunner | None = None,
+) -> int:
+    snapshot = startup_snapshot
+    app = startup_app or ScreenCodingTuiApp(
         model_label=snapshot.model_label,
         cwd=snapshot.cwd,
         branch=snapshot.branch,
         session_label=snapshot.session_label,
         now=time.monotonic,
     )
+    current = current_agent_runtime_session(runtime, session)
+    apply_coding_plugin_theme_to_screen(app, current)
+    app.state.session_id = session_observability_id(current)
     completion_provider = await _load_completion_provider(
         session, base_path=Path(snapshot.cwd)
     )
+    if startup_app is not None:
+        app.state.model_label = snapshot.model_label
+        app.state.cwd = snapshot.cwd
+        app.state.branch = snapshot.branch
+        app.state.session_label = snapshot.session_label
     controller = build_coding_ui_controller(
         runtime=runtime,
         session=session,
         verbose=verbose,
+        plugin_workspace=snapshot.cwd,
     )
+
+    def current_session():
+        return current_agent_runtime_session(runtime, session)
+
     action_host = build_screen_coding_action_host(
         presenter=app,
         controller=controller,
         stderr=stderr,
         verbose=verbose,
+        debug=ScreenCodingDebugBinding(
+            current_session=current_session,
+            current_cwd=lambda: app.state.cwd,
+            enable=observability_runtime.enable_session_debug,
+            disable=observability_runtime.disable_session_debug,
+        ),
     )
     event_source = RebindableEventSource(session)
-    surface_manager: ScreenSurfaceManager | None = None
 
-    def no_rebound_presenter() -> None:
-        return None
-
-    rebound_presenter_cleanup = no_rebound_presenter
+    def current_approval_interaction():
+        return getattr(
+            current_session(),
+            "approval_interaction",
+            None,
+        )
 
     def build_surface(status_provider):
-        nonlocal surface_manager
-        surface_manager = ScreenSurfaceManager(
+        return ScreenSurfaceManager(
             app=app,
             session=session,
             runtime=runtime,
+            continuity_reference=continuity_reference,
             status_provider=status_provider,
             on_approval=lambda event: handle_agent_screen_approval(
-                current_agent_runtime_session(runtime, session),
+                current_approval_interaction(),
                 event,
             ),
-        )
-        return surface_manager
-
-    async def rebind_screen_session(next_session: object) -> None:
-        nonlocal rebound_presenter_cleanup
-        try:
-            await refresh_agent_screen_session(
-                runtime=runtime,
-                app=app,
-                session=next_session,
-                event_source=event_source,
-            )
-        except Exception as refresh_error:
-            event_source.rebind(next_session)
-            app.replace_transcript_window((), reason="resume_refresh_failed")
-            app.state.session_label = getattr(next_session, "session_name", None) or (
-                getattr(next_session, "session_id", None)
-            )
-            app.add_error(
-                "Session changed, but the TUI could not refresh its history.",
-                str(refresh_error) or refresh_error.__class__.__name__,
-            )
-            log.problem(
-                "coding_ui_session_rebind_failed",
-                source="tui",
-                message=str(refresh_error) or refresh_error.__class__.__name__,
-                recoverable=True,
-                exc=refresh_error,
-            )
-            return
-        if event_source.last_rebind_error is not None:
-            rebind_error = event_source.last_rebind_error
-            app.add_error(
-                "Session changed, but event subscription could not be rebound.",
-                str(rebind_error) or rebind_error.__class__.__name__,
-            )
-            log.problem(
-                "coding_ui_event_rebind_failed",
-                source="tui",
-                message=str(rebind_error) or rebind_error.__class__.__name__,
-                recoverable=True,
-                exc=rebind_error,
-            )
-        if surface_manager is None:  # pragma: no cover - prepared before rebind
-            return
-        try:
-            surface_manager.status_provider.update_context(
-                model_label=app.state.model_label,
-                cwd=app.state.cwd,
-                branch=app.state.branch,
-            )
-            app.composer.set_completion_provider(
-                await _load_completion_provider(
-                    next_session,
-                    base_path=Path(app.state.cwd),
-                )
-            )
-            rebound_presenter_cleanup()
-            rebound_presenter_cleanup = bind_agent_screen_approval_presenter(
-                next_session,
-                surface_manager,
-            )
-        except Exception as error:
-            app.add_error(
-                "Session resumed, but some TUI bindings could not be refreshed.",
-                str(error) or error.__class__.__name__,
-            )
-            log.problem(
-                "coding_ui_session_binding_refresh_failed",
-                source="tui",
-                message=str(error) or error.__class__.__name__,
-                recoverable=True,
-                exc=error,
-            )
-
-    def bind_screen_presenter(surface):
-        initial_cleanup = bind_agent_screen_approval_presenter(
-            session,
-            surface,
-            session_provider=lambda: current_agent_runtime_session(runtime, session),
+            approval_interaction_provider=current_approval_interaction,
         )
 
-        def cleanup() -> None:
-            try:
-                rebound_presenter_cleanup()
-            finally:
-                initial_cleanup()
+    def report_rebind_problem(code: str, error: Exception) -> None:
+        log.problem(
+            f"coding_ui_{code}",
+            source="tui",
+            message=str(error) or error.__class__.__name__,
+            recoverable=True,
+            exc=error,
+        )
 
-        return cleanup
+    capability_session: object | None = None
+    capability_generation = 0
+
+    def current_capabilities():
+        from .screen_input import project_coding_capabilities
+
+        nonlocal capability_session, capability_generation
+        active = current_session()
+        if active is not capability_session:
+            capability_session = active
+            capability_generation += 1
+        return project_coding_capabilities(
+            ("coding", str(id(app)), str(capability_generation)), controller.get_operations,
+            clipboard_declared=screen_run_profile is CODING_SCREEN_RUN_PROFILE,
+        )
 
     prepared = AgentScreenConversationApplicationBinding(
         session=session,
@@ -236,26 +254,29 @@ async def _run_screen_interactive_tui(
             cwd=snapshot.cwd,
             mode="tui",
         ),
-        profile=CODING_SCREEN_RUN_PROFILE,
+        profile=screen_run_profile,
         trace=_trace,
         stdout=stdout,
         now=time.monotonic,
         completion_provider=completion_provider,
-        bind_presenter=bind_screen_presenter,
-        bind_transition=lambda surface: bind_agent_screen_session_transition(
-            runtime,
-            surface,
-            on_rebind=rebind_screen_session,
-        ),
+        cooperative_large_deltas=True,
+        capability_provider=current_capabilities,
         resume_command_prefix=("loushang", "--resume"),
         session_provider=lambda: current_agent_runtime_session(runtime, session),
+        get_operations=controller.get_operations,
+        approval_interaction_provider=current_approval_interaction,
         event_source=event_source,
+        runtime=runtime,
+        completion_provider_loader=lambda next_session, cwd: _load_completion_provider(
+            next_session, base_path=Path(cwd)
+        ),
+        report_rebind_problem=report_rebind_problem,
     ).prepare()
     return await run_prepared_screen_conversation(
         prepared,
         stdin=stdin,
         stdout=stdout,
-        screen_runner=run_action_host_conversation_screen,
+        screen_runner=prepared_screen_runner or run_action_host_conversation_screen,
     )
 
 
@@ -268,6 +289,9 @@ async def _run_plain_tui(
     stderr: TextIO,
     verbose: bool,
 ) -> int:
+    from loushang.coding.presentation.tui.plain import PlainCodingUiRenderer
+    from loushang.coding.ui.plain_app import build_plain_coding_tui_app
+
     renderer = PlainCodingUiRenderer(stdout=stdout, stderr=stderr, verbose=verbose)
     snapshot = await load_coding_tui_startup_view(runtime=runtime, session=session)
 

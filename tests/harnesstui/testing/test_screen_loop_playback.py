@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 
+import pytest
+
+from loushang.foundation.platform_paths import resolve_platform_paths
+from loushang.foundation.runtime_scope import RunLease, resolve_runtime_scope
+from loushang.harnesstui.conversation.input import bind_clipboard_image_input_router
 from loushang.harnesstui.conversation.screen_state import ScreenConversationState
 from loushang.harnesstui.testing.screen_loop_playback import (
+    BlockingPromptController,
     ConversationScreenLoopPlayback,
     ConversationScreenLoopScenario,
     ScriptedInputChunk,
 )
+from loushang.tui.clipboard_image import ClipboardImage
 from loushang.tui.core import RenderConstraints, RenderResult
 from loushang.tui.framework import SurfaceHost
+from loushang.tui.input import BRACKETED_PASTE_END, BRACKETED_PASTE_START
 from loushang.tui.terminal_capabilities import TerminalRuntimeCapabilities
 from loushang.tui.ui_parts.composer import Composer
 
@@ -70,6 +79,40 @@ def _app_factory(*, now):
     return _ScreenApp(clock=now)
 
 
+def test_blocking_prompt_controller_settles_without_residual_task() -> None:
+    controller = BlockingPromptController(timeout_seconds=0.1)
+
+    async def run() -> None:
+        with controller:
+            waiter = asyncio.create_task(controller.wait_until_settled())
+            await asyncio.sleep(0)
+            assert controller.started
+            controller.settle_on_abort()
+            await waiter
+
+    asyncio.run(run())
+    assert controller.settled
+
+
+def test_blocking_prompt_controller_fails_closed_on_missing_abort() -> None:
+    controller = BlockingPromptController(timeout_seconds=0.001)
+
+    with pytest.raises(AssertionError, match="not settled by abort"):
+        asyncio.run(controller.wait_until_settled())
+
+
+def test_blocking_prompt_controller_context_requires_completed_lifecycle() -> None:
+    with pytest.raises(AssertionError, match="never started"):
+        with BlockingPromptController():
+            pass
+
+
+@pytest.mark.parametrize("timeout", [0, float("inf"), float("nan")])
+def test_blocking_prompt_controller_rejects_unbounded_timeout(timeout: float) -> None:
+    with pytest.raises(ValueError, match="finite and greater than zero"):
+        BlockingPromptController(timeout_seconds=timeout)
+
+
 def test_screen_loop_playback_runs_scripted_chunks_through_shared_runner() -> None:
     prompts: list[str] = []
     playback = ConversationScreenLoopPlayback(
@@ -96,6 +139,104 @@ def test_screen_loop_playback_runs_scripted_chunks_through_shared_runner() -> No
     result.assert_no_clear_screen()
     assert prompts == ["hello"]
     assert result.state_snapshot["running"] is False
+
+
+def test_screen_loop_playback_preserves_focus_and_paste_tails_at_idle_deadline() -> (
+    None
+):
+    prompts: list[str] = []
+    playback = ConversationScreenLoopPlayback(
+        app_factory=_app_factory,
+        interruption_message="interrupted",
+        cancellation_message="cancelled",
+        width=40,
+        height=8,
+    )
+
+    async def handle_prompt(text: str) -> None:
+        prompts.append(text)
+
+    pasted = "hello"
+    result = playback.run(
+        (0.00, "\x1b"),
+        (0.01, "[I"),
+        (0.02, BRACKETED_PASTE_START[:3]),
+        (0.03, f"{BRACKETED_PASTE_START[3:]}{pasted}"),
+        (0.04, BRACKETED_PASTE_END[:3]),
+        (0.05, BRACKETED_PASTE_END[3:]),
+        (0.06, "\r"),
+        (0.08, ""),
+        handle_prompt=handle_prompt,
+    )
+
+    result.assert_exit_code(0)
+    assert prompts == [pasted]
+    assert "[I" not in result.output
+    assert "[201~" not in result.output
+
+
+def test_screen_loop_playback_routes_windows_alt_v_to_clipboard_image(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("sys.platform", "win32")
+    paths = resolve_platform_paths(
+        environ={"LOUSHANG_RUNTIME_DIR": str(tmp_path / "runtime")},
+        home=tmp_path / "home",
+    )
+    scope = resolve_runtime_scope(paths=paths, run_id="c" * 32)
+    lease = RunLease.acquire(scope)
+
+    def app_factory(*, now):
+        app = _ScreenApp(clock=now)
+        app.state.cwd = str(tmp_path)
+        return app
+
+    clipboard_router = bind_clipboard_image_input_router(runtime_scope=scope)
+
+    def input_router_factory(
+        *, app, should_exit, is_local_command, keybindings, width, height
+    ):
+        return clipboard_router(
+            app=app,
+            should_exit=should_exit,
+            is_local_command=is_local_command,
+            keybindings=keybindings,
+            width=width,
+            height=height,
+            clipboard_image_reader=lambda: ClipboardImage(
+                bytes=b"png",
+                mime_type="image/png",
+            ),
+            clipboard_image_name_factory=lambda: "playback",
+        )
+
+    playback = ConversationScreenLoopPlayback(
+        app_factory=app_factory,
+        interruption_message="interrupted",
+        cancellation_message="cancelled",
+        width=40,
+        height=8,
+        input_router_factory=input_router_factory,
+    )
+
+    result = playback.run(
+        # The Windows backend normalizes native getwch() bytes NUL + 0x2F
+        # (the V scan code) into this terminal-style Alt+V sequence.
+        (0.00, "\x1bv"),
+        (0.01, ""),
+    )
+
+    marker = "@clipboard/clipboard-playback.png"
+    result.assert_exit_code(0)
+    result.assert_composer_text(f"{marker} ")
+    assert playback.app.state.status_message == (
+        "Attached clipboard image: clipboard/clipboard-playback.png"
+    )
+    assert not (scope.drafts / "clipboard" / "clipboard-playback.png").exists()
+    assert scope.run_dir.exists()
+    lease.close()
+    assert not scope.run_dir.exists()
 
 
 def test_screen_loop_scenario_builds_timed_input_recipe() -> None:

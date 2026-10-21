@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from loushang.ai.model.domain import (
@@ -23,9 +23,23 @@ from loushang.ai.model.registry import (
     resolve_model_ref,
 )
 from loushang.ai.model.selection import ModelSelection
-from loushang.observability import get_log
+from loushang.foundation.observability import get_log
+from loushang.harness.runtime.registration import (
+    RegistrationDisposalResult,
+    RegistrationIdentity,
+    RegistrationLease,
+    RegistrationOwner,
+)
 
 log = get_log(__name__).bind(component="ModelCatalog")
+
+
+@dataclass(frozen=True)
+class _ProviderLayer:
+    owner: RegistrationOwner
+    identity: RegistrationIdentity
+    provider: Provider | None
+    published: bool = True
 
 
 def _registry_provider_snapshot(
@@ -46,6 +60,8 @@ class ModelCatalog:
         self._ai_registry = (
             ai_registry if ai_registry is not None else get_default_model_registry()
         )
+        self._provider_layers: dict[str, list[_ProviderLayer]] = {}
+        self._provider_baselines: dict[str, Provider | None] = {}
 
     @property
     def ai_registry(self) -> AiModelRegistry:
@@ -67,6 +83,8 @@ class ModelCatalog:
                     (str(path), load_model_registry_from_directory(path).providers)
                 )
         self._replace_ai_registry(_combine_model_registries(sources))
+        self._provider_layers.clear()
+        self._provider_baselines.clear()
 
     def reload_if_project_layer(
         self,
@@ -79,7 +97,9 @@ class ModelCatalog:
         resolved_project_dir = Path(project_dir).expanduser()
         if not resolved_project_dir.is_dir():
             return False
-        resolved_user_dir = Path(user_dir).expanduser() if user_dir is not None else None
+        resolved_user_dir = (
+            Path(user_dir).expanduser() if user_dir is not None else None
+        )
         self.reload(
             user_dir=(
                 resolved_user_dir
@@ -113,13 +133,247 @@ class ModelCatalog:
         self._replace_ai_registry(AiModelRegistry.from_providers(providers))
 
     def register_provider(self, provider: Provider) -> None:
+        self._provider_layers.pop(provider.id, None)
+        self._provider_baselines.pop(provider.id, None)
         providers = _registry_provider_snapshot(self._ai_registry)
         providers[provider.id] = provider
         self._replace_ai_registry(AiModelRegistry.from_providers(providers))
 
     def unregister_provider(self, provider_id: str) -> None:
+        self._provider_layers.pop(provider_id, None)
+        self._provider_baselines.pop(provider_id, None)
         providers = _registry_provider_snapshot(self._ai_registry)
         providers.pop(provider_id, None)
+        self._replace_ai_registry(AiModelRegistry.from_providers(providers))
+
+    def bind_provider(
+        self,
+        provider: Provider,
+        *,
+        owner: RegistrationOwner,
+    ) -> RegistrationLease:
+        """Bind one exact Provider layer and restore the prior winner on removal."""
+
+        return self._bind_provider(provider, owner=owner, published=True)
+
+    def stage_provider(
+        self,
+        provider: Provider,
+        *,
+        owner: RegistrationOwner,
+    ) -> RegistrationLease:
+        """Add an invisible Provider layer activated by its registration scope."""
+
+        return self._bind_provider(provider, owner=owner, published=False)
+
+    def bind_provider_removal(
+        self,
+        provider_id: str,
+        *,
+        owner: RegistrationOwner,
+    ) -> RegistrationLease:
+        """Bind an owner-scoped tombstone without deleting another owner's layer."""
+
+        return self._bind_provider_layer(
+            provider_id,
+            None,
+            owner=owner,
+            published=True,
+        )
+
+    def stage_provider_removal(
+        self,
+        provider_id: str,
+        *,
+        owner: RegistrationOwner,
+    ) -> RegistrationLease:
+        """Stage an invisible owner-scoped Provider tombstone."""
+
+        return self._bind_provider_layer(
+            provider_id,
+            None,
+            owner=owner,
+            published=False,
+        )
+
+    def _bind_provider(
+        self,
+        provider: Provider,
+        *,
+        owner: RegistrationOwner,
+        published: bool,
+    ) -> RegistrationLease:
+        if not isinstance(provider, Provider):
+            raise TypeError("ModelCatalog.bind_provider expects a Provider")
+        if not isinstance(owner, RegistrationOwner):
+            raise TypeError("ModelCatalog.bind_provider owner must be a RegistrationOwner")
+        return self._bind_provider_layer(
+            provider.id,
+            provider,
+            owner=owner,
+            published=published,
+        )
+
+    def _bind_provider_layer(
+        self,
+        provider_id: str,
+        provider: Provider | None,
+        *,
+        owner: RegistrationOwner,
+        published: bool,
+    ) -> RegistrationLease:
+        if not isinstance(provider_id, str) or not provider_id.strip():
+            raise ValueError("Provider id must be a non-empty string")
+        layers = self._provider_layers.get(provider_id)
+        if layers is None:
+            layers = []
+            self._provider_layers[provider_id] = layers
+            self._provider_baselines[provider_id] = self._ai_registry.get_provider(
+                provider_id
+            )
+        identity = RegistrationIdentity.create(
+            surface="model_provider",
+            public_key=provider_id,
+        )
+        layers.append(
+            _ProviderLayer(
+                owner=owner,
+                identity=identity,
+                provider=provider,
+                published=published,
+            )
+        )
+        if published:
+            self._publish_provider(provider_id, provider)
+        return RegistrationLease(
+            owner=owner,
+            identity=identity,
+            dispose=lambda: self._remove_bound_provider(
+                owner=owner,
+                identity=identity,
+            ),
+            activate=(
+                None
+                if published
+                else lambda: self._set_bound_provider_published(
+                    owner=owner,
+                    identity=identity,
+                    published=True,
+                )
+            ),
+            deactivate=(
+                None
+                if published
+                else lambda: self._set_bound_provider_published(
+                    owner=owner,
+                    identity=identity,
+                    published=False,
+                )
+            ),
+            rollback=lambda: self._remove_bound_provider(
+                owner=owner,
+                identity=identity,
+            ),
+        )
+
+    def get_owner_provider_state(
+        self,
+        provider_id: str,
+        *,
+        owner: RegistrationOwner,
+    ) -> tuple[bool, Provider | None]:
+        """Return the last staged or published action for one exact owner."""
+
+        layers = self._provider_layers.get(provider_id, ())
+        for layer in reversed(layers):
+            if layer.owner == owner:
+                return True, layer.provider
+        return False, None
+
+    def _remove_bound_provider(
+        self,
+        *,
+        owner: RegistrationOwner,
+        identity: RegistrationIdentity,
+    ) -> RegistrationDisposalResult:
+        provider_id = identity.public_key
+        if identity.surface != "model_provider" or provider_id is None:
+            return RegistrationDisposalResult(
+                state="failed_terminal",
+                diagnostic_code="provider_registration_identity_invalid",
+            )
+        layers = self._provider_layers.get(provider_id)
+        if layers is None:
+            return RegistrationDisposalResult(state="already_removed")
+        for index, layer in enumerate(layers):
+            if layer.identity.registration_id != identity.registration_id:
+                continue
+            if layer.owner != owner:
+                return RegistrationDisposalResult(
+                    state="failed_terminal",
+                    diagnostic_code="provider_registration_owner_mismatch",
+                )
+            layers.pop(index)
+            published_layer = next(
+                (item for item in reversed(layers) if item.published),
+                None,
+            )
+            if published_layer is not None:
+                self._publish_provider(provider_id, published_layer.provider)
+            else:
+                baseline = self._provider_baselines.get(provider_id)
+                if not layers:
+                    self._provider_baselines.pop(provider_id, None)
+                    self._provider_layers.pop(provider_id, None)
+                self._publish_provider(provider_id, baseline)
+            return RegistrationDisposalResult(state="removed")
+        return RegistrationDisposalResult(state="already_removed")
+
+    def _set_bound_provider_published(
+        self,
+        *,
+        owner: RegistrationOwner,
+        identity: RegistrationIdentity,
+        published: bool,
+    ) -> None:
+        provider_id = identity.public_key
+        layers = self._provider_layers.get(provider_id or "")
+        if identity.surface != "model_provider" or provider_id is None or layers is None:
+            raise RuntimeError("staged Provider registration is unavailable")
+        for index, layer in enumerate(layers):
+            if layer.identity.registration_id != identity.registration_id:
+                continue
+            if layer.owner != owner:
+                raise RuntimeError("staged Provider registration owner changed")
+            layers[index] = _ProviderLayer(
+                owner=layer.owner,
+                identity=layer.identity,
+                provider=layer.provider,
+                published=published,
+            )
+            effective = next(
+                (item for item in reversed(layers) if item.published),
+                None,
+            )
+            self._publish_provider(
+                provider_id,
+                effective.provider
+                if effective is not None
+                else self._provider_baselines.get(provider_id),
+            )
+            return
+        raise RuntimeError("staged Provider registration was removed")
+
+    def _publish_provider(
+        self,
+        provider_id: str,
+        provider: Provider | None,
+    ) -> None:
+        providers = _registry_provider_snapshot(self._ai_registry)
+        if provider is None:
+            providers.pop(provider_id, None)
+        else:
+            providers[provider_id] = provider
         self._replace_ai_registry(AiModelRegistry.from_providers(providers))
 
     def get_model(self, name: str) -> ModelSelection | None:
@@ -127,11 +381,19 @@ class ModelCatalog:
             model = resolve_model_ref(self._ai_registry, name)
         except (KeyError, ValueError):
             return None
-        return ModelSelection(provider=model.provider_id, model_id=model.id)
+        return ModelSelection(
+            provider=model.provider_id,
+            endpoint_id=model.endpoint_id,
+            model_id=model.id,
+        )
 
     def list_models(self) -> list[ModelSelection]:
         return [
-            ModelSelection(provider=model.provider_id, model_id=model.id)
+            ModelSelection(
+                provider=model.provider_id,
+                endpoint_id=model.endpoint_id,
+                model_id=model.id,
+            )
             for model in self._ai_registry.list_models()
         ]
 
@@ -142,54 +404,38 @@ class ModelCatalog:
             return selection_input
         if isinstance(selection_input, Model):
             return ModelSelection(
-                provider=selection_input.provider_id, model_id=selection_input.id
+                provider=selection_input.provider_id,
+                endpoint_id=selection_input.endpoint_id,
+                model_id=selection_input.id,
             )
         model = resolve_model_ref(self._ai_registry, selection_input)
-        return ModelSelection(provider=model.provider_id, model_id=model.id)
+        return ModelSelection(
+            provider=model.provider_id,
+            endpoint_id=model.endpoint_id,
+            model_id=model.id,
+        )
 
     def build_model(self, selection_input: ModelSelection | str | Model) -> Model:
         selection = self.resolve_model(selection_input)
         return self._resolve_model(selection)
 
     def _resolve_model(self, selection: ModelSelection) -> Model:
-        if selection.endpoint_id:
-            return self._ai_registry.get_model(
-                selection.provider,
-                selection.endpoint_id,
-                selection.model_id,
-            )
         try:
-            return resolve_model_ref(
-                self._ai_registry,
-                f"{selection.provider}/{selection.model_id}",
-            )
+            return self._ai_registry.resolve_model_selection(selection)
         except KeyError:
             log.problem(
                 "model_selection_not_found",
                 source="config",
-                message=f"Model selection not found: {selection.provider}:{selection.model_id}",
+                message=(
+                    "Model selection not found: "
+                    f"{selection.provider}:{selection.endpoint_id}:{selection.model_id}"
+                ),
                 recoverable=True,
                 provider_id=selection.provider,
+                endpoint_id=selection.endpoint_id,
                 model_id=selection.model_id,
             )
-            raise KeyError((selection.provider, selection.model_id))
-        except ValueError as error:
-            matches = self._ai_registry.list_models(
-                provider=selection.provider,
-                model_id=selection.model_id,
-            )
-            log.problem(
-                "model_selection_ambiguous",
-                source="config",
-                message=f"Ambiguous model selection: {selection.provider}:{selection.model_id}",
-                recoverable=True,
-                provider_id=selection.provider,
-                model_id=selection.model_id,
-                endpoint_ids=[model.endpoint_id for model in matches],
-            )
-            raise ValueError(
-                f"Ambiguous model selection: {selection.provider}:{selection.model_id}; {error}"
-            ) from error
+            raise
 
 
 __all__ = ["ModelCatalog"]

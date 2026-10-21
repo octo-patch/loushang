@@ -156,6 +156,22 @@ def transform_messages_result(
                     )
                 )
                 continue
+            if not any(
+                isinstance(block, ToolCall)
+                or (isinstance(block, TextPart) and bool(block.text.strip()))
+                for block in normalized_message.content
+            ):
+                diagnostics.append(
+                    NormalizationDiagnostic(
+                        code="non_visible_assistant_dropped",
+                        path=message_path,
+                        message=(
+                            "Dropped assistant message without visible text or "
+                            "tool calls during normalization."
+                        ),
+                    )
+                )
+                continue
 
             tool_call_id_resolutions = _resolve_tool_call_ids(
                 message,
@@ -206,6 +222,7 @@ def transform_messages_result(
                     content=normalized_content,  # type: ignore[arg-type]
                     api=message.api,
                     provider=message.provider,
+                    endpoint=message.endpoint,
                     model=message.model,
                     response_id=message.response_id,
                     usage=message.usage,
@@ -393,6 +410,7 @@ def _aborted_boundary_message(message: AssistantMessage) -> AssistantMessage:
         content=[TextPart(type="text", text=text)],
         api=message.api,
         provider=message.provider,
+        endpoint=message.endpoint,
         model=message.model,
         response_id=message.response_id,
         usage=message.usage,
@@ -417,12 +435,14 @@ def coerce_cross_provider_assistant_message(
     *,
     target_api: str,
     target_provider: str | None = None,
+    target_endpoint: str | None = None,
     target_model: str | None = None,
 ) -> AssistantMessage:
     return coerce_cross_provider_assistant_message_result(
         message,
         target_api=target_api,
         target_provider=target_provider,
+        target_endpoint=target_endpoint,
         target_model=target_model,
     ).message
 
@@ -432,15 +452,17 @@ def coerce_cross_provider_assistant_message_result(
     *,
     target_api: str,
     target_provider: str | None = None,
+    target_endpoint: str | None = None,
     target_model: str | None = None,
     path: str = "messages",
 ) -> AssistantMessageCoercionResult:
-    same_model = (
+    same_target = (
         message.api == target_api
-        and (target_provider is None or message.provider == target_provider)
-        and (target_model is None or message.model == target_model)
+        and message.provider == target_provider
+        and message.endpoint == target_endpoint
+        and message.model == target_model
     )
-    if same_model or not message.api:
+    if same_target:
         return AssistantMessageCoercionResult(message=message)
     coerced_content: list[object] = []
     diagnostics: list[NormalizationDiagnostic] = []
@@ -530,6 +552,7 @@ def coerce_cross_provider_assistant_message_result(
             content=coerced_content,  # type: ignore[arg-type]
             api=message.api,
             provider=message.provider,
+            endpoint=message.endpoint,
             model=message.model,
             response_id=message.response_id,
             usage=message.usage,

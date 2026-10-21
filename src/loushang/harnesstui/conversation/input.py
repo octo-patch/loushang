@@ -1,18 +1,34 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Protocol, cast
+from typing import Literal, Protocol, TypeAlias
 
+from loushang.foundation.runtime_scope import RuntimeScope
 from loushang.harnesstui.conversation.attachments import (
     ClipboardImageNameFactory,
     ClipboardImageReader,
-    PendingPromptImageRegistry,
+    DraftStore,
+    DraftStoreQuotaExceeded,
     PromptImageAttachment,
     PromptImageAttachmentOutcome,
     new_prompt_image_name_token,
     stage_clipboard_image,
+)
+from loushang.harnesstui.conversation.clipboard_policy import (
+    STANDARD_CLIPBOARD_IMAGE_INPUT_PROFILE,
+    ClipboardImageInputProfile,
+    ClipboardImageStatusCopy,
+)
+from loushang.harnesstui.conversation.input_policy import (
+    CONVERSATION_FOLLOW_UP_ACTION,
+    CONVERSATION_PASTE_IMAGE_ACTION,
+    CONVERSATION_QUEUE_EDIT_LAST_ACTION,
+    DEFAULT_CONVERSATION_INPUT_POLICY,
+    ConversationInputPolicy,
+    RunningSubmitMode,
+    conversation_keybinding_manager,
 )
 from loushang.harnesstui.conversation.screen_state import ScreenConversationState
 from loushang.tui import Composer, SurfaceHost
@@ -21,13 +37,19 @@ from loushang.tui.input import (
     ComposerInputTarget,
     InputEvent,
     InputIntent,
+    PromptJumpDirection,
+    apply_prompt_paste,
+    apply_prompt_text,
+    prompt_jump_direction_for_key,
     route_editor_editing_key,
     route_editor_selection_key,
     route_prompt_completion_key,
+    route_prompt_explicit_completion_key,
+    route_prompt_vertical_navigation_key,
 )
 from loushang.tui.keybindings import KeybindingConfig, KeybindingManager
+from loushang.tui.transcript import AssistantMessageRecord
 
-RunningSubmitMode = Literal["steer", "follow_up"]
 PromptImageAttachmentStager = Callable[[], PromptImageAttachmentOutcome]
 ClipboardOutcomePresenter = Callable[[PromptImageAttachmentOutcome], None]
 
@@ -49,84 +71,159 @@ class ConversationScreenInputPort(Protocol):
     def queue_steer(self, text: str) -> None: ...
 
 
-class ClipboardImageConversationInputPort(ConversationScreenInputPort, Protocol):
-    """Conversation input surface capable of presenting clipboard status."""
+@dataclass(frozen=True, slots=True)
+class ConversationInputHandled:
+    """An input event changed local interaction state and needs a render."""
 
-    def set_status(self, message: str | None) -> None: ...
+    kind: Literal["handled"] = field(default="handled", init=False)
+    render_requested: bool = field(default=True, init=False)
 
 
 @dataclass(frozen=True, slots=True)
-class ClipboardImageStatusCopy:
-    """Caller-supplied copy for neutral clipboard attachment outcomes."""
+class ConversationInputIgnored:
+    """An input event produced no state change and needs no render."""
 
-    empty: str
-    read_error_prefix: str
-    unsupported_prefix: str
-    write_error_prefix: str
-    attached_prefix: str
-    unknown_type: str
-
-    def message(self, outcome: PromptImageAttachmentOutcome) -> str | None:
-        if outcome.kind == "empty":
-            return self.empty
-        if outcome.kind == "read_error":
-            return f"{self.read_error_prefix}{outcome.error_message}"
-        if outcome.kind == "unsupported":
-            return f"{self.unsupported_prefix}{outcome.mime_type or self.unknown_type}"
-        if outcome.kind == "write_error":
-            return f"{self.write_error_prefix}{outcome.error_message}"
-        if outcome.attachment is not None:
-            return f"{self.attached_prefix}{outcome.attachment.display_path}"
-        return None
-
-
-ClipboardImageAppPath = Callable[[ConversationScreenInputPort], Path | str]
+    kind: Literal["ignored"] = field(default="ignored", init=False)
+    render_requested: bool = field(default=False, init=False)
 
 
 @dataclass(frozen=True, slots=True)
-class ClipboardImageInputProfile:
-    """Product policy injected into app-aware clipboard image routing."""
+class ConversationPromptResult:
+    """Start one idle conversation prompt."""
 
-    directory: ClipboardImageAppPath
-    display_root: ClipboardImageAppPath
-    status_copy: ClipboardImageStatusCopy
+    text: str
+    attachments: tuple[object, ...] | None = None
+    kind: Literal["prompt"] = field(default="prompt", init=False)
+    render_requested: bool = field(default=True, init=False)
 
 
-class ClipboardImageInputRouterBuilder(Protocol):
-    """Construct a clipboard-enabled router from one bound product profile."""
+@dataclass(frozen=True, slots=True)
+class ConversationLocalResult:
+    """Dispatch one product-local command."""
+
+    text: str
+    kind: Literal["local"] = field(default="local", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationSteerResult:
+    """Steer the active conversation run."""
+
+    text: str
+    attachments: tuple[object, ...] | None = None
+    kind: Literal["steer"] = field(default="steer", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationFollowupResult:
+    """Queue one follow-up behind the active conversation run."""
+
+    text: str
+    attachments: tuple[object, ...] | None = None
+    kind: Literal["follow_up"] = field(default="follow_up", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationSurfaceResult:
+    """Forward one intent emitted by an active surface."""
+
+    intent: InputIntent[str]
+    kind: Literal["surface"] = field(default="surface", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationClipboardResult:
+    """Report one clipboard-image staging outcome."""
+
+    outcome: PromptImageAttachmentOutcome
+    kind: Literal["clipboard"] = field(default="clipboard", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationCopyTextResult:
+    """Copy an immutable answer or selection snapshot without blocking input."""
+
+    text: str
+    kind: Literal["copy_text"] = field(default="copy_text", init=False)
+    render_requested: bool = field(default=False, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationAbortResult:
+    """Request cancellation of the active conversation run."""
+
+    kind: Literal["abort"] = field(default="abort", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ConversationExitResult:
+    """Exit the conversation screen with one process status."""
+
+    exit_code: int
+    kind: Literal["exit"] = field(default="exit", init=False)
+    render_requested: bool = field(default=True, init=False)
+
+
+ConversationInputResult: TypeAlias = (
+    ConversationInputHandled
+    | ConversationInputIgnored
+    | ConversationPromptResult
+    | ConversationLocalResult
+    | ConversationSteerResult
+    | ConversationFollowupResult
+    | ConversationSurfaceResult
+    | ConversationClipboardResult
+    | ConversationCopyTextResult
+    | ConversationAbortResult
+    | ConversationExitResult
+)
+
+
+class ConversationInputRouterPort(Protocol):
+    """Route one decoded terminal input event to a conversation result."""
+
+    def handle(self, event: InputEvent) -> ConversationInputResult: ...
+
+    def dispose(self) -> None: ...
+
+
+class ConversationInputRouterFactoryPort(Protocol):
+    """Construct a product-neutral conversation input adapter."""
 
     def __call__(
         self,
-        app: ClipboardImageConversationInputPort,
+        *,
+        app: ConversationScreenInputPort,
+        should_exit: Callable[[str], bool],
+        is_local_command: Callable[[str], bool],
+        keybindings: KeybindingManager | KeybindingConfig | None,
+        width: int,
+        height: int,
+    ) -> ConversationInputRouterPort: ...
+
+
+class ClipboardImageInputRouterBuilder(ConversationInputRouterFactoryPort, Protocol):
+    """Standard router factory with optional clipboard test dependencies."""
+
+    def __call__(
+        self,
+        app: ConversationScreenInputPort,
         should_exit: Callable[[str], bool],
         is_local_command: Callable[[str], bool] = ...,
         keybindings: KeybindingManager | KeybindingConfig | None = ...,
-        running_submit_mode: RunningSubmitMode = ...,
-        follow_up_keys: tuple[str, ...] = ...,
         width: int = ...,
         height: int = ...,
         clipboard_image_reader: ClipboardImageReader = ...,
         clipboard_image_dir: Path | str | None = ...,
         clipboard_image_name_factory: ClipboardImageNameFactory = ...,
+        runtime_scope: RuntimeScope | None = ...,
     ) -> ConversationInputRouter: ...
-
-
-@dataclass(frozen=True, slots=True)
-class ConversationInputResult:
-    """Product-neutral outcome of routing one conversation input event."""
-
-    prompt_text: str | None = None
-    prompt_attachments: tuple[PromptImageAttachment, ...] | None = None
-    local_text: str | None = None
-    steer_text: str | None = None
-    steer_attachments: tuple[PromptImageAttachment, ...] | None = None
-    followup_text: str | None = None
-    followup_attachments: tuple[PromptImageAttachment, ...] | None = None
-    surface_intent: InputIntent | None = None
-    clipboard_outcome: PromptImageAttachmentOutcome | None = None
-    abort_requested: bool = False
-    exit_code: int | None = None
-    render_requested: bool = True
 
 
 @dataclass(slots=True)
@@ -137,146 +234,283 @@ class ConversationInputRouter:
     should_exit: Callable[[str], bool]
     is_local_command: Callable[[str], bool] = lambda _text: False
     keybindings: KeybindingManager | KeybindingConfig | None = None
-    running_submit_mode: RunningSubmitMode = "steer"
-    follow_up_keys: tuple[str, ...] = ("alt+enter",)
+    policy: ConversationInputPolicy = DEFAULT_CONVERSATION_INPUT_POLICY
     width: int = 80
     height: int = 12
     prompt_image_stager: PromptImageAttachmentStager | None = None
     clipboard_outcome_presenter: ClipboardOutcomePresenter | None = None
-    _jump_mode: Literal["forward", "backward"] | None = None
-    _pending_prompt_images: PendingPromptImageRegistry = field(
-        default_factory=PendingPromptImageRegistry,
+    # Deferred is a text-only intent port: its caller accepts the action before
+    # clearing/history presentation. It never consumes remote display queues.
+    submission_presentation: Literal["optimistic", "deferred"] = "optimistic"
+    _jump_mode: PromptJumpDirection | None = None
+    draft_store: DraftStore = field(
+        default_factory=DraftStore,
+        repr=False,
+    )
+    _disposed: bool = field(
+        default=False,
         init=False,
         repr=False,
     )
+    _submission_paused: bool = field(default=False, init=False, repr=False)
+    _submission_deferred: tuple[str, tuple[PromptImageAttachment, ...]] | None = field(
+        default=None, init=False, repr=False
+    )
     _composer_target: ComposerInputTarget = field(init=False, repr=False)
+    _transcript_viewport_top: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.keybindings, KeybindingManager):
-            self.keybindings = KeybindingManager(self.keybindings)
+        if self.submission_presentation not in {"optimistic", "deferred"}:
+            raise ValueError("invalid submission presentation")
+        self._check_deferred_attachments()
+        self.keybindings = conversation_keybinding_manager(self.keybindings)
+        setter = getattr(self.app, "set_keybindings", None)
+        if callable(setter):
+            setter(self.keybindings)
         self._composer_target = ComposerInputTarget(self.app.composer)
 
     def replace_app(self, app: ConversationScreenInputPort) -> None:
         """Rebind the router and its composer target to another screen port."""
 
         self.app = app
+        setter = getattr(app, "set_keybindings", None)
+        if callable(setter) and isinstance(self.keybindings, KeybindingManager):
+            setter(self.keybindings)
         self._composer_target = ComposerInputTarget(app.composer)
+        self._jump_mode = None
+        self._transcript_viewport_top = 0
+        self._submission_deferred = None
+
+    def set_transcript_viewport_top(self, row: int) -> None:
+        """Map terminal mouse rows onto the committed logical conversation frame."""
+
+        self._transcript_viewport_top = max(0, row)
+
+    def dispose(self) -> None:
+        """Idempotently release draft-owned resources on every runner exit."""
+
+        if self._disposed:
+            return
+        self._disposed = True
+        self._submission_deferred = None
+        self._clear_prompt_attachments()
+
+    def set_submission_paused(self, paused: bool) -> None:
+        """Keep the draft editable while the previous run is retiring."""
+
+        self._submission_paused = paused
+        if not paused:
+            self._submission_deferred = None
+
+    def resume_paused_submission(self) -> ConversationInputResult | None:
+        """Submit an Enter pressed during cancellation after the turn retires."""
+
+        deferred = self._submission_deferred
+        self.set_submission_paused(False)
+        if deferred is None:
+            return None
+        text, attachments = deferred
+        current_attachments = self.draft_store.select_for_text(text)
+        if (
+            self.app.composer.value != text
+            or len(current_attachments) != len(attachments)
+            or any(
+                current is not captured
+                for current, captured in zip(current_attachments, attachments)
+            )
+        ):
+            return None
+        return self._submit()
 
     def handle(self, event: InputEvent) -> ConversationInputResult:
+        if self._disposed:
+            return ConversationInputIgnored()
         if event.kind == "key" and event.event_type == "release":
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
         if self._runtime_surface_active():
             return self._route_runtime_surface(event)
         if self.app.active_surface is not None:
             return self._route_active_surface(event)
-        if event.kind == "text":
-            if self._jump_mode is not None:
-                self.app.composer.jump_to_char(
-                    event.text,
-                    direction=self._jump_mode,
+        if (
+            event.kind == "text"
+            and getattr(self.app, "_focused_tool_index", None) is not None
+        ):
+            if event.text == " ":
+                toggle = getattr(self.app, "toggle_focused_detail", None)
+                return (
+                    ConversationInputHandled()
+                    if callable(toggle) and toggle()
+                    else ConversationInputIgnored()
                 )
-                self._jump_mode = None
-                return ConversationInputResult()
-            self.app.composer.insert_text(event.text)
-            return ConversationInputResult()
+            clear_focus = getattr(self.app, "clear_detail_focus", None)
+            if callable(clear_focus):
+                clear_focus()
+        if (
+            event.kind == "paste"
+            and getattr(self.app, "_focused_tool_index", None) is not None
+        ):
+            clear_focus = getattr(self.app, "clear_detail_focus", None)
+            if callable(clear_focus):
+                clear_focus()
+        if event.kind in {"text", "paste", "resize"}:
+            clear = getattr(self.app, "clear_transcript_selection", None)
+            if callable(clear):
+                clear()
+        if event.kind == "focus" and event.focused is False:
+            clear = getattr(self.app, "clear_transcript_selection", None)
+            return (
+                ConversationInputHandled()
+                if callable(clear) and clear()
+                else ConversationInputIgnored()
+            )
+        if event.kind == "mouse":
+            handler = getattr(self.app, "handle_transcript_mouse", None)
+            if callable(handler):
+                if event.mouse_row is not None and self._transcript_viewport_top:
+                    event = replace(
+                        event,
+                        mouse_row=event.mouse_row + self._transcript_viewport_top,
+                    )
+                handled, copy_text = handler(event)
+                if copy_text:
+                    return ConversationCopyTextResult(copy_text)
+                if handled:
+                    return ConversationInputHandled()
+            return ConversationInputIgnored()
+        if event.kind == "text":
+            apply_prompt_text(
+                self._composer_target,
+                event.text,
+                jump_direction=self._jump_mode,
+            )
+            self._jump_mode = None
+            return ConversationInputHandled()
         if event.kind == "paste":
             self._jump_mode = None
-            self.app.composer.paste(event.text)
-            return ConversationInputResult()
+            apply_prompt_paste(self._composer_target, event.text)
+            return ConversationInputHandled()
         if event.kind == "resize":
             if event.columns:
                 self.width = event.columns
             if event.rows:
                 self.height = event.rows
-            return ConversationInputResult()
+            return ConversationInputHandled()
         if event.kind != "key":
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
 
         keybindings = self._keybindings()
+        if keybindings.matches(event.key, "tui.transcript.focusDetail"):
+            focus = getattr(self.app, "focus_detail_controls", None)
+            return (
+                ConversationInputHandled()
+                if callable(focus) and focus()
+                else ConversationInputIgnored()
+            )
+        focused = getattr(self.app, "_focused_tool_index", None)
+        if focused is not None:
+            if event.key in {"up", "down"}:
+                move = getattr(self.app, "move_detail_focus", None)
+                if callable(move):
+                    move(-1 if event.key == "up" else 1)
+                return ConversationInputHandled()
+            if event.key in {"enter", "space", " "}:
+                toggle = getattr(self.app, "toggle_focused_detail", None)
+                if callable(toggle):
+                    toggle()
+                return ConversationInputHandled()
+            if event.key in {"esc", "escape"}:
+                clear = getattr(self.app, "clear_detail_focus", None)
+                if callable(clear):
+                    clear()
+                return ConversationInputHandled()
+        if event.key in {"esc", "escape"}:
+            clear = getattr(self.app, "clear_transcript_selection", None)
+            if callable(clear) and clear():
+                return ConversationInputHandled()
+        if event.key in {"ctrl+c", "ctrl_c"}:
+            selected = getattr(self.app, "selected_transcript_text", None)
+            if callable(selected) and (text := selected()):
+                return ConversationCopyTextResult(text)
+        jump_direction = prompt_jump_direction_for_key(
+            event.key,
+            keybindings=keybindings,
+        )
         if self._jump_mode is not None:
-            if keybindings.matches(
-                event.key,
-                "tui.editor.jumpForward",
-            ) or keybindings.matches(
-                event.key,
-                "tui.editor.jumpBackward",
-            ):
+            if jump_direction is not None:
                 self._jump_mode = None
-                return ConversationInputResult()
+                return ConversationInputHandled()
             self._jump_mode = None
-        if keybindings.matches(event.key, "tui.queue.editLast"):
+        if keybindings.matches(event.key, CONVERSATION_QUEUE_EDIT_LAST_ACTION):
+            if self.submission_presentation == "deferred":
+                return ConversationInputIgnored()
             self._restore_queued_messages()
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.transcript.open"):
-            return ConversationInputResult(
-                render_requested=self.app.open_transcript_reader()
+            return ConversationInputHandled()
+        if keybindings.matches_prefer_explicit(event.key, "tui.transcript.open"):
+            return (
+                ConversationInputHandled()
+                if self.app.open_transcript_reader()
+                else ConversationInputIgnored()
+            )
+        if keybindings.matches_prefer_explicit(
+            event.key, "tui.transcript.copyLastAnswer"
+        ):
+            return ConversationCopyTextResult(
+                next(
+                    (
+                        record.text
+                        for record in reversed(self.app.state.records)
+                        if isinstance(record, AssistantMessageRecord)
+                        and record.stable
+                        and record.text.strip()
+                    ),
+                    "",
+                )
             )
         if route_editor_selection_key(
             self._composer_target,
             event.key,
             keybindings=keybindings,
         ):
-            return ConversationInputResult()
+            return ConversationInputHandled()
         if self.app.composer.has_completions and keybindings.matches(
             event.key,
             "tui.input.submit",
         ):
             return self._submit_selected_completion()
-        if self.app.composer.has_completions and self._route_completion_key(
-            event,
-            keybindings,
+        if self.app.composer.has_completions and route_prompt_completion_key(
+            self._composer_target,
+            event.key,
+            keybindings=keybindings,
         ):
-            return ConversationInputResult()
+            return ConversationInputHandled()
         if keybindings.matches(event.key, "tui.select.cancel"):
             return self._abort_or_clear()
-        if keybindings.matches(event.key, "tui.input.tab"):
-            self.app.composer.refresh_completions(force=True, explicit=True)
-            if self.app.composer.has_completions:
-                self.app.composer.apply_selected_completion()
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "app.clipboard.pasteImage"):
+        if route_prompt_explicit_completion_key(
+            self._composer_target,
+            event.key,
+            keybindings=keybindings,
+        ):
+            return ConversationInputHandled()
+        if keybindings.matches(event.key, CONVERSATION_PASTE_IMAGE_ACTION):
             return self._paste_clipboard_image()
-        if keybindings.matches(event.key, "tui.editor.jumpForward"):
-            self._jump_mode = "forward"
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.editor.jumpBackward"):
-            self._jump_mode = "backward"
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.editor.cursorUp"):
-            if self.app.composer.browsing_history:
-                self.app.composer.history_previous()
-            elif (
-                not self.app.composer.value
-                or not self.app.composer.move_visual_up(width=self.width)
-            ):
-                self.app.composer.history_previous()
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.editor.cursorDown"):
-            if self.app.composer.browsing_history:
-                self.app.composer.history_next()
-            elif (
-                not self.app.composer.value
-                or not self.app.composer.move_visual_down(width=self.width)
-            ):
-                self.app.composer.history_next()
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.editor.pageUp"):
-            self.app.composer.move_visual_page_up(
-                width=self.width,
-                visible_lines=self._composer_page_lines(),
-            )
-            return ConversationInputResult()
-        if keybindings.matches(event.key, "tui.editor.pageDown"):
-            self.app.composer.move_visual_page_down(
-                width=self.width,
-                visible_lines=self._composer_page_lines(),
-            )
-            return ConversationInputResult()
-        if self.app.state.running and event.key in self.follow_up_keys:
+        if jump_direction is not None:
+            self._jump_mode = jump_direction
+            return ConversationInputHandled()
+        if route_prompt_vertical_navigation_key(
+            self._composer_target,
+            event.key,
+            keybindings=keybindings,
+            width=self.width,
+            height=self.height,
+        ):
+            return ConversationInputHandled()
+        if self.app.state.running and keybindings.matches(
+            event.key, CONVERSATION_FOLLOW_UP_ACTION
+        ):
             return self._submit_running(mode="follow_up")
         if keybindings.matches(event.key, "tui.input.newLine"):
             self.app.composer.insert_newline()
-            return ConversationInputResult()
+            return ConversationInputHandled()
         if keybindings.matches(event.key, "tui.input.submit"):
             return self._submit()
         if route_editor_editing_key(
@@ -284,19 +518,8 @@ class ConversationInputRouter:
             event.key,
             keybindings=keybindings,
         ):
-            return ConversationInputResult()
-        return ConversationInputResult(render_requested=False)
-
-    def _route_completion_key(
-        self,
-        event: InputEvent,
-        keybindings: KeybindingManager,
-    ) -> bool:
-        return route_prompt_completion_key(
-            self._composer_target,
-            event.key,
-            keybindings=keybindings,
-        )
+            return ConversationInputHandled()
+        return ConversationInputIgnored()
 
     def _submit_selected_completion(self) -> ConversationInputResult:
         should_submit_after_completion = self.app.composer.value.lstrip().startswith(
@@ -305,19 +528,21 @@ class ConversationInputRouter:
         self.app.composer.apply_selected_completion()
         if should_submit_after_completion:
             return self._submit()
-        return ConversationInputResult()
+        return ConversationInputHandled()
 
     def _abort_or_clear(self) -> ConversationInputResult:
         if self.app.state.running:
-            return ConversationInputResult(abort_requested=True)
+            return ConversationAbortResult()
+        if self.submission_presentation == "deferred":
+            return ConversationInputIgnored()
         if self.app.state.pending_steers:
             pending_steer = self.app.state.pending_steers.pop(0)
-            return ConversationInputResult(steer_text=pending_steer)
+            return ConversationSteerResult(text=pending_steer)
         if self.app.composer.value:
             self.app.composer.clear()
             self._clear_prompt_attachments()
-            return ConversationInputResult()
-        return ConversationInputResult(render_requested=False)
+            return ConversationInputHandled()
+        return ConversationInputIgnored()
 
     def _restore_queued_messages(self) -> None:
         text = self.app.state.restore_queued_to_text()
@@ -325,25 +550,40 @@ class ConversationInputRouter:
             self.app.composer.set_text(text)
 
     def _submit(self) -> ConversationInputResult:
+        if self._submission_paused:
+            text = self.app.composer.value
+            self._submission_deferred = (
+                (text, self.draft_store.select_for_text(text)) if text.strip() else None
+            )
+            return ConversationInputIgnored()
+        self._check_deferred_attachments()
         text = self.app.composer.value
         if not text.strip():
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
         if self.should_exit(text.strip()):
-            self.app.composer.clear()
-            self._clear_prompt_attachments()
-            return ConversationInputResult(exit_code=0)
+            if self.submission_presentation == "optimistic":
+                self.app.composer.clear()
+                self._clear_prompt_attachments()
+            return ConversationExitResult(exit_code=0)
         if self.is_local_command(text.strip()):
-            self.app.composer.clear()
-            self._clear_prompt_attachments()
-            return ConversationInputResult(local_text=text.strip())
+            if self.submission_presentation == "optimistic":
+                self.app.composer.clear()
+                self._clear_prompt_attachments()
+            return ConversationLocalResult(text=text.strip())
         if self.app.state.running:
-            return self._submit_running(mode=self.running_submit_mode)
-        attachments = self._prompt_attachments_for_text(text)
+            mode = self.policy.resolve_running_submit(self.app.state.input_capabilities)
+            return (
+                ConversationInputIgnored()
+                if mode is None
+                else self._submit_running(mode=mode)
+            )
+        if self.submission_presentation == "deferred":
+            return ConversationPromptResult(text=text)
+        attachments = self._take_prompt_attachments_for_text(text)
         self.app.start_prompt(text)
-        self._clear_prompt_attachments()
-        return ConversationInputResult(
-            prompt_text=text,
-            prompt_attachments=attachments,
+        return ConversationPromptResult(
+            text=text,
+            attachments=attachments,
         )
 
     def _submit_running(
@@ -351,23 +591,33 @@ class ConversationInputRouter:
         *,
         mode: RunningSubmitMode,
     ) -> ConversationInputResult:
+        if self._submission_paused:
+            return ConversationInputIgnored()
+        self._check_deferred_attachments()
+        if not self.app.state.input_capabilities.supports(mode):
+            return ConversationInputIgnored()
         text = self.app.composer.value
         if not text.strip():
-            return ConversationInputResult(render_requested=False)
-        attachments = self._prompt_attachments_for_text(text)
+            return ConversationInputIgnored()
+        if self.submission_presentation == "deferred":
+            return (
+                ConversationFollowupResult(text=text)
+                if mode == "follow_up"
+                else ConversationSteerResult(text=text)
+            )
+        attachments = self._take_prompt_attachments_for_text(text)
         self.app.composer.add_history(text)
         self.app.composer.clear()
-        self._clear_prompt_attachments()
         if mode == "follow_up":
             self.app.queue_followup(text)
-            return ConversationInputResult(
-                followup_text=text,
-                followup_attachments=attachments,
+            return ConversationFollowupResult(
+                text=text,
+                attachments=attachments,
             )
         self.app.queue_steer(text)
-        return ConversationInputResult(
-            steer_text=text,
-            steer_attachments=attachments,
+        return ConversationSteerResult(
+            text=text,
+            attachments=attachments,
         )
 
     def _keybindings(self) -> KeybindingManager:
@@ -375,19 +625,18 @@ class ConversationInputRouter:
             return self.keybindings
         return KeybindingManager(self.keybindings)
 
-    def _composer_page_lines(self) -> int:
-        return max(2, min(10, self.height))
-
     def _route_active_surface(self, event: InputEvent) -> ConversationInputResult:
         handler = getattr(self.app.active_surface, "handle_input", None)
         if not callable(handler):
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
         intent = handler(event)
         if isinstance(intent, InputIntent):
+            if intent.kind == "copy_text":
+                return ConversationCopyTextResult(intent.text)
             if intent.kind == "consumed":
-                return ConversationInputResult()
-            return ConversationInputResult(surface_intent=intent)
-        return ConversationInputResult()
+                return ConversationInputHandled()
+            return ConversationSurfaceResult(intent=intent)
+        return ConversationInputHandled()
 
     def _runtime_surface_active(self) -> bool:
         surface_host = self.app.surface_host
@@ -399,32 +648,48 @@ class ConversationInputRouter:
     ) -> ConversationInputResult:
         surface_host = self.app.surface_host
         if surface_host is None:
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
         intents = surface_host.route_input(
             event,
             close_on_intents=("surface_close", "dialog_cancel"),
         )
         for intent in intents:
             if isinstance(intent, InputIntent):
+                if intent.kind == "copy_text":
+                    return ConversationCopyTextResult(intent.text)
                 if intent.kind == "consumed":
-                    return ConversationInputResult()
-                return ConversationInputResult(surface_intent=intent)
-        return ConversationInputResult()
+                    return ConversationInputHandled()
+                return ConversationSurfaceResult(intent=intent)
+        return ConversationInputHandled()
 
     def _paste_clipboard_image(self) -> ConversationInputResult:
+        self._check_deferred_attachments()
         if self.prompt_image_stager is None:
-            return ConversationInputResult(render_requested=False)
+            return ConversationInputIgnored()
         outcome = self.prompt_image_stager()
         attachment = outcome.attachment
         if outcome.kind != "attached":
             self._present_clipboard_outcome(outcome)
-            return ConversationInputResult(clipboard_outcome=outcome)
+            return ConversationClipboardResult(outcome=outcome)
         if attachment is None:
             raise RuntimeError("attached clipboard outcome requires an attachment")
-        self.app.composer.paste(f"{attachment.marker} ")
-        self._pending_prompt_images.add(attachment)
+        try:
+            self.draft_store.add(attachment)
+        except DraftStoreQuotaExceeded as error:
+            quota_outcome = PromptImageAttachmentOutcome(
+                kind="quota_exceeded",
+                mime_type=attachment.mime_type,
+                error_message=str(error),
+            )
+            self._present_clipboard_outcome(quota_outcome)
+            return ConversationClipboardResult(outcome=quota_outcome)
+        try:
+            self.app.composer.paste(f"{attachment.marker} ")
+        except BaseException:
+            self.draft_store.discard(attachment)
+            raise
         self._present_clipboard_outcome(outcome)
-        return ConversationInputResult(clipboard_outcome=outcome)
+        return ConversationClipboardResult(outcome=outcome)
 
     def _present_clipboard_outcome(
         self,
@@ -433,19 +698,30 @@ class ConversationInputRouter:
         if self.clipboard_outcome_presenter is not None:
             self.clipboard_outcome_presenter(outcome)
 
-    def _prompt_attachments_for_text(
+    def _take_prompt_attachments_for_text(
         self,
         text: str,
     ) -> tuple[PromptImageAttachment, ...] | None:
-        attachments = self._pending_prompt_images.select_for_text(text)
+        attachments = self.draft_store.take_for_text(text)
         return attachments or None
 
     def _clear_prompt_attachments(self) -> None:
-        self._pending_prompt_images.clear()
+        self.draft_store.clear()
+
+    def _check_deferred_attachments(self) -> None:
+        if self.submission_presentation == "deferred" and (
+            self.prompt_image_stager is not None or self.draft_store
+        ):
+            raise ValueError(
+                "deferred input requires an empty attachment store and no image stager"
+            )
 
 
 def bind_clipboard_image_input_router(
-    profile: ClipboardImageInputProfile,
+    profile: ClipboardImageInputProfile = STANDARD_CLIPBOARD_IMAGE_INPUT_PROFILE,
+    *,
+    policy: ConversationInputPolicy = DEFAULT_CONVERSATION_INPUT_POLICY,
+    runtime_scope: RuntimeScope | None = None,
 ) -> ClipboardImageInputRouterBuilder:
     """Bind app-aware staging and status presentation to a router builder.
 
@@ -454,13 +730,13 @@ def bind_clipboard_image_input_router(
     rebuilding the router.
     """
 
+    configured_runtime_scope = runtime_scope
+
     def build(
-        app: ClipboardImageConversationInputPort,
+        app: ConversationScreenInputPort,
         should_exit: Callable[[str], bool],
         is_local_command: Callable[[str], bool] = lambda _text: False,
         keybindings: KeybindingManager | KeybindingConfig | None = None,
-        running_submit_mode: RunningSubmitMode = "steer",
-        follow_up_keys: tuple[str, ...] = ("alt+enter",),
         width: int = 80,
         height: int = 12,
         clipboard_image_reader: ClipboardImageReader = read_clipboard_image,
@@ -468,41 +744,58 @@ def bind_clipboard_image_input_router(
         clipboard_image_name_factory: ClipboardImageNameFactory = (
             new_prompt_image_name_token
         ),
+        runtime_scope: RuntimeScope | None = None,
     ) -> ConversationInputRouter:
+        scope = runtime_scope or configured_runtime_scope
+        scope_required = (
+            profile.runtime_storage is not None and clipboard_image_dir is None
+        )
         router: ConversationInputRouter
 
-        def current_app() -> ClipboardImageConversationInputPort:
-            return cast(ClipboardImageConversationInputPort, router.app)
+        def current_app() -> ConversationScreenInputPort:
+            return router.app
 
         def stage_image() -> PromptImageAttachmentOutcome:
             bound_app = current_app()
+            explicit_display_root = profile.explicit_directory_display_root
+            if scope_required and scope is None:
+                return PromptImageAttachmentOutcome(
+                    kind="write_error",
+                    error_message="runtime scope is not bound",
+                )
             return stage_clipboard_image(
                 clipboard_image_reader,
                 directory=(
                     clipboard_image_dir
                     if clipboard_image_dir is not None
-                    else profile.directory(bound_app)
+                    else profile.directory_for(bound_app, scope)
                 ),
-                display_root=profile.display_root(bound_app),
+                display_root=(
+                    explicit_display_root(bound_app)
+                    if clipboard_image_dir is not None
+                    and explicit_display_root is not None
+                    else profile.display_root_for(bound_app, scope)
+                ),
                 name_factory=clipboard_image_name_factory,
+                max_bytes=profile.draft_policy.max_attachment_bytes,
             )
 
         def present_outcome(outcome: PromptImageAttachmentOutcome) -> None:
             message = profile.status_copy.message(outcome)
             if message is not None:
-                current_app().set_status(message)
+                current_app().state.set_status(message)
 
         router = ConversationInputRouter(
             app=app,
             should_exit=should_exit,
             is_local_command=is_local_command,
             keybindings=keybindings,
-            running_submit_mode=running_submit_mode,
-            follow_up_keys=follow_up_keys,
+            policy=policy,
             width=width,
             height=height,
             prompt_image_stager=stage_image,
             clipboard_outcome_presenter=present_outcome,
+            draft_store=DraftStore(policy=profile.draft_policy),
         )
         return router
 
@@ -510,14 +803,27 @@ def bind_clipboard_image_input_router(
 
 
 __all__ = [
-    "ClipboardImageConversationInputPort",
     "ClipboardImageInputProfile",
     "ClipboardImageInputRouterBuilder",
     "ClipboardImageStatusCopy",
     "ClipboardOutcomePresenter",
+    "ConversationAbortResult",
+    "ConversationClipboardResult",
+    "ConversationCopyTextResult",
+    "ConversationExitResult",
+    "ConversationFollowupResult",
+    "ConversationInputHandled",
+    "ConversationInputIgnored",
     "ConversationInputResult",
     "ConversationInputRouter",
+    "ConversationInputRouterFactoryPort",
+    "ConversationInputRouterPort",
+    "ConversationInputPolicy",
+    "ConversationLocalResult",
+    "ConversationPromptResult",
     "ConversationScreenInputPort",
+    "ConversationSteerResult",
+    "ConversationSurfaceResult",
     "PromptImageAttachmentStager",
     "RunningSubmitMode",
     "bind_clipboard_image_input_router",

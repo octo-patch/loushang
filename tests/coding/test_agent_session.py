@@ -5,7 +5,12 @@ import inspect
 import json
 from dataclasses import replace
 from datetime import date
+from types import SimpleNamespace
+from typing import Any, cast
 
+import pytest
+
+from loushang.ai.errors import UnsupportedCapabilityError
 from loushang.ai.event_stream.stream import AssistantMessageEventStream
 from loushang.ai.model import (
     Capabilities,
@@ -14,7 +19,15 @@ from loushang.ai.model import (
     Provider,
 )
 from loushang.ai.model.registry import ModelRegistry as AiModelRegistry
-from loushang.ai.types import AssistantMessage, TextPart, ToolCall, Usage, UserMessage
+from loushang.ai.types import (
+    AssistantMessage,
+    ImagePart,
+    TextPart,
+    ToolCall,
+    Usage,
+    UserMessage,
+)
+from loushang.harness.tools.workspace import direct_tool
 
 
 def _ai_model_registry(
@@ -61,7 +74,6 @@ def _user_message(text: str) -> UserMessage:
 
 def test_agent_session_restores_persisted_context_on_init(tmp_path) -> None:
     from loushang.agent import Agent
-    from loushang.coding import AgentSession as PublicAgentSession
     from loushang.coding.session import AgentSession
     from loushang.coding.session_manager import SessionManager
 
@@ -81,7 +93,6 @@ def test_agent_session_restores_persisted_context_on_init(tmp_path) -> None:
     agent = Agent()
     session = AgentSession(agent=agent, session_manager=manager)
 
-    assert PublicAgentSession is AgentSession
     assert [getattr(message, "role", None) for message in agent.state.messages] == [
         "user"
     ]
@@ -89,6 +100,73 @@ def test_agent_session_restores_persisted_context_on_init(tmp_path) -> None:
         getattr(message, "role", None)
         for message in session.get_session_context().messages
     ] == ["user"]
+
+
+def test_worker_session_binding_still_rejects_unselected_inputs(tmp_path) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
+    )
+    try:
+        with pytest.raises(
+            ValueError, match="Coding Product Worker ordinary Session changed"
+        ):
+            AgentSession(
+                agent=Agent(),
+                session_manager=manager,
+                coding_product_worker_ordinary_binding=cast(Any, object()),
+            )
+    finally:
+        asyncio.run(manager.dispose_runtime_profile())
+
+
+def test_product_capability_route_rejects_unselected_runtime_package(tmp_path) -> None:
+    from loushang.agent import Agent
+    from loushang.coding._capability_plugin_composition import (
+        CodingCapabilityPluginCompositionAssembly,
+    )
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.package_product.product_runtime import (
+        PackageProductRuntimeBindingV1,
+    )
+    from loushang.harness.resources.plugins import PluginRuntimeResolution
+
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
+    )
+    assembly = object.__new__(CodingCapabilityPluginCompositionAssembly)
+    assembly.runtime = cast(
+        PluginRuntimeResolution,
+        SimpleNamespace(
+            packages=(
+                SimpleNamespace(
+                    manifest=SimpleNamespace(name="unselected.package"),
+                    content_digest="0" * 64,
+                ),
+            )
+        ),
+    )
+    owner = SimpleNamespace(binding_id="product-graph", activate=lambda: None)
+    runtime_binding = PackageProductRuntimeBindingV1(
+        product_id="coding",
+        lifecycle=cast(Any, owner),
+        inventory=cast(Any, owner),
+        mode="enforced",
+    )
+    try:
+        with pytest.raises(ValueError, match="Coding Product Session packages changed"):
+            AgentSession(
+                agent=Agent(),
+                session_manager=manager,
+                coding_capability_plugin_assembly=assembly,
+                coding_base_product_runtime_binding=runtime_binding,
+            )
+    finally:
+        asyncio.run(manager.dispose_runtime_profile())
 
 
 def _usage() -> Usage:
@@ -104,6 +182,7 @@ def _usage() -> Usage:
 
 def _assistant_text_message(text: str) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text=text)],
         api="anthropic-messages",
@@ -348,6 +427,7 @@ def test_agent_session_abort_mid_stream_cleans_run_state_and_keeps_queued_messag
                 {
                     "type": "error",
                     "error": AssistantMessage(
+                        endpoint="test-endpoint",
                         role="assistant",
                         content=[TextPart(type="text", text="")],
                         api="anthropic-messages",
@@ -390,6 +470,140 @@ def test_agent_session_abort_mid_stream_cleans_run_state_and_keeps_queued_messag
     assert session.agent.has_queued_messages() is True
     assert "agent_end" in event_types
     assert event_types[-1] == "agent_end"
+
+
+def test_persisted_session_abort_tool_then_prompt_and_resume_keeps_revision_chain(
+    tmp_path,
+) -> None:
+    from loushang.agent import Agent, synthetic_model_transport
+    from loushang.agent.types import AgentToolResult
+    from loushang.ai.types import ToolResultMessage
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.tools.core import ToolDefinition
+    from loushang.harness.tools.execution import direct_execution
+    from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
+
+    tool_started = asyncio.Event()
+    release_tool = asyncio.Event()
+
+    async def execute_blocking(tool_call_id, params, signal=None, on_update=None):
+        del tool_call_id, params, signal, on_update
+        tool_started.set()
+        await release_tool.wait()
+        return AgentToolResult(content=[TextPart(type="text", text="unreachable")])
+
+    registry = WorkspaceToolRegistry()
+    registry.register_tool(
+        ToolDefinition(
+            name="blocking",
+            description="Block until the run is aborted",
+            parameters={"type": "object", "properties": {}},
+            label="Blocking",
+            execution=direct_execution(execute_blocking),
+            execution_mode="sequential",
+        )
+    )
+
+    @synthetic_model_transport
+    async def stream_fn(model, context, options=None):
+        del model, options
+        last = context.messages[-1]
+        text = last.content[0].text if isinstance(last, UserMessage) else ""
+        if text == "use tool":
+            return _stream_with_assistant_message(
+                AssistantMessage(
+                    endpoint="test-endpoint",
+                    role="assistant",
+                    content=[
+                        ToolCall(
+                            type="toolCall",
+                            id="tool-1",
+                            name="blocking",
+                            arguments={},
+                        )
+                    ],
+                    api="anthropic-messages",
+                    provider="faux",
+                    model="faux-model",
+                    response_id=None,
+                    usage=_usage(),
+                    stop_reason="toolUse",
+                    error_message=None,
+                    timestamp=0.0,
+                )
+            )
+        return _stream_with_final_message(_assistant_text_message(f"ok:{text}"))
+
+    async def scenario() -> None:
+        manager = await SessionManager.new(
+            session_dir=tmp_path,
+            cwd="/tmp/project",
+            persist=True,
+        )
+        session = AgentSession(
+            agent=Agent(
+                stream_fn=stream_fn,
+                initial_state={"model": _model()},
+                tool_execution="sequential",
+            ),
+            session_manager=manager,
+            tool_registry=registry,
+            active_tool_names=["blocking"],
+        )
+
+        prompt_task = asyncio.create_task(session.prompt("use tool"))
+        await asyncio.wait_for(tool_started.wait(), timeout=2)
+        session.abort()
+        _done, pending = await asyncio.wait({prompt_task}, timeout=2)
+        if pending:
+            stacks = [frame.f_code.co_name for frame in prompt_task.get_stack()]
+            release_tool.set()
+            await prompt_task
+            raise AssertionError(f"abort did not settle prompt; stack={stacks}")
+        await prompt_task
+        await asyncio.wait_for(session.prompt("next"), timeout=2)
+
+        first_messages = session.get_session_context().messages
+        tool_results = [
+            message
+            for message in first_messages
+            if isinstance(message, ToolResultMessage)
+        ]
+        assert len(tool_results) == 1
+        assert tool_results[0].tool_call_id == "tool-1"
+        assert tool_results[0].details == {"code": "tool_call_aborted"}
+        assert (
+            sum(
+                isinstance(message, AssistantMessage)
+                and message.stop_reason == "aborted"
+                for message in first_messages
+            )
+            == 1
+        )
+        first_revision = len(manager.get_entries())
+        assert first_revision == len(first_messages)
+        assert manager.session_file is not None
+
+        resumed_manager = await asyncio.wait_for(
+            SessionManager.load(manager.session_file, persist=True),
+            timeout=2,
+        )
+        resumed = AgentSession(
+            agent=Agent(
+                stream_fn=stream_fn,
+                initial_state={"model": _model()},
+            ),
+            session_manager=resumed_manager,
+        )
+        await asyncio.wait_for(resumed.prompt("after resume"), timeout=2)
+
+        assert len(resumed_manager.get_entries()) == first_revision + 2
+        assert resumed.get_session_context().messages[-1].content[0].text == (
+            "ok:after resume"
+        )
+
+    asyncio.run(scenario())
 
 
 def test_agent_session_prompt_reports_preflight_before_stream_finishes(
@@ -849,17 +1063,17 @@ def test_agent_session_forwards_agent_lifecycle_events_to_extensions(tmp_path) -
             timestamp=0.0,
         )
 
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {"type": "agent_start"}, session.agent.signal
         )
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {"type": "turn_start"}, session.agent.signal
         )
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {"type": "turn_end", "message": assistant, "tool_results": [tool_result]},
             session.agent.signal,
         )
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {"type": "agent_end", "messages": [assistant]}, session.agent.signal
         )
 
@@ -929,10 +1143,10 @@ def test_agent_session_forwards_message_and_tool_execution_events_to_extensions(
             content=[TextPart(type="text", text="ok")], details={}
         )
 
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {"type": "message_start", "message": assistant}, session.agent.signal
         )
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {
                 "type": "tool_execution_end",
                 "tool_call_id": "tc1",
@@ -970,7 +1184,7 @@ def test_agent_session_records_tool_execution_error_diagnostic_with_correlation(
             agent=Agent(), session_manager=manager, diagnostics_service=diagnostics
         )
 
-        await session._session_runtime.handle_agent_event(
+        await session._composition.session_runtime.handle_agent_event(
             {
                 "type": "tool_execution_end",
                 "tool_call_id": "tc1",
@@ -1083,31 +1297,39 @@ def test_agent_session_extension_hook_ordering_spans_provider_tool_and_agent_end
         InputEventResult,
         LoadedExtension,
     )
-
-    class FinishingTool:
-        name = "finish"
-        description = "Finish the run"
-        parameters = {"type": "object", "properties": {}}
-        label = "Finish"
-        prepare_arguments = None
-        execution_mode = "sequential"
-
-        async def execute(self, tool_call_id, params, signal=None, on_update=None):
-            del tool_call_id, params, signal, on_update
-            order.append("tool_execute")
-            return AgentToolResult(
-                content=[TextPart(type="text", text="finished")],
-                details={"ok": True},
-                terminate=True,
-            )
+    from loushang.harness.tools.core import ToolDefinition
+    from loushang.harness.tools.execution import direct_execution
+    from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 
     order: list[str] = []
+
+    async def execute_finish(tool_call_id, params, signal=None, on_update=None):
+        del tool_call_id, params, signal, on_update
+        order.append("tool_execute")
+        return AgentToolResult(
+            content=[TextPart(type="text", text="finished")],
+            details={"ok": True},
+            terminate=True,
+        )
+
+    registry = WorkspaceToolRegistry()
+    registry.register_tool(
+        ToolDefinition(
+            name="finish",
+            description="Finish the run",
+            parameters={"type": "object", "properties": {}},
+            label="Finish",
+            execution=direct_execution(execute_finish),
+            execution_mode="sequential",
+        )
+    )
 
     async def stream_fn(model, context, options=None):
         del model, context
         assert options is not None
         return _stream_with_assistant_message(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     ToolCall(
@@ -1157,7 +1379,7 @@ def test_agent_session_extension_hook_ordering_spans_provider_tool_and_agent_end
                     "system_prompt": "Base system prompt",
                     "model": _model(),
                     "thinking_level": "off",
-                    "tools": [FinishingTool()],
+                    "tools": [],
                 },
             ),
             session_manager=await SessionManager.new(
@@ -1178,6 +1400,8 @@ def test_agent_session_extension_hook_ordering_spans_provider_tool_and_agent_end
                     )
                 ]
             ),
+            tool_registry=registry,
+            active_tool_names=["finish"],
         )
 
         await session.prompt("hello")
@@ -2381,7 +2605,7 @@ def test_agent_session_removes_visible_queue_when_queued_user_message_starts(
     session.steer("queued")
 
     asyncio.run(
-        session._session_runtime.handle_agent_event(
+        session._composition.session_runtime.handle_agent_event(
             {
                 "type": "message_start",
                 "message": UserMessage(
@@ -2412,9 +2636,9 @@ def test_agent_session_follow_up_and_state_snapshot(tmp_path) -> None:
     session = AgentSession(agent=agent, session_manager=manager)
 
     session.follow_up("later")
-    session._retry_runtime.retry_future = object()  # type: ignore[assignment]
+    session._composition.retry_runtime.retry_future = object()  # type: ignore[assignment]
     state = session.get_state()
-    session._retry_runtime.retry_future = None
+    session._composition.retry_runtime.retry_future = None
 
     assert state.run == RunState(status="idle")
     assert state.follow_up == ["later"]
@@ -2456,7 +2680,7 @@ def test_agent_session_set_model_and_thinking_level_persist_to_store(tmp_path) -
     asyncio.run(session.set_thinking_level("high"))
 
     assert session.get_model_selection() == ModelSelection(
-        provider="alt", model_id="alt-model"
+        endpoint_id="responses", provider="alt", model_id="alt-model"
     )
     assert session.get_state().thinking_level == "high"
     assert [entry.kind for entry in manager.get_entries()] == [
@@ -2465,8 +2689,143 @@ def test_agent_session_set_model_and_thinking_level_persist_to_store(tmp_path) -
     ]
     assert session.get_session_context().model == {
         "provider": "alt",
+        "endpoint_id": "responses",
         "model_id": "alt-model",
     }
+
+
+def test_agent_session_rejects_text_only_model_for_image_history_before_commit(
+    tmp_path,
+) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+
+    image_model = Model(
+        id="image-model",
+        name="Image",
+        provider="image-provider",
+        endpoint="responses",
+        capabilities=Capabilities(
+            input=("text", "image"),
+            context_window=64_000,
+            max_tokens=2_048,
+        ),
+    )
+    text_model = Model(
+        id="text-model",
+        name="Text",
+        provider="text-provider",
+        endpoint="responses",
+        capabilities=Capabilities(
+            input=("text",),
+            context_window=64_000,
+            max_tokens=2_048,
+        ),
+    )
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+    )
+    asyncio.run(
+        manager.append_message(
+            UserMessage(
+                role="user",
+                content=[
+                    ImagePart(
+                        type="image",
+                        data="aGVsbG8=",
+                        mime_type="image/png",
+                    )
+                ],
+                timestamp=0.0,
+            )
+        )
+    )
+    session = AgentSession(
+        agent=Agent(
+            initial_state={
+                "system_prompt": "",
+                "model": image_model,
+                "thinking_level": "off",
+            }
+        ),
+        session_manager=manager,
+    )
+    entries_before = list(manager.get_entries())
+
+    with pytest.raises(
+        UnsupportedCapabilityError, match="does not support image input"
+    ):
+        asyncio.run(session.set_model(text_model))
+
+    assert session.agent.model == image_model
+    assert manager.get_entries() == entries_before
+
+
+def test_agent_session_serializes_model_selection_after_active_prompt(tmp_path) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stream_fn(model, context, options=None):
+        del model, context, options
+        started.set()
+        await release.wait()
+        return _stream_with_final_message(_assistant_text_message("done"))
+
+    first = _model()
+    second = Model(
+        id="alt-model",
+        name="Alt",
+        provider="alt",
+        endpoint="responses",
+        capabilities=Capabilities(
+            input=("text",),
+            context_window=64_000,
+            max_tokens=2_048,
+        ),
+    )
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+    )
+
+    async def scenario() -> None:
+        agent = Agent(
+            stream_fn=stream_fn,
+            initial_state={
+                "system_prompt": "",
+                "model": first,
+                "thinking_level": "off",
+            },
+        )
+        session = AgentSession(agent=agent, session_manager=manager)
+        prompt_task = asyncio.create_task(session.prompt("hi"))
+        await started.wait()
+
+        selection_task = asyncio.create_task(session.set_model(second))
+        await asyncio.sleep(0)
+
+        assert selection_task.done() is False
+        assert agent.model == first
+        assert not any(
+            entry.kind == "agent.model_selection" for entry in manager.get_entries()
+        )
+
+        release.set()
+        await prompt_task
+        await selection_task
+
+        assert agent.model == second
+        assert [
+            entry.kind
+            for entry in manager.get_entries()
+            if entry.kind == "agent.model_selection"
+        ] == ["agent.model_selection"]
+
+    asyncio.run(scenario())
 
 
 def test_agent_session_persists_explicit_model_selection_endpoint(tmp_path) -> None:
@@ -2547,10 +2906,10 @@ def test_agent_session_cycles_model_and_thinking_level(tmp_path) -> None:
     )
 
     assert asyncio.run(session.cycle_model()) == ModelSelection(
-        provider="alt", model_id="alt-model"
+        endpoint_id="responses", provider="alt", model_id="alt-model"
     )
     assert session.get_model_selection() == ModelSelection(
-        provider="alt", model_id="alt-model"
+        endpoint_id="responses", provider="alt", model_id="alt-model"
     )
     assert asyncio.run(session.cycle_thinking_level()) == "medium"
     assert session.get_state().thinking_level == "medium"
@@ -2608,7 +2967,7 @@ def test_agent_session_emits_model_select_event_for_async_model_control(
 
     asyncio.run(session.set_model(second))
     assert asyncio.run(session.cycle_model("backward")) == ModelSelection(
-        provider="faux", model_id="faux-model"
+        endpoint_id="anthropic-messages", provider="faux", model_id="faux-model"
     )
 
     assert seen == [
@@ -2649,14 +3008,14 @@ def test_agent_session_exposes_standard_model_and_session_mutators(tmp_path) -> 
 
     asyncio.run(session.set_model(second))
     assert session.get_model_selection() == ModelSelection(
-        provider="alt", model_id="alt-model"
+        endpoint_id="responses", provider="alt", model_id="alt-model"
     )
 
     assert asyncio.run(session.cycle_model("backward")) == ModelSelection(
-        provider="faux", model_id="faux-model"
+        endpoint_id="anthropic-messages", provider="faux", model_id="faux-model"
     )
     assert session.get_model_selection() == ModelSelection(
-        provider="faux", model_id="faux-model"
+        endpoint_id="anthropic-messages", provider="faux", model_id="faux-model"
     )
 
     asyncio.run(session.set_thinking_level("high"))
@@ -2929,7 +3288,11 @@ def test_agent_session_exposes_standard_scoped_models_and_resources(tmp_path) ->
         [
             {"model": first, "thinkingLevel": "low"},
             {
-                "model": {"provider": "alt", "model_id": "alt-model"},
+                "model": {
+                    "provider": "alt",
+                    "endpoint_id": "responses",
+                    "model_id": "alt-model",
+                },
                 "thinkingLevel": "high",
             },
         ]
@@ -2937,7 +3300,7 @@ def test_agent_session_exposes_standard_scoped_models_and_resources(tmp_path) ->
 
     assert session.scoped_models[0]["model"] is first
     assert asyncio.run(session.cycle_model()) == ModelSelection(
-        provider="alt", model_id="alt-model"
+        endpoint_id="responses", provider="alt", model_id="alt-model"
     )
     assert session.thinking_level == "high"
     assert session.resource_loader is loader
@@ -3377,7 +3740,7 @@ def test_agent_session_disposal_closes_approval_before_waiting_for_host(
             )
 
         active_run = asyncio.create_task(
-            session._session_runtime.host_runtime.run(wait_for_approval)
+            session._composition.session_runtime.host_runtime.run(wait_for_approval)
         )
         await presented.wait()
         await asyncio.wait_for(getattr(session, dispose_method)(), timeout=0.2)
@@ -3498,6 +3861,167 @@ def test_agent_session_presenter_rebind_reopens_active_approval_generation(
     asyncio.run(run())
 
 
+async def _approval_interaction_session(tmp_path):
+    from loushang.agent import Agent
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.approval import (
+        HeadlessApprovalResolver,
+        InteractiveApprovalResolver,
+    )
+
+    resolver = InteractiveApprovalResolver(
+        fallback=HeadlessApprovalResolver(mode="deny")
+    )
+    session = AgentSession(
+        agent=Agent(
+            initial_state={
+                "system_prompt": "",
+                "model": _model(),
+                "thinking_level": "off",
+            }
+        ),
+        session_manager=await SessionManager.new(
+            session_dir=tmp_path,
+            cwd="/tmp/project",
+            persist=False,
+        ),
+        approval_resolver=resolver,
+    )
+    interaction = session.approval_interaction
+    assert interaction is not None
+    return session, resolver, interaction
+
+
+def test_agent_session_approval_presenter_replacement_replays_pending(
+    tmp_path,
+) -> None:
+    from loushang.harness.approval import ApprovalRequest
+
+    async def run() -> None:
+        session, resolver, interaction = await _approval_interaction_session(tmp_path)
+        first_presented = asyncio.Event()
+        first_payloads: list[dict[str, object]] = []
+
+        def present_first(payload: dict[str, object]) -> None:
+            first_payloads.append(payload)
+            first_presented.set()
+
+        interaction.bind_presenter(present_first)
+        pending = asyncio.create_task(
+            resolver.resolve(
+                ApprovalRequest(
+                    tool_name="write",
+                    arguments={},
+                    action_id="replace-presenter",
+                )
+            )
+        )
+        await asyncio.wait_for(first_presented.wait(), timeout=0.5)
+
+        second_presented = asyncio.Event()
+        second_payloads: list[dict[str, object]] = []
+
+        def present_second(payload: dict[str, object]) -> None:
+            second_payloads.append(payload)
+            second_presented.set()
+
+        second = interaction.bind_presenter(present_second)
+        await asyncio.wait_for(second_presented.wait(), timeout=0.5)
+
+        assert not pending.done()
+        assert [payload["action_id"] for payload in first_payloads] == [
+            "replace-presenter"
+        ]
+        assert [payload["action_id"] for payload in second_payloads] == [
+            "replace-presenter"
+        ]
+        assert await interaction.respond(
+            "replace-presenter",
+            outcome="allow_once",
+        )
+        assert (await pending).disposition == "allow"
+        second.close()
+        await session.dispose()
+
+    asyncio.run(run())
+
+
+def test_agent_session_superseded_approval_lease_cannot_close_replacement(
+    tmp_path,
+) -> None:
+    from loushang.harness.approval import ApprovalRequest
+
+    async def run() -> None:
+        session, resolver, interaction = await _approval_interaction_session(tmp_path)
+        first_presented = asyncio.Event()
+        first = interaction.bind_presenter(lambda _payload: first_presented.set())
+        pending = asyncio.create_task(
+            resolver.resolve(
+                ApprovalRequest(
+                    tool_name="write",
+                    arguments={},
+                    action_id="superseded-lease",
+                )
+            )
+        )
+        await asyncio.wait_for(first_presented.wait(), timeout=0.5)
+
+        second_presented = asyncio.Event()
+        second = interaction.bind_presenter(lambda _payload: second_presented.set())
+        await asyncio.wait_for(second_presented.wait(), timeout=0.5)
+        first.close()
+
+        assert not pending.done()
+        pending_ids = [
+            item.permission_id for item in resolver.permissions_snapshot().pending
+        ]
+        assert pending_ids == ["superseded-lease"]
+        assert await interaction.respond(
+            "superseded-lease",
+            outcome="allow_once",
+        )
+        assert (await pending).disposition == "allow"
+        second.close()
+        await session.dispose()
+
+    asyncio.run(run())
+
+
+def test_agent_session_current_approval_lease_close_denies_pending(
+    tmp_path,
+) -> None:
+    from loushang.harness.approval import ApprovalRequest
+
+    async def run() -> None:
+        session, resolver, interaction = await _approval_interaction_session(tmp_path)
+        first_presented = asyncio.Event()
+        interaction.bind_presenter(lambda _payload: first_presented.set())
+        pending = asyncio.create_task(
+            resolver.resolve(
+                ApprovalRequest(
+                    tool_name="write",
+                    arguments={},
+                    action_id="current-lease-close",
+                )
+            )
+        )
+        await asyncio.wait_for(first_presented.wait(), timeout=0.5)
+
+        second_presented = asyncio.Event()
+        second = interaction.bind_presenter(lambda _payload: second_presented.set())
+        await asyncio.wait_for(second_presented.wait(), timeout=0.5)
+        second.close("Replacement presenter disconnected")
+
+        decision = await pending
+        assert decision.disposition == "deny"
+        assert decision.reason == "Replacement presenter disconnected"
+        assert resolver.permissions_snapshot().pending == ()
+        await session.dispose()
+
+    asyncio.run(run())
+
+
 def test_agent_session_disposal_finalizes_when_host_dispose_fails(tmp_path) -> None:
     import pytest
 
@@ -3535,7 +4059,7 @@ def test_agent_session_disposal_finalizes_when_host_dispose_fails(tmp_path) -> N
             ),
             approval_resolver=resolver,
         )
-        session._session_runtime._host_runtime = FailingHostRuntime()  # type: ignore[assignment]
+        session._composition.session_runtime._host_runtime = FailingHostRuntime()  # type: ignore[assignment]
         pending = asyncio.create_task(
             resolver.resolve(ApprovalRequest(tool_name="write", arguments={}))
         )
@@ -3951,6 +4475,7 @@ def test_agent_session_reload_extensions_refreshes_resources_before_session_star
         LoadedExtension,
     )
     from loushang.harness.resources.types import (
+        ExtensionDescriptor,
         PromptFragmentDescriptor,
         ResourceBundle,
     )
@@ -3974,10 +4499,31 @@ def test_agent_session_reload_extensions_refreshes_resources_before_session_star
             ]
         )
 
+    session_ref: list[AgentSession] = []
+
+    class _ReloadedExtension:
+        def session_start(self, event):
+            del event
+            seen.append(session_ref[0].agent.system_prompt.splitlines())
+
+        def resources_discover(self, event):
+            del event
+            return _resources_discover(None, None)
+
     class _ReloadingLoader(DefaultResourceLoader):
         def reload_resources(self, cwd):
             reload_calls.append(str(cwd))
-            return ResourceBundle(cwd=Path(cwd), prompt_fragments=["reloaded prompt"])
+            return ResourceBundle(
+                cwd=Path(cwd),
+                prompt_fragments=["reloaded prompt"],
+                extensions=[
+                    ExtensionDescriptor(
+                        name="demo",
+                        source_path=Path("/tmp/demo.py"),
+                        metadata={"extension": _ReloadedExtension()},
+                    )
+                ],
+            )
 
     manager = asyncio.run(
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
@@ -4005,6 +4551,7 @@ def test_agent_session_reload_extensions_refreshes_resources_before_session_star
         ),
         resource_loader=_ReloadingLoader(),
     )
+    session_ref.append(session)
 
     seen.clear()
     asyncio.run(session.reload_extension_runtime())
@@ -4056,8 +4603,8 @@ def test_agent_session_set_active_tools_emits_session_refresh(tmp_path) -> None:
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
     )
     registry = ToolRegistry()
-    registry.register_tool(read_file)
-    registry.register_tool(grep_file)
+    registry.register_tool(direct_tool(read_file))
+    registry.register_tool(direct_tool(grep_file))
     session = AgentSession(
         agent=Agent(
             initial_state={
@@ -4118,8 +4665,8 @@ def test_agent_session_refresh_does_not_reemit_session_start(tmp_path) -> None:
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
     )
     registry = ToolRegistry()
-    registry.register_tool(read_file)
-    registry.register_tool(grep_file)
+    registry.register_tool(direct_tool(read_file))
+    registry.register_tool(direct_tool(grep_file))
     session = AgentSession(
         agent=Agent(
             initial_state={
@@ -4455,8 +5002,8 @@ def test_extension_session_refresh_actions_do_not_recursively_emit_refresh(
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
     )
     registry = ToolRegistry()
-    registry.register_tool(read_file)
-    registry.register_tool(grep_file)
+    registry.register_tool(direct_tool(read_file))
+    registry.register_tool(direct_tool(grep_file))
     next_model = Model(
         id="next-model",
         name="Next",
@@ -4622,7 +5169,7 @@ def test_agent_session_resource_refresh_rebuilds_prompt_and_tools_without_emitti
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
     )
     registry = ToolRegistry()
-    registry.register_tool(read_file)
+    registry.register_tool(direct_tool(read_file))
     session = AgentSession(
         agent=Agent(
             initial_state={
@@ -4707,7 +5254,7 @@ def test_agent_session_records_reload_failures_as_diagnostics(tmp_path) -> None:
     assert records[0].type == "error"
 
 
-def test_agent_session_records_bind_failures_as_diagnostics(tmp_path) -> None:
+def test_agent_session_records_candidate_bind_failures_as_diagnostics(tmp_path) -> None:
     from pathlib import Path
 
     from loushang.agent import Agent
@@ -4727,17 +5274,22 @@ def test_agent_session_records_bind_failures_as_diagnostics(tmp_path) -> None:
         ResourceBundle,
     )
 
-    class _BrokenBindRunner(ExtensionRunner):
-        def __init__(self, extensions) -> None:
-            super().__init__(extensions)
-            self._bind_calls = 0
+    class _BrokenBindCandidate:
+        async def discover_resources_async(self, bundle, *, reason):
+            del reason
+            return bundle
 
-        def bind_runtime(self, bindings) -> None:
-            self._bind_calls += 1
-            if self._bind_calls == 1:
-                return super().bind_runtime(bindings)
+        async def activate(self, bindings) -> None:
             del bindings
             raise RuntimeError("bind boom")
+
+        async def rollback(self) -> None:
+            return None
+
+    class _BrokenBindRunner(ExtensionRunner):
+        def prepare_generation(self, extensions):
+            del extensions
+            return _BrokenBindCandidate()
 
     class _ReloadingLoader(DefaultResourceLoader):
         def reload_resources(self, cwd):
@@ -4787,7 +5339,7 @@ def test_agent_session_records_bind_failures_as_diagnostics(tmp_path) -> None:
     records = [
         record
         for record in session.get_last_diagnostics()
-        if record.code == "extension_runtime_bind_failed"
+        if record.code == "extension_resource_refresh_failed"
     ]
 
     assert len(records) == 1
@@ -4852,6 +5404,7 @@ def test_agent_session_exposes_context_usage_and_stats(tmp_path) -> None:
     asyncio.run(
         manager.append_message(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(type="text", text="reading"),
@@ -4921,6 +5474,8 @@ def test_agent_session_exposes_context_usage_and_stats(tmp_path) -> None:
             "cache_read": 5,
             "cache_write": 7,
             "total": 17,
+            "source": "legacy_derived",
+            "incomplete_attempts": True,
         },
         "cost": 0.25,
         "context_usage": None,
@@ -5126,8 +5681,11 @@ def test_agent_session_records_remote_package_manifest_diagnostics(tmp_path) -> 
 
     packages = session.get_packages()
 
-    assert packages[0]["manifestDiagnostics"][0]["code"] == "invalid_package_manifest"
-    records = diagnostics.get_diagnostics(code="invalid_package_manifest")
+    assert (
+        packages[0]["manifestDiagnostics"][0]["code"]
+        == "plugin_declaration_invalid_json"
+    )
+    records = diagnostics.get_diagnostics(code="plugin_declaration_invalid_json")
     assert len(records) == 1
     assert records[0].phase == "resource_loading"
     assert records[0].source == "package"
@@ -5279,7 +5837,9 @@ def test_agent_session_installs_and_uninstalls_package_with_settings(tmp_path) -
         record.target_path.mkdir(parents=True, exist_ok=True)
         return record.with_lifecycle("installed")
 
-    settings = SettingsManager(ControlConfig())
+    settings = SettingsManager(
+        ControlConfig(), project_settings_path=tmp_path / "settings.json"
+    )
     materializer = PackageMaterializer(
         install_root=tmp_path / "packages", backend=backend
     )
@@ -5324,7 +5884,9 @@ def test_agent_session_installs_and_uninstalls_local_package_with_settings(
 
     local_package = tmp_path / "local-pack"
     local_package.mkdir()
-    settings = SettingsManager(ControlConfig())
+    settings = SettingsManager(
+        ControlConfig(), project_settings_path=tmp_path / "settings.json"
+    )
     materializer = PackageMaterializer(install_root=tmp_path / "packages")
     session = AgentSession(
         agent=Agent(),
@@ -5427,7 +5989,10 @@ def test_agent_session_install_package_refreshes_resources_for_current_session(
         )
         return record.with_lifecycle("installed")
 
-    settings = SettingsManager(ControlConfig(system_prompt="Base"))
+    settings = SettingsManager(
+        ControlConfig(system_prompt="Base"),
+        project_settings_path=tmp_path / "settings.json",
+    )
     materializer = PackageMaterializer(
         install_root=tmp_path / "packages", backend=backend
     )
@@ -5474,7 +6039,9 @@ def test_agent_session_emits_package_progress_events(tmp_path) -> None:
         record.target_path.mkdir(parents=True, exist_ok=True)
         return record.with_lifecycle("installed")
 
-    settings = SettingsManager(ControlConfig())
+    settings = SettingsManager(
+        ControlConfig(), project_settings_path=tmp_path / "settings.json"
+    )
     materializer = PackageMaterializer(
         install_root=tmp_path / "packages", backend=backend
     )

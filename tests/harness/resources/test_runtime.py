@@ -26,13 +26,49 @@ from loushang.harness.resources.packages import (
     PackageSourceConfig,
     package_source_from_raw,
 )
-from loushang.harness.resources.plugins import PluginManager
+from loushang.harness.resources.plugins import (
+    InstalledPlugin,
+    PluginManifest,
+    PluginRegistry,
+    PluginSource,
+)
 
 
 class _AllowPackageSources:
     def evaluate_package_source(self, source: str | Path) -> PolicyDecision:
         del source
         return PolicyDecision.allow()
+
+
+def test_resource_registries_public_key_compatibility_baseline(tmp_path) -> None:
+    built_ins = BuiltInResourceRegistry()
+    first_package = BuiltInResourcePackage(name="shared", package="first.resources")
+    replacement_package = BuiltInResourcePackage(
+        name="shared",
+        package="replacement.resources",
+    )
+
+    assert built_ins.register(first_package) is first_package
+    assert built_ins.register(replacement_package) is replacement_package
+    assert built_ins.list_packages() == (replacement_package,)
+    assert built_ins.unregister("shared") is replacement_package
+    assert built_ins.unregister("shared") is None
+
+    plugins = PluginRegistry()
+    first_plugin = InstalledPlugin(
+        manifest=PluginManifest(name="shared", root=tmp_path / "first"),
+        source=PluginSource(path=tmp_path / "first"),
+    )
+    replacement_plugin = InstalledPlugin(
+        manifest=PluginManifest(name="shared", root=tmp_path / "replacement"),
+        source=PluginSource(path=tmp_path / "replacement"),
+    )
+
+    assert plugins.register(first_plugin) is first_plugin
+    assert plugins.register(replacement_plugin) is replacement_plugin
+    assert plugins.list_plugins() == [replacement_plugin]
+    assert plugins.unregister("shared") is replacement_plugin
+    assert plugins.unregister("shared") is None
 
 
 def test_platform_resource_layout_resolves_standard_roots(tmp_path) -> None:
@@ -170,6 +206,20 @@ def test_profiled_resource_loader_injects_product_conventions(tmp_path) -> None:
     )
 
 
+def test_resource_loader_treats_long_inline_prompt_as_text(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    prompt = "Read-only delegate policy. " * 40
+    loader = ResourceLoader(
+        user_resource_roots=(),
+        system_prompt=prompt,
+    )
+
+    loader.prepare_catalog_input_receipt(workspace)
+
+    assert loader.get_system_prompt_override() == prompt
+
+
 def test_package_materializer_requires_product_policy(tmp_path) -> None:
     source = "https://packages.example.invalid/review-pack.git"
     calls: list[str] = []
@@ -212,9 +262,7 @@ def test_package_materializer_accepts_injected_policy(tmp_path) -> None:
     assert materializer.materialize_remote_source_sync(source).lifecycle == "installed"
 
 
-def test_package_source_parser_and_plugin_registry_are_product_neutral(
-    tmp_path,
-) -> None:
+def test_package_source_parser_is_product_neutral() -> None:
     config = package_source_from_raw(
         {"source": "pypi:review-pack", "skills": ["review", "debug"]}
     )
@@ -222,11 +270,3 @@ def test_package_source_parser_and_plugin_registry_are_product_neutral(
         source="pypi:review-pack",
         skills=("review", "debug"),
     )
-
-    plugin_root = tmp_path / "review-pack"
-    plugin_root.mkdir()
-    manager = PluginManager()
-    plugin = manager.add_plugin_source(plugin_root)
-
-    assert plugin.manifest.name == "review-pack"
-    assert manager.resolve_package_roots() == (plugin_root.resolve(),)

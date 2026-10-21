@@ -1,0 +1,62 @@
+"""Product-neutral contracts for bounded local child execution."""
+
+from ._win32_process import observe_windows_worker_job_absent
+from .contracts import (
+    HOSTING_CONTRACT_VERSION,
+    ChildSessionHostingPort,
+    ChildSessionLease,
+    ChildSessionRequest,
+    HostByteEndpoint,
+    HostingComponent,
+    HostingLifecycleTransition,
+    HostingObservation,
+    HostingObservationSink,
+    LaunchPreparationLease,
+    LaunchPreparationPort,
+    ProcessExit,
+    ProcessHostingPort,
+    ProcessLaunchRequest,
+    ProcessLease,
+    ProcessStderrMode,
+    ProcessStderrTail,
+    ProcessStdinMode,
+    ProcessStdoutMode,
+    ProcessStreamSpec,
+)
+from .errors import (
+    HostingError,
+    HostingFailureCategory,
+    HostingStartSettledError,
+    InvalidHostingRequestError,
+)
+from .runtime import create_child_session_host, create_process_host
+
+__all__ = [
+    "HOSTING_CONTRACT_VERSION",
+    "ChildSessionHostingPort",
+    "ChildSessionLease",
+    "ChildSessionRequest",
+    "HostByteEndpoint",
+    "HostingComponent",
+    "HostingError",
+    "HostingFailureCategory",
+    "HostingStartSettledError",
+    "HostingLifecycleTransition",
+    "HostingObservation",
+    "HostingObservationSink",
+    "InvalidHostingRequestError",
+    "LaunchPreparationLease",
+    "LaunchPreparationPort",
+    "ProcessExit",
+    "ProcessHostingPort",
+    "ProcessLaunchRequest",
+    "ProcessLease",
+    "ProcessStderrMode",
+    "ProcessStderrTail",
+    "ProcessStdinMode",
+    "ProcessStdoutMode",
+    "ProcessStreamSpec",
+    "create_child_session_host",
+    "create_process_host",
+    "observe_windows_worker_job_absent",
+]

@@ -27,7 +27,12 @@ through three small values:
   do not provide a file path.
 - `AgentTranscriptRuntimeBinding` supplies one sealed
   `ConversationStore[ConversationHeader, AgentTranscriptRecord]`, its key,
-  transcript profile, opaque Product binding, and async disposer.
+  transcript profile, opaque Product binding, and async disposer. Standard
+  Profile-backed Products also supply the canonical Runtime Profile snapshot
+  and dynamic selected compaction port. Existing generic Product bindings may
+  omit those additive fields; AgentProduct adoption then freezes an explicit
+  legacy snapshot and the same default/custom compaction selection that the old
+  Session composition path used.
 - `AgentTranscriptLifecycleSession` returns the bound transcript, standard
   label indexes, and the Product binding for the duration of that session.
 
@@ -43,13 +48,20 @@ Product does not call it and may use a persistent context with no file path.
 ## Lifecycle Semantics
 
 `create()` with retained initial records persists them through the bound store.
-A persistent empty create is provisional: it binds the runtime and builds the
+A persistent empty create is provisional by default: it binds the runtime and builds the
 in-memory repository without calling `ConversationStore.create()`.
 Administrative records may be staged in that repository. The first user Agent
 message or application message atomically calls Store create with the header,
 all staged records, and the materializing message. Disposing a still
 provisional transcript only releases its binding, so no empty authority or
 index row exists to delete.
+
+An explicit `defer_materialization=False` instead creates even an empty
+transcript through the same Store. Products can therefore publish a durable
+identity before the first message without introducing a second authority.
+The lifecycle context canonicalizes parent directories while retaining its
+selected file leaf, leaving no-follow enforcement to the Store. Ordinary
+path discovery and explicitly bound-source restoration remain distinct.
 
 `restore()` loads an already materialized persistent store, while a
 non-persistent restore snapshots a current Conversation JSONL source into the
@@ -63,9 +75,15 @@ owns only Conversation JSONL file deletion and rejects a path that is the active
 transcript.
 
 If create or restore fails after a runtime binding has been acquired, Harness
-releases that binding before propagating the error. A returned lifecycle session
-releases its binding exactly once. Commit, queue, retry, compaction, and Product
-event presentation remain outside this lifecycle boundary.
+releases that binding before propagating the error. A returned standalone
+lifecycle session releases its root-owned binding exactly once. When an
+AgentProduct mounts `harness.session` v2, that same lifecycle session transfers
+through `root_owned -> graph_constructing -> graph_owned -> disposed`;
+compatibility disposal no longer competes with the Graph owner. Failed disposal
+preserves its owner state for retry. The Graph never rebuilds the
+Store/Profile/Compaction trio or splits their disposer. Commit, queue, retry,
+compaction task ownership, and Product event presentation remain outside this
+lifecycle boundary.
 
 ## Product Boundary
 

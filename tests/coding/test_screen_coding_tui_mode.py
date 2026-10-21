@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Callable
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,17 @@ from loushang.ai import (
 )
 from loushang.ai.model import ModelSelection
 from loushang.coding.ui.screen_surfaces import ScreenSurfaceManager
+from loushang.foundation.observability._router import (
+    configure_debug_logging,
+    reset_observability,
+)
 from loushang.harness.conversation import ConversationRecord
+from loushang.harness.permissions import permission_profile_snapshot
+from loushang.harness.resources.types import (
+    ResourceBundle,
+    RevisionResourceRef,
+    ThemeDescriptor,
+)
 from loushang.harness.transcript import (
     AGENT_MESSAGE_KIND,
     CONTEXT_COMPACTION_CHECKPOINT_KIND,
@@ -32,7 +43,6 @@ from loushang.harnesstui.conversation.control import ConversationTextAction
 from loushang.harnesstui.testing.performance import (
     characterize_long_transcript_rendering,
 )
-from loushang.observability import configure_debug_logging, reset_observability
 from loushang.tui import RenderLoop, TerminalSize
 from loushang.tui.transcript import (
     AssistantMessageRecord,
@@ -45,6 +55,13 @@ from loushang.tui.transcript import (
 class _TTYStringIO(StringIO):
     def isatty(self) -> bool:
         return True
+
+
+def _runtime_for(session: object) -> object:
+    return SimpleNamespace(
+        get_current_session=lambda: session,
+        current_session=session,
+    )
 
 
 class _RecordingDebugSink:
@@ -75,7 +92,7 @@ class _Session:
             get_keybindings=lambda: self.keybindings,
         )
         self.current_model: object = ModelSelection(
-            provider="unknown", model_id="unknown"
+            endpoint_id="test-endpoint", provider="unknown", model_id="unknown"
         )
         self.model_details = [
             Model(
@@ -92,6 +109,7 @@ class _Session:
         self.visible_steering: list[str] = []
         self.visible_follow_up: list[str] = []
         self.context_messages: list[object] = []
+        self.session_control = self
 
     def get_model_selection(self) -> object:
         return self.current_model
@@ -111,7 +129,9 @@ class _Session:
     async def set_model(self, selection: object) -> None:
         if isinstance(selection, Model):
             self.current_model = ModelSelection(
-                provider=selection.provider_id, model_id=selection.id
+                endpoint_id="test-endpoint",
+                provider=selection.provider_id,
+                model_id=selection.id,
             )
         else:
             self.current_model = selection
@@ -126,7 +146,7 @@ class _Session:
 
         return unsubscribe
 
-    async def prompt(self, text: str) -> None:
+    async def prompt(self, text: str, **_kwargs: object) -> None:
         self.prompts.append(text)
         await self._emit(
             {
@@ -164,10 +184,15 @@ class _Session:
             if inspect.isawaitable(result):
                 await result
 
-    async def steer(self, text: str) -> None:
+    async def wait_for_idle(self) -> None:
+        return None
+
+    def steer(self, text: str, images=None) -> None:
+        del images
         self.steers.append(text)
 
-    async def follow_up(self, text: str) -> None:
+    def follow_up(self, text: str, images=None) -> None:
+        del images
         self.follow_ups.append(text)
 
     def get_steering_messages(self) -> list[str]:
@@ -179,11 +204,66 @@ class _Session:
     def abort(self) -> None:
         return None
 
-    def clear_queue(self) -> None:
-        return None
+    def clear_queue(self) -> dict[str, list[str]]:
+        return {"steering": [], "follow_up": []}
 
     def abort_bash(self) -> None:
         return None
+
+
+class _ApprovalLease:
+    def __init__(self, close: Callable[[str], None]) -> None:
+        self._close = close
+        self._closed = False
+
+    def close(self, reason: str = "Approval presenter closed") -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._close(reason)
+
+
+class _ResolverApprovalInteraction:
+    def __init__(self, resolver, *, on_present: Callable[[], None] | None = None):
+        self._resolver = resolver
+        self._on_present = on_present
+
+    def bind_presenter(self, presenter, *, dismisser=None) -> _ApprovalLease:
+        def present(payload: dict[str, object]) -> object:
+            if self._on_present is not None:
+                self._on_present()
+            return presenter(payload)
+
+        self._resolver.set_request_presenter(present, dismisser=dismisser)
+        self._resolver.open_session()
+
+        def close(reason: str) -> None:
+            self._resolver.close_session(reason)
+            self._resolver.set_request_presenter(None)
+
+        return _ApprovalLease(close)
+
+    async def respond(
+        self,
+        action_id: str,
+        *,
+        outcome: str,
+        reason: str | None = None,
+    ) -> bool:
+        return await self._resolver.handle_result(
+            action_id,
+            outcome=outcome,
+            reason=reason,
+        )
+
+    def permissions_snapshot(self):
+        return self._resolver.permissions_snapshot()
+
+    def permission_profile_snapshot(self):
+        return permission_profile_snapshot("standard")
+
+    async def apply_permission_action(self, _action: str) -> bool:
+        return False
 
 
 def test_run_coding_tui_interactive_uses_screen_loop(monkeypatch) -> None:
@@ -201,7 +281,7 @@ def test_run_coding_tui_interactive_uses_screen_loop(monkeypatch) -> None:
 
     exit_code = asyncio.run(
         mode.run_coding_tui(
-            runtime=object(),
+            runtime=_runtime_for(session),
             session=session,
             stdin=_TTYStringIO(),
             stdout=_TTYStringIO(),
@@ -218,6 +298,44 @@ def test_run_coding_tui_interactive_uses_screen_loop(monkeypatch) -> None:
     assert session.prompts == ["hello"]
     assert captured["keybindings"] == session.keybindings
     assert assistant_records[-1].text == "hello back"
+
+
+def test_screen_tui_uses_selected_catalog_theme_and_disabled_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from loushang.coding.ui import mode
+
+    session = _Session()
+    session.settings_manager.get_theme = lambda: "plugin:dusk"
+    theme = ThemeDescriptor(
+        name="dusk", source_path=tmp_path / "themes" / "dusk.json",
+        content='{"schemaVersion":1,"tokens":{'
+            '"welcome.title":{"color":"red"}}}',
+        source="product_selected_snapshot", source_kind="external_package",
+        source_scope="package",
+        revision_ref=RevisionResourceRef(
+            content_digest="a" * 64, relative_path="themes/dusk.json"
+        ),
+    )
+    session.resource_bundle = ResourceBundle(cwd=tmp_path, themes=[theme])
+    observed: list[str] = []
+
+    async def fake_screen_loop(**kwargs: object) -> int:
+        app = kwargs["app"]
+        observed.append(app.welcome_theme.resolve("welcome.title")["color"])
+        return 0
+
+    monkeypatch.setattr(mode, "run_action_host_conversation_screen", fake_screen_loop)
+    for enabled in (True, False):
+        session.resource_bundle = ResourceBundle(
+            cwd=tmp_path,
+            themes=[theme if enabled else replace(theme, enabled=False)],
+        )
+        assert asyncio.run(mode.run_coding_tui(
+            runtime=_runtime_for(session), session=session,
+            stdin=_TTYStringIO(), stdout=_TTYStringIO(), stderr=StringIO(),
+        )) == 0
+    assert observed == ["red", "cyan"]
 
 
 def test_run_coding_tui_interactive_prints_resume_hint_on_clean_exit(
@@ -265,6 +383,7 @@ def test_run_coding_tui_interactive_replays_resumed_session_history(
             timestamp=1.0,
         ),
         AssistantMessage(
+            endpoint="test-endpoint",
             role="assistant",
             content=[TextPart(type="text", text="previous answer")],
             api="openai",
@@ -370,6 +489,7 @@ def test_run_coding_tui_interactive_bounds_resumed_long_transcript_render_window
         line_count = 900 if turn == 23 else 40
         session.context_messages.append(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(
@@ -456,6 +576,7 @@ def test_run_coding_tui_interactive_long_transcript_input_frame_does_not_clear_s
         )
         session.context_messages.append(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(
@@ -527,6 +648,7 @@ def test_run_coding_tui_interactive_long_transcript_working_timer_frame_stays_bo
         )
         session.context_messages.append(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(
@@ -603,6 +725,7 @@ def test_run_coding_tui_interactive_traces_resumed_transcript_window_trim(
         )
         session.context_messages.append(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(
@@ -679,7 +802,7 @@ def test_run_coding_tui_interactive_screen_loop_dispatches_steer_and_followup(
 
     exit_code = asyncio.run(
         mode.run_coding_tui(
-            runtime=object(),
+            runtime=_runtime_for(session),
             session=session,
             stdin=_TTYStringIO(),
             stdout=_TTYStringIO(),
@@ -726,6 +849,172 @@ def test_run_coding_tui_injects_on_approval_callback(monkeypatch) -> None:
     assert isinstance(captured.get("loop_kwargs"), dict)
 
 
+def test_run_coding_tui_awaits_bootstrap_and_releases_injected_reference(
+    monkeypatch,
+) -> None:
+    from loushang.coding.ui import mode
+
+    session = _Session()
+    runtime = _runtime_for(session)
+    events: list[str] = []
+
+    class _Reference:
+        def release(self) -> None:
+            events.append("release")
+
+    reference = _Reference()
+
+    class _Hub:
+        def reference(self):
+            events.append("reference")
+            return reference
+
+    async def bind_configured(bound_runtime, **kwargs):
+        assert bound_runtime is runtime
+        assert kwargs["cwd"] == "/repo"
+        events.append("bind")
+        return SimpleNamespace(hub=_Hub())
+
+    class RecordingSurfaceManager(ScreenSurfaceManager):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            assert kwargs["continuity_reference"] is reference
+            events.append("surface")
+            super().__init__(*args, **kwargs)
+
+    async def fake_screen_loop(**_kwargs: object) -> int:
+        events.append("loop")
+        return 0
+
+    monkeypatch.setattr(
+        mode,
+        "bind_coding_configured_continuity",
+        bind_configured,
+    )
+    monkeypatch.setattr(mode, "ScreenSurfaceManager", RecordingSurfaceManager)
+    monkeypatch.setattr(mode, "run_action_host_conversation_screen", fake_screen_loop)
+
+    exit_code = asyncio.run(
+        mode.run_coding_tui(
+            runtime=runtime,
+            session=session,
+            stdin=_TTYStringIO(),
+            stdout=_TTYStringIO(),
+            stderr=StringIO(),
+        )
+    )
+
+    assert exit_code == 0
+    assert events == ["bind", "reference", "surface", "loop", "release"]
+
+
+def test_run_coding_tui_reuses_process_composition_after_restored_cwd_changes(
+    monkeypatch,
+) -> None:
+    from loushang.coding.ui import mode
+
+    session = _Session()
+    runtime = _runtime_for(session)
+    events: list[str] = []
+
+    class _Reference:
+        def release(self) -> None:
+            events.append("release")
+
+    reference = _Reference()
+
+    class _Hub:
+        def reference(self):
+            events.append("reference")
+            return reference
+
+    composition = SimpleNamespace(hub=_Hub())
+
+    async def unexpected_bind(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a restored cwd must not recompose process continuity")
+
+    class RecordingSurfaceManager(ScreenSurfaceManager):
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            assert kwargs["continuity_reference"] is reference
+            events.append("surface")
+            super().__init__(*args, **kwargs)
+
+    async def fake_screen_loop(**_kwargs: object) -> int:
+        events.append("loop")
+        return 0
+
+    monkeypatch.setattr(
+        mode,
+        "get_coding_configured_continuity_composition",
+        lambda bound_runtime: composition if bound_runtime is runtime else None,
+    )
+    monkeypatch.setattr(
+        mode,
+        "bind_coding_configured_continuity",
+        unexpected_bind,
+    )
+    monkeypatch.setattr(mode, "ScreenSurfaceManager", RecordingSurfaceManager)
+    monkeypatch.setattr(mode, "run_action_host_conversation_screen", fake_screen_loop)
+
+    exit_code = asyncio.run(
+        mode.run_coding_tui(
+            runtime=runtime,
+            session=session,
+            stdin=_TTYStringIO(),
+            stdout=_TTYStringIO(),
+            stderr=StringIO(),
+        )
+    )
+
+    assert exit_code == 0
+    assert events == ["reference", "surface", "loop", "release"]
+
+
+def test_run_coding_tui_does_not_treat_direct_base_binding_as_configured(
+    monkeypatch,
+) -> None:
+    from loushang.coding.continuity import (
+        bind_coding_continuity,
+        shutdown_coding_continuity,
+    )
+    from loushang.coding.ui import mode
+
+    session = _Session()
+    runtime = _runtime_for(session)
+    base = bind_coding_continuity(runtime, cwd="/repo")
+    calls: list[dict[str, object]] = []
+
+    async def configured_bind(bound_runtime, **kwargs):
+        assert bound_runtime is runtime
+        calls.append(kwargs)
+        base.configured_request_fingerprint = "configured-by-test"
+        return base
+
+    async def fake_screen_loop(**_kwargs: object) -> int:
+        return 0
+
+    monkeypatch.setattr(
+        mode,
+        "bind_coding_configured_continuity",
+        configured_bind,
+    )
+    monkeypatch.setattr(mode, "run_action_host_conversation_screen", fake_screen_loop)
+
+    exit_code = asyncio.run(
+        mode.run_coding_tui(
+            runtime=runtime,
+            session=session,
+            stdin=_TTYStringIO(),
+            stdout=_TTYStringIO(),
+            stderr=StringIO(),
+        )
+    )
+
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["cwd"] == "/repo"
+    asyncio.run(shutdown_coding_continuity(runtime))
+
+
 def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
     tmp_path,
 ) -> None:
@@ -744,18 +1033,6 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
     presented: list[dict[str, object]] = []
     opened = asyncio.Event()
 
-    class ApprovalSession:
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            resolver.set_request_presenter(presenter, dismisser=dismisser)
-
-        async def handle_screen_approval(self, event: dict[str, object]) -> bool:
-            action_id = event.get("action_id")
-            assert isinstance(action_id, str)
-            return await resolver.handle_result(
-                action_id,
-                approved=bool(event.get("approved")),
-            )
-
     class ApprovalSurfaceManager:
         def open_approval(self, **payload: object) -> None:
             presented.append(dict(payload))
@@ -764,11 +1041,18 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
         def dismiss_approval(self, action_id: str) -> None:
             del action_id
 
-    registry = WorkspaceToolRegistry()
+    from loushang.harness.tools.workspace.authorization import (
+        create_workspace_tool_execution_host,
+    )
+
+    registry = WorkspaceToolRegistry(
+        execution_host=create_workspace_tool_execution_host(
+            policy_evaluator=PolicyEngine(ask_tools=["write"]),
+            approval_resolver=resolver,
+        )
+    )
     register_coding_builtin_tools(
         registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
-        approval_resolver=resolver,
     )
 
     def context_provider(*, tool_call_id: str) -> ToolContext:
@@ -778,9 +1062,9 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
         "write",
         context_provider=context_provider,
     )
-    session = ApprovalSession()
+    interaction = _ResolverApprovalInteraction(resolver)
     unbind = tui_policy.bind_agent_screen_approval_presenter(
-        session,
+        interaction,
         ApprovalSurfaceManager(),  # type: ignore[arg-type]
     )
 
@@ -794,8 +1078,9 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
         await opened.wait()
         allow_action_id = presented[-1]["action_id"]
         assert isinstance(allow_action_id, str)
-        await session.handle_screen_approval(
-            {"action_id": allow_action_id, "approved": True}
+        await interaction.respond(
+            allow_action_id,
+            outcome="allow_once",
         )
         await allow_task
 
@@ -809,8 +1094,9 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
         await opened.wait()
         deny_action_id = presented[-1]["action_id"]
         assert isinstance(deny_action_id, str)
-        await session.handle_screen_approval(
-            {"action_id": deny_action_id, "approved": False}
+        await interaction.respond(
+            deny_action_id,
+            outcome="deny",
         )
         with pytest.raises(PermissionError):
             await deny_task
@@ -825,7 +1111,7 @@ def test_screen_approval_presenter_resolves_ask_tools_and_clears_pending(
     assert resolver._broker.pending_requests() == ()
 
 
-def test_screen_approval_unbind_targets_runtime_current_session() -> None:
+def test_screen_approval_unbind_closes_captured_presentation_lease() -> None:
     from loushang.harness.approval import (
         ApprovalRequest,
         HeadlessApprovalResolver,
@@ -837,26 +1123,6 @@ def test_screen_approval_unbind_targets_runtime_current_session() -> None:
     )
     shown = asyncio.Event()
 
-    class ApprovalSession:
-        def __init__(self) -> None:
-            self.active = True
-
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            if presenter is None:
-                if self.active:
-                    resolver.close_session(
-                        "Approval presenter closed before approval was resolved"
-                    )
-                    self.active = False
-                resolver.set_request_presenter(None)
-                return
-
-            def present(payload: dict[str, object]) -> object:
-                shown.set()
-                return presenter(payload)
-
-            resolver.set_request_presenter(present, dismisser=dismisser)
-
     class ApprovalSurfaceManager:
         def open_approval(self, **payload: object) -> None:
             del payload
@@ -864,17 +1130,11 @@ def test_screen_approval_unbind_targets_runtime_current_session() -> None:
         def dismiss_approval(self, action_id: str) -> None:
             del action_id
 
-    old_session = ApprovalSession()
-    new_session = ApprovalSession()
-    current_session = old_session
+    interaction = _ResolverApprovalInteraction(resolver, on_present=shown.set)
     unbind = tui_policy.bind_agent_screen_approval_presenter(
-        old_session,
+        interaction,
         ApprovalSurfaceManager(),  # type: ignore[arg-type]
-        session_provider=lambda: current_session,
     )
-    old_session.active = False
-    new_session.active = True
-    current_session = new_session
 
     async def run() -> object:
         pending = asyncio.create_task(
@@ -897,94 +1157,6 @@ def test_screen_approval_unbind_targets_runtime_current_session() -> None:
     assert resolver._request_presenter is None
 
 
-def test_screen_approval_unbind_clears_host_presenter_without_current_session() -> None:
-    from loushang.harness.approval import (
-        HeadlessApprovalResolver,
-        InteractiveApprovalResolver,
-    )
-
-    resolver = InteractiveApprovalResolver(
-        fallback=HeadlessApprovalResolver(mode="deny")
-    )
-
-    class ClosedSession:
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            if presenter is not None:
-                resolver.set_request_presenter(presenter, dismisser=dismisser)
-
-        def _unbind_approval_presenter_host(self) -> None:
-            resolver.set_request_presenter(None)
-
-    class EmptyRuntime:
-        def get_current_session(self) -> None:
-            return None
-
-    class ApprovalSurfaceManager:
-        def open_approval(self, **payload: object) -> None:
-            del payload
-
-        def dismiss_approval(self, action_id: str) -> None:
-            del action_id
-
-    session = ClosedSession()
-    unbind = tui_policy.bind_agent_screen_approval_presenter(
-        session,
-        ApprovalSurfaceManager(),  # type: ignore[arg-type]
-        session_provider=lambda: tui_policy.current_agent_runtime_session(
-            EmptyRuntime(), session
-        ),
-    )
-    assert resolver._request_presenter is not None
-
-    unbind()
-
-    assert resolver._request_presenter is None
-
-
-def test_screen_approval_unbind_clears_initial_presenter_when_current_has_none() -> (
-    None
-):
-    from loushang.harness.approval import (
-        HeadlessApprovalResolver,
-        InteractiveApprovalResolver,
-    )
-
-    resolver = InteractiveApprovalResolver(
-        fallback=HeadlessApprovalResolver(mode="deny")
-    )
-
-    class InitialSession:
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            resolver.set_request_presenter(presenter, dismisser=dismisser)
-
-        def _unbind_approval_presenter_host(self) -> None:
-            resolver.set_request_presenter(None)
-
-    class SessionWithoutApproval:
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            del presenter, dismisser
-
-    class ApprovalSurfaceManager:
-        def open_approval(self, **payload: object) -> None:
-            del payload
-
-        def dismiss_approval(self, action_id: str) -> None:
-            del action_id
-
-    initial_session = InitialSession()
-    current_session = SessionWithoutApproval()
-    unbind = tui_policy.bind_agent_screen_approval_presenter(
-        initial_session,
-        ApprovalSurfaceManager(),  # type: ignore[arg-type]
-        session_provider=lambda: current_session,
-    )
-    assert resolver._request_presenter is not None
-
-    unbind()
-
-    assert resolver._request_presenter is None
-
-
 def test_screen_tui_failure_detaches_presenter_and_denies_pending(
     monkeypatch,
 ) -> None:
@@ -1001,19 +1173,12 @@ def test_screen_tui_failure_detaches_presenter_and_denies_pending(
     shown = asyncio.Event()
 
     class ApprovalSession(_Session):
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            if presenter is None:
-                resolver.close_session(
-                    "Approval presenter closed before approval was resolved"
-                )
-                resolver.set_request_presenter(None)
-                return
-
-            def present(payload: dict[str, object]) -> object:
-                shown.set()
-                return presenter(payload)
-
-            resolver.set_request_presenter(present, dismisser=dismisser)
+        def __init__(self) -> None:
+            super().__init__()
+            self.approval_interaction = _ResolverApprovalInteraction(
+                resolver,
+                on_present=shown.set,
+            )
 
     pending: asyncio.Task[object] | None = None
 
@@ -1070,8 +1235,9 @@ def test_screen_tui_projector_failure_still_unbinds_presenter(
     )
 
     class ApprovalSession(_Session):
-        def set_approval_presenter(self, presenter, *, dismisser=None) -> None:
-            resolver.set_request_presenter(presenter, dismisser=dismisser)
+        def __init__(self) -> None:
+            super().__init__()
+            self.approval_interaction = _ResolverApprovalInteraction(resolver)
 
     def fail_projector(*args: object, **kwargs: object) -> None:
         del args, kwargs
@@ -1098,7 +1264,9 @@ def test_screen_tui_projector_failure_still_unbinds_presenter(
     assert resolver._broker.pending_requests() == ()
 
 
-def test_screen_session_transition_binding_clears_approval_surfaces_and_rebinds() -> None:
+def test_screen_session_transition_binding_clears_approval_surfaces_and_rebinds() -> (
+    None
+):
 
     subscribers: list[Callable[[], None]] = []
     primary_calls = 0
@@ -1153,46 +1321,12 @@ def test_screen_session_transition_binding_clears_approval_surfaces_and_rebinds(
     assert subscribers == []
 
 
-def test_run_coding_tui_non_interactive_keeps_plain_prompt_loop(monkeypatch) -> None:
-    from loushang.coding.ui import mode
-
-    session = _Session()
-    captured: dict[str, object] = {}
-
-    async def fail_screen_loop(**_kwargs):
-        raise AssertionError(
-            "non-interactive mode should not enter screen terminal loop"
-        )
-
-    async def fake_prompt_loop(**kwargs):
-        captured.update(kwargs)
-        await kwargs["handle_prompt"]("hello")
-        return 0
-
-    monkeypatch.setattr(mode, "run_action_host_conversation_screen", fail_screen_loop)
-    monkeypatch.setattr(mode, "run_non_interactive_prompt_loop", fake_prompt_loop)
-
-    exit_code = asyncio.run(
-        mode.run_coding_tui(
-            runtime=object(),
-            session=session,
-            stdin=StringIO("hello\n"),
-            stdout=StringIO(),
-            stderr=StringIO(),
-        )
-    )
-
-    assert exit_code == 0
-    assert session.prompts == ["hello"]
-    assert set(captured) == {"stdin", "stdout", "handle_prompt"}
-
-
 def test_screen_event_projection_skips_duplicate_user_messages(monkeypatch) -> None:
     from loushang.coding.ui import mode
 
     session = _Session()
 
-    async def prompt_with_user_event(text: str) -> None:
+    async def prompt_with_user_event(text: str, **_kwargs: object) -> None:
         session.prompts.append(text)
         await session._emit(
             {
@@ -1219,7 +1353,7 @@ def test_screen_event_projection_skips_duplicate_user_messages(monkeypatch) -> N
 
     exit_code = asyncio.run(
         mode.run_coding_tui(
-            runtime=object(),
+            runtime=_runtime_for(session),
             session=session,
             stdin=_TTYStringIO(),
             stdout=_TTYStringIO(),

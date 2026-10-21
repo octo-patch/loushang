@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 
 import pytest
@@ -15,7 +16,7 @@ from loushang.coding.product_plan import (
 )
 from loushang.coding.session_manager import SessionManager
 from loushang.harness.conversation import FileConversationStore, MemoryConversationStore
-from loushang.harness.runtime import RuntimeProfileSnapshot
+from loushang.harness.runtime import SIDE_QUESTION_PROVIDER_SLOT, RuntimeProfileSnapshot
 from loushang.harness.transcript import (
     TURN_AWARE_SUMMARY_IMPLEMENTATION,
     TURN_AWARE_SUMMARY_VERSION,
@@ -37,6 +38,18 @@ def _model() -> Model:
     )
 
 
+def _durable_capability_snapshot() -> dict[str, object]:
+    snapshot = CODING_CAPABILITY_PROFILE.snapshot()
+    return replace(
+        snapshot,
+        capabilities=tuple(
+            capability
+            for capability in snapshot.capabilities
+            if capability.slot != SIDE_QUESTION_PROVIDER_SLOT.key
+        ),
+    ).to_json()
+
+
 def test_in_memory_session_binds_the_coding_runtime_profile_and_records_snapshot(
     tmp_path,
 ) -> None:
@@ -55,10 +68,7 @@ def test_in_memory_session_binds_the_coding_runtime_profile_and_records_snapshot
 
         assert manager.runtime_profile.product_id == "coding"
         assert snapshot.to_json() == manager.runtime_profile.snapshot().to_json()
-        assert (
-            capability_snapshot.to_json()
-            == CODING_CAPABILITY_PROFILE.snapshot().to_json()
-        )
+        assert capability_snapshot.to_json() == _durable_capability_snapshot()
         assert isinstance(
             manager.get_runtime_capability("conversation.store"),
             MemoryConversationStore,
@@ -98,7 +108,7 @@ def test_persistent_session_resumes_the_snapshotted_file_profile(tmp_path) -> No
             UserMessage(role="user", content="materialize", timestamp=0.0)
         )
         expected_snapshot = manager.runtime_profile.snapshot().to_json()
-        expected_capability_snapshot = CODING_CAPABILITY_PROFILE.snapshot().to_json()
+        expected_capability_snapshot = _durable_capability_snapshot()
 
         resumed = await SessionManager.load(manager.session_file, persist=True)
 
@@ -166,7 +176,54 @@ def test_persistent_session_accepts_snapshot_without_auxiliary_side_question(
     asyncio.run(scenario())
 
 
-def test_persistent_session_rejects_a_different_capability_profile(tmp_path) -> None:
+def test_persistent_session_accepts_legacy_capability_semantic_snapshot(
+    tmp_path,
+) -> None:
+    async def scenario() -> None:
+        manager = await SessionManager.new(
+            session_dir=tmp_path,
+            cwd="/tmp/project",
+            persist=True,
+        )
+        assert manager.session_file is not None
+        await manager.append_message(
+            UserMessage(role="user", content="materialize", timestamp=0.0)
+        )
+        metadata = deepcopy(dict(manager.header.metadata))
+        for metadata_key in (
+            CODING_RUNTIME_PROFILE_METADATA_KEY,
+            CODING_CAPABILITY_PROFILE_METADATA_KEY,
+        ):
+            snapshot = metadata[metadata_key]
+            assert isinstance(snapshot, dict)
+            capabilities = snapshot["capabilities"]
+            assert isinstance(capabilities, list)
+            for capability in capabilities:
+                assert isinstance(capability, dict)
+                capability.pop("variationSemantic")
+                if capability["slot"] in {
+                    "prompt.sections",
+                    "tool.packs",
+                    "command.packs",
+                }:
+                    capability["shape"] = "ordered"
+        header = replace(manager.header, metadata=metadata)
+        write_session_file(manager.session_file, header, manager.get_entries())
+        await manager.dispose_runtime_profile()
+
+        resumed = await SessionManager.load(manager.session_file, persist=True)
+        await resumed.dispose_runtime_profile()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "metadata_key",
+    [CODING_RUNTIME_PROFILE_METADATA_KEY, CODING_CAPABILITY_PROFILE_METADATA_KEY],
+)
+def test_persistent_session_accepts_a_historical_profile(
+    tmp_path, metadata_key: str
+) -> None:
     async def scenario() -> None:
         manager = await SessionManager.new(
             session_dir=tmp_path,
@@ -178,7 +235,7 @@ def test_persistent_session_rejects_a_different_capability_profile(tmp_path) -> 
             manager.header,
             metadata={
                 **manager.header.metadata,
-                CODING_CAPABILITY_PROFILE_METADATA_KEY: {
+                metadata_key: {
                     "schemaVersion": 1,
                     "productId": "coding",
                     "capabilities": [],
@@ -186,10 +243,18 @@ def test_persistent_session_rejects_a_different_capability_profile(tmp_path) -> 
             },
         )
         write_session_file(manager.session_file, header, manager.get_entries())
+        before = manager.session_file.read_bytes()
         await manager.dispose_runtime_profile()
 
-        with pytest.raises(ValueError, match="unsupported capability profile"):
-            await SessionManager.load(manager.session_file, persist=True)
+        resumed = await SessionManager.load(manager.session_file, persist=True)
+        try:
+            assert manager.session_file.read_bytes() == before
+            await resumed.append_message(
+                UserMessage(role="user", content="continue", timestamp=1.0)
+            )
+            assert resumed.get_leaf_entry().payload.content == "continue"
+        finally:
+            await resumed.dispose_runtime_profile()
 
     asyncio.run(scenario())
 
@@ -243,22 +308,56 @@ def test_agent_session_uses_and_disposes_selected_compaction_runtime(tmp_path) -
         )
 
         session = create_agent_session(session_manager=manager, model=_model())
-        capability_runtime = session._capability_runtime
+        staged_candidate = session._staged_resource_candidate
+        resource_ports = session._resource_capability_ports
+        assert staged_candidate is not None
 
-        assert session._compaction_capability is compaction_capability
-        assert session._compaction_runtime._get_policy() == compaction_capability.policy
-        assert capability_runtime is not None
+        mirrored_runtime_names = {
+            "_bash_runtime",
+            "_command_controller",
+            "_compaction_capability",
+            "_compaction_runtime",
+            "_diagnostics_bridge",
+            "_extension_binding",
+            "_extension_event_sink",
+            "_extension_input_runtime",
+            "_extension_message_controller",
+            "_identity_binding",
+            "_maintenance_binding",
+            "_model_binding",
+            "_navigation_runtime",
+            "_resource_refresh_runtime",
+            "_resource_watch_controller",
+            "_retry_runtime",
+            "_selection_runtime",
+            "_session_inspector",
+            "_session_runtime",
+            "_tool_controller",
+        }
+        assert mirrored_runtime_names.isdisjoint(vars(session))
+        assert session._composition.compaction_capability is compaction_capability
         assert (
-            session._tool_controller.prompt_section_composer
-            is capability_runtime.prompt_section_composer
+            session._composition.compaction_runtime._get_policy()
+            == compaction_capability.policy
         )
         assert (
-            session._command_controller.pack_composer
-            is capability_runtime.command_pack_composer
+            session._composition.tool_controller.prompt_section_composer
+            is resource_ports.prompt
         )
+        assert (
+            session._composition.command_controller.pack_composer
+            is resource_ports.commands
+        )
+
+        await session.prepare_model_call_runtime()
+
+        assert session._staged_resource_candidate is None
+        assert staged_candidate.ownership_state == "graph_owned"
+        assert session._capability_graph_runtime.snapshot is not None
 
         await session.dispose()
-        assert capability_runtime.binding.is_closed
+        assert staged_candidate.binding.is_closed
+        assert staged_candidate.ownership_state == "disposed"
         with pytest.raises(RuntimeError, match="closed"):
             manager.get_runtime_capability("context.compaction")
 

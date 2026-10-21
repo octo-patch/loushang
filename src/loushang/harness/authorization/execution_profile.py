@@ -1,8 +1,20 @@
+"""Frozen, non-widening effective authority for one execution attempt.
+
+Implements the permission enforcer (§12.4) of
+docs/internals/architecture/harness/policy-approval-redesign.md: resolves
+the effective execution profile (readable/writable/denied roots, network
+access) from policy and approval inputs, and constrains child or delegated
+profiles so derived authority can only narrow, never widen. An effective
+execution profile is enforcement state, not a permission profile
+(`loushang.harness.permissions.PermissionProfile`); see the terminology
+conventions in section 7.0.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 
 from loushang.harness.approval import ApprovalDecision
 from loushang.harness.policy import PolicyDecision
@@ -43,6 +55,69 @@ class ExecutionAuthorizationError(PermissionError):
     pass
 
 
+class ExecutionProfileProvider(Protocol):
+    """Trusted owner selection for the next action, before authority is frozen."""
+
+    def __call__(self) -> EffectiveExecutionProfile: ...
+
+
+def select_execution_profile(
+    ceiling: EffectiveExecutionProfile,
+    provider: ExecutionProfileProvider | None = None,
+) -> EffectiveExecutionProfile:
+    """Read live owner selection without exceeding a frozen deployment ceiling."""
+
+    if provider is None:
+        return ceiling
+    selected = provider()
+    if not isinstance(selected, EffectiveExecutionProfile):
+        raise TypeError("execution profile provider must return an EffectiveExecutionProfile")
+    return constrain_execution_profile(ceiling, selected)
+
+
+def execution_profile_expansion_codes(
+    current: EffectiveExecutionProfile,
+    baseline: EffectiveExecutionProfile | None,
+) -> tuple[str, ...]:
+    """Compare bounded execution scopes without granting authority.
+
+    A baseline may describe historical restrictions. Even an empty result is
+    only a scope comparison: it proves neither a current actor, an Approval
+    fact, managed Policy nor live filesystem/Sandbox enforcement.
+    """
+
+    if type(current) is not EffectiveExecutionProfile or (
+        baseline is not None and type(baseline) is not EffectiveExecutionProfile
+    ):
+        raise TypeError("execution scope comparison requires a native profile")
+    for profile in (current, baseline):
+        if profile is None:
+            continue
+        if any(len(roots) > 64 for roots in (
+            profile.readable_roots, profile.writable_roots, profile.denied_roots,
+        )):
+            raise ValueError("execution scope comparison exceeds its root budget")
+    if baseline is None:
+        return ("execution.baseline_unknown",)
+    readable = tuple(root for root in current.readable_roots if not _covered(root, current.denied_roots))
+    writable = tuple(root for root in current.writable_roots if not _covered(root, current.denied_roots))
+    codes: list[str] = []
+    if any(not _covered(root, baseline.readable_roots) for root in readable):
+        codes.append("execution.readable_expanded")
+    if any(not _covered(root, baseline.writable_roots) for root in writable):
+        codes.append("execution.writable_expanded")
+    if _NETWORK_RANK[current.network] > _NETWORK_RANK[baseline.network]:
+        codes.append("execution.network_expanded")
+    if any(
+        not _covered(denied, current.denied_roots)
+        and any(denied == root or denied.is_relative_to(root) or root.is_relative_to(denied)
+                for root in (*readable, *writable))
+        for denied in baseline.denied_roots
+    ):
+        codes.append("execution.denial_reduced")
+    return tuple(sorted(codes))
+
+
 def resolve_effective_execution_profile(
     *,
     ceiling: EffectiveExecutionProfile,
@@ -51,7 +126,7 @@ def resolve_effective_execution_profile(
     approval: ApprovalDecision | None = None,
     approval_action_id: str | None = None,
 ) -> EffectiveExecutionProfile:
-    """Resolve legacy Policy/Approval into a non-widening execution profile."""
+    """Resolve Policy/Approval into a non-widening execution profile."""
 
     if decision.disposition == "deny":
         raise ExecutionAuthorizationError(decision.reason or "execution denied by policy")

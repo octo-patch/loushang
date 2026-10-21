@@ -6,7 +6,6 @@ from typing import Any
 from loushang.harness.resources.loader import (
     DEFAULT_CONTEXT_FILE_NAMES,
     ProfiledResourceLoader,
-    ResourceLoader,
     ResourceLoaderProfile,
 )
 from loushang.harness.resources.packages.catalog import (
@@ -20,8 +19,14 @@ from loushang.harness.resources.packages.projection import (
     collect_projected_package_entries,
 )
 from loushang.harness.resources.packages.source import PackageSourceConfig
-from loushang.harness.resources.skills import SkillLoader
 from loushang.harness.resources.types import PackageResourceSummary, ResourceBundle
+
+from .plugin_dependency_grants import (
+    CoDistributedPluginDependencyGrantResolver,
+    coding_arch_default_plugin_root,
+    coding_lsp_default_plugin_root,
+    coding_plugin_distribution_evidence_resolver,
+)
 
 BUILT_IN_RESOURCE_PACKAGE = "loushang.coding.resources"
 CODING_CONTEXT_FILE_NAMES = (*DEFAULT_CONTEXT_FILE_NAMES, "CLAUDE.md", "CLAUDE.MD")
@@ -71,25 +76,19 @@ class CodingPackageMaterializer(PackageMaterializer):
             )
 
             security_policy = PackageSecurityPolicy()
+        kwargs.setdefault(
+            "co_distributed_dependency_grant_resolver",
+            CoDistributedPluginDependencyGrantResolver(
+                coding_lsp_source=coding_lsp_default_plugin_root(),
+                coding_arch_source=coding_arch_default_plugin_root(),
+            ),
+        )
+        kwargs.setdefault(
+            "installed_distribution_evidence_resolver",
+            coding_plugin_distribution_evidence_resolver(),
+        )
         super().__init__(
             security_policy=security_policy,
-            **kwargs,
-        )
-
-
-class CodingSkillLoader(SkillLoader):
-    """Harness skill loader with Coding's built-in resource content."""
-
-    def __init__(
-        self,
-        *,
-        resource_loader: ResourceLoader | None = None,
-        package_roots: list[str | Path] | tuple[str | Path, ...] | None = None,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__(
-            resource_loader=resource_loader
-            or CodingResourceLoader(package_roots=package_roots),
             **kwargs,
         )
 
@@ -124,7 +123,6 @@ __all__ = [
     "CODING_RESOURCE_PROFILE",
     "CodingPackageMaterializer",
     "CodingResourceLoader",
-    "CodingSkillLoader",
     "collect_coding_package_entries",
     "summarize_coding_package_root",
 ]

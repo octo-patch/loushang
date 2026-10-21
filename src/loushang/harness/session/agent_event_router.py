@@ -1,20 +1,29 @@
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from loushang.agent import AbortSignal, AgentEvent
-from loushang.ai.types import AssistantMessage
+from loushang.ai.types import AssistantMessage, UserMessage
+from loushang.foundation.json import JSONValue
+from loushang.harness.session.request_evidence import RequestEvidenceRuntimePort
+from loushang.harness.transcript import AutoRetryOutcome, CompactionResult
 
-AppendMessage = Callable[[object], Awaitable[str]]
+AppendMessage = Callable[..., Awaitable[str]]
 EventDispatcher = Callable[..., Awaitable[None]]
 ExtensionEventEmitter = Callable[[AgentEvent], Awaitable[None]]
 ToolExecutionErrorRecorder = Callable[[AgentEvent], None]
 ExtensionDiagnosticsSync = Callable[..., None]
 AssistantResponseErrorRecorder = Callable[[AssistantMessage], None]
-AutoCompactionChecker = Callable[[AssistantMessage], Awaitable[object | None]]
+AutoCompactionChecker = Callable[
+    [AssistantMessage], Awaitable[CompactionResult | None]
+]
 QueuedMessageConsumer = Callable[[object], bool]
+QueuedMessageCompleter = Callable[[object], None]
+InFlightMessageDiscarder = Callable[[], None]
+ContinueRun = Callable[[], Awaitable[None]]
+MessageMetadataPreparer = Callable[[object], Mapping[str, JSONValue] | None]
 
 
 class RetryRouterPort(Protocol):
@@ -30,7 +39,9 @@ class RetryRouterPort(Protocol):
 
     async def handle_retryable_error(
         self, assistant_message: AssistantMessage
-    ) -> bool: ...
+    ) -> AutoRetryOutcome: ...
+
+    def continue_retry(self, continue_run: ContinueRun) -> None: ...
 
 
 class CompactionRouterPort(Protocol):
@@ -48,7 +59,13 @@ class AgentEventRouter:
     sync_extension_diagnostics: ExtensionDiagnosticsSync
     record_assistant_response_error: AssistantResponseErrorRecorder
     check_auto_compaction: AutoCompactionChecker
+    schedule_continue_run: ContinueRun
     consume_queued_message: QueuedMessageConsumer | None = None
+    request_evidence: RequestEvidenceRuntimePort | None = None
+    prepare_message_metadata: MessageMetadataPreparer | None = None
+    complete_queued_message: QueuedMessageCompleter | None = None
+    discard_in_flight_messages: InFlightMessageDiscarder | None = None
+    allow_automatic_recovery: Callable[[], bool] = lambda: True
     _committed_messages: dict[int, tuple[object, str]] = field(
         default_factory=dict,
         init=False,
@@ -68,6 +85,13 @@ class AgentEventRouter:
         if event["type"] == "message_end":
             committed_message = event["message"]
             source_record_id = await self._append_message_once(committed_message)
+            if self.request_evidence is not None:
+                self.request_evidence.commit_message(
+                    committed_message,
+                    source_record_id,
+                )
+            if self.complete_queued_message is not None:
+                self.complete_queued_message(committed_message)
         if event["type"] == "tool_execution_end" and event.get("is_error"):
             self.record_tool_execution_error(event)
         await self.dispatch_event(event, source_record_id=source_record_id)
@@ -80,29 +104,67 @@ class AgentEventRouter:
             if assistant_message.stop_reason != "error":
                 self.compaction_controller.clear_overflow_recovery_attempted()
         if event["type"] == "agent_end":
+            if self.discard_in_flight_messages is not None:
+                self.discard_in_flight_messages()
             self.sync_extension_diagnostics(phase="runtime")
             last_assistant_message = _last_assistant_message(event["messages"])
             if last_assistant_message is None:
                 return
             self.record_assistant_response_error(last_assistant_message)
+            if not self.allow_automatic_recovery():
+                return
             if self.retry_controller.should_prepare_retry(last_assistant_message):
                 self.retry_controller.ensure_future()
             if self.retry_controller.is_retryable_error(last_assistant_message):
-                did_retry = await self.retry_controller.handle_retryable_error(
+                outcome = await self.retry_controller.handle_retryable_error(
                     last_assistant_message
                 )
-                if did_retry:
+                if outcome.should_continue:
+                    self.retry_controller.continue_retry(self.schedule_continue_run)
                     return
             await self.check_auto_compaction(last_assistant_message)
         if committed_message is not None:
             self._forget_committed_message(committed_message)
+
+    async def commit_prepared_user_message(self, message: UserMessage) -> str:
+        """Commit an owner-prepared input with the original evidence metadata.
+
+        The caller owns admission and fixed-input identity. This persistence
+        entry emits no Agent event, starts no run, and grants no retry authority.
+        """
+
+        if not isinstance(message, UserMessage):
+            raise TypeError("prepared input requires a UserMessage")
+        record_id = await self._append_message_once(message)
+        if self.request_evidence is not None:
+            self.request_evidence.commit_message(message, record_id)
+        self._forget_committed_message(message)
+        return record_id
 
     async def _append_message_once(self, message: object) -> str:
         identity = id(message)
         existing = self._committed_messages.get(identity)
         if existing is not None and existing[0] is message:
             return existing[1]
-        record_id = await self.append_message(message)
+        metadata: dict[str, JSONValue] = {}
+        if self.request_evidence is not None:
+            evidence = self.request_evidence.prepare_message_commit(message)
+            if evidence is not None:
+                metadata.update(evidence)
+        if self.prepare_message_metadata is not None:
+            product_metadata = self.prepare_message_metadata(message)
+            if product_metadata is not None:
+                conflicts = metadata.keys() & product_metadata.keys()
+                if conflicts:
+                    raise ValueError(
+                        "Agent message metadata key conflict: "
+                        + ", ".join(sorted(conflicts))
+                    )
+                metadata.update(product_metadata)
+        if not metadata:
+            record_id = await self.append_message(message)
+        else:
+            record_id = await self.append_message(message, metadata=metadata)
         self._committed_messages[identity] = (message, record_id)
         return record_id
 

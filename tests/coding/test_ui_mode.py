@@ -13,6 +13,13 @@ class _TTYStringIO(StringIO):
         return True
 
 
+def _runtime_for(session: object) -> object:
+    return SimpleNamespace(
+        get_current_session=lambda: session,
+        current_session=session,
+    )
+
+
 class _Session:
     def __init__(self) -> None:
         self.session_id = "254d6156"
@@ -23,7 +30,7 @@ class _Session:
         )
         self.settings_manager = None
         self.current_model: object = ModelSelection(
-            provider="unknown", model_id="unknown"
+            endpoint_id="test-endpoint", provider="unknown", model_id="unknown"
         )
         self.model_details = [
             Model(
@@ -34,8 +41,11 @@ class _Session:
         ]
         self.set_model_calls: list[object] = []
         self.prompts: list[str] = []
+        self.follow_ups: list[str] = []
+        self.steers: list[str] = []
         self.listeners: list[object] = []
         self.unsubscribed = False
+        self.session_control = self
 
     def get_tool_definition(self, _tool_name: str) -> None:
         return None
@@ -54,15 +64,23 @@ class _Session:
 
     def get_available_models(self) -> list[ModelSelection]:
         return [
-            ModelSelection(provider="moonshot", model_id="kimi-for-coding"),
-            ModelSelection(provider="openai", model_id="gpt-5.4"),
+            ModelSelection(
+                endpoint_id="test-endpoint",
+                provider="moonshot",
+                model_id="kimi-for-coding",
+            ),
+            ModelSelection(
+                endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
+            ),
         ]
 
     async def set_model(self, selection: object) -> None:
         self.set_model_calls.append(selection)
         if isinstance(selection, Model):
             self.current_model = ModelSelection(
-                provider=selection.provider_id, model_id=selection.id
+                endpoint_id="test-endpoint",
+                provider=selection.provider_id,
+                model_id=selection.id,
             )
         else:
             self.current_model = selection
@@ -77,8 +95,26 @@ class _Session:
 
         return unsubscribe
 
-    async def prompt(self, text: str) -> None:
+    async def prompt(
+        self,
+        text: str,
+        *,
+        streaming_behavior: str | None = None,
+        source: str | None = None,
+    ) -> None:
+        del streaming_behavior, source
         self.prompts.append(text)
+
+    def steer(self, text: str, *, images=None) -> None:
+        del images
+        self.steers.append(text)
+
+    def follow_up(self, text: str, *, images=None) -> None:
+        del images
+        self.follow_ups.append(text)
+
+    async def wait_for_idle(self) -> None:
+        return None
 
     def clear_queue(self) -> None:
         return None
@@ -88,10 +124,18 @@ class _Session:
 
 
 def test_run_coding_tui_uses_screen_loop_for_interactive_terminal(monkeypatch) -> None:
+    from dataclasses import replace
+
     from loushang.coding.ui import mode
+    from loushang.coding.ui.screen_input import CODING_SCREEN_RUN_PROFILE
 
     session = _Session()
     captured: dict[str, object] = {}
+    custom_profile = replace(
+        CODING_SCREEN_RUN_PROFILE,
+        interruption_message="Plugin interrupted",
+        cancellation_message="Plugin cancelled",
+    )
 
     async def fake_screen_loop(**kwargs):
         captured.update(kwargs)
@@ -112,6 +156,7 @@ def test_run_coding_tui_uses_screen_loop_for_interactive_terminal(monkeypatch) -
             stdin=_TTYStringIO(),
             stdout=_TTYStringIO(),
             stderr=StringIO(),
+            screen_run_profile=custom_profile,
         )
     )
 
@@ -120,7 +165,7 @@ def test_run_coding_tui_uses_screen_loop_for_interactive_terminal(monkeypatch) -
     assert captured["action_host"].__class__.__name__ == (
         "PresentedConversationActionHost"
     )
-    assert captured["profile"].__class__.__name__ == "ConversationScreenRunProfile"
+    assert captured["profile"] is custom_profile
     assert callable(captured["handle_local"])
     assert callable(captured["handle_surface_intent"])
 
@@ -146,7 +191,7 @@ def test_run_coding_tui_non_interactive_keeps_plain_prompt_loop(monkeypatch) -> 
 
     exit_code = asyncio.run(
         mode.run_coding_tui(
-            runtime=object(),
+            runtime=_runtime_for(session),
             session=session,
             stdin=StringIO("hello\n"),
             stdout=StringIO(),

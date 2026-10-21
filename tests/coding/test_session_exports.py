@@ -15,6 +15,7 @@ from loushang.ai.types import (
 )
 from loushang.coding.session import AgentSession
 from loushang.coding.session_manager import SessionManager
+from loushang.harness.tools.execution import direct_execution
 from loushang.harness.tools.workspace import ToolDefinition
 from loushang.harness.tools.workspace.registry import (
     WorkspaceToolRegistry as ToolRegistry,
@@ -42,6 +43,7 @@ def _build_export_session(
     asyncio.run(
         manager.append_message(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(type="text", text="Calling read"),
@@ -105,11 +107,37 @@ def test_agent_session_exposes_standard_export_methods(tmp_path) -> None:
 
     jsonl_output = session.export_to_jsonl(str(tmp_path / "session.jsonl"))
     html_output = session.export_to_html(str(tmp_path / "session.html"))
+    bundle_output = session.export_to_bundle(str(tmp_path / "session.loushang.zip"))
 
     assert jsonl_output.endswith(".jsonl")
     assert html_output.endswith(".html")
+    assert bundle_output.endswith(".loushang.zip")
     assert (tmp_path / "session.jsonl").exists()
     assert (tmp_path / "session.html").exists()
+    assert (tmp_path / "session.loushang.zip").exists()
+
+
+def test_export_session_to_bundle_defaults_to_generated_portable_backup(
+    tmp_path,
+) -> None:
+    from loushang.harness.session.export import export_session_to_bundle
+
+    cwd = tmp_path / "project"
+    cwd.mkdir()
+    manager = asyncio.run(
+        SessionManager.new(
+            session_dir=tmp_path / "data" / "sessions",
+            cwd=str(cwd),
+            persist=False,
+        )
+    )
+    session = AgentSession(agent=Agent(), session_manager=manager)
+
+    output = Path(export_session_to_bundle(session))
+
+    assert output.name.startswith("session-")
+    assert output.name.endswith(".loushang.zip")
+    assert output.parent == cwd.resolve()
 
 
 def test_export_session_to_jsonl_defaults_to_generated_filename(tmp_path) -> None:
@@ -217,6 +245,7 @@ def test_render_transcript_renders_markdown_code_fences_with_syntax_highlighting
     html = render_transcript(
         [
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     TextPart(
@@ -378,7 +407,7 @@ def test_export_session_to_html_uses_tool_renderers(tmp_path) -> None:
                 "properties": {},
                 "additionalProperties": False,
             },
-            execute=execute,
+            execution=direct_execution(execute),
             render_call=render_call,
             render_result=render_result,
         )
@@ -409,7 +438,7 @@ def test_render_tool_sections_falls_back_when_tool_renderer_fails() -> None:
         label="Bash",
         description="Run commands",
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        execute=execute,
+        execution=direct_execution(execute),
         render_result=render_result,
     )
 
@@ -457,7 +486,7 @@ def test_render_tool_sections_uses_shared_renderer_runtime_state() -> None:
         label="Read",
         description="Read files",
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        execute=execute,
+        execution=direct_execution(execute),
         render_call=render_call,
         render_result=render_result,
     )
@@ -465,6 +494,7 @@ def test_render_tool_sections_uses_shared_renderer_runtime_state() -> None:
     html = render_tool_sections(
         [
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[
                     ToolCall(
@@ -528,6 +558,7 @@ def test_export_session_to_html_embeds_entry_tree_and_summary_entries(tmp_path) 
     asyncio.run(
         manager.append_message(
             AssistantMessage(
+                endpoint="test-endpoint",
                 role="assistant",
                 content=[TextPart(type="text", text="main branch")],
                 api="anthropic-messages",
@@ -589,7 +620,12 @@ def test_export_session_to_html_embeds_entry_tree_and_summary_entries(tmp_path) 
 
 
 def test_product_transcript_dispositions_cover_every_standard_kind() -> None:
-    from loushang.harness.transcript import STANDARD_AGENT_TRANSCRIPT_KINDS
+    from loushang.harness.transcript import (
+        MODEL_CALL_OUTCOME_KIND,
+        MODEL_INPUT_COMPONENT_KIND,
+        MODEL_INPUT_PREPARED_KIND,
+        STANDARD_AGENT_TRANSCRIPT_KINDS,
+    )
     from loushang.harness.transcript.export import (
         HTML_TRANSCRIPT_DISPOSITIONS,
     )
@@ -600,6 +636,10 @@ def test_product_transcript_dispositions_cover_every_standard_kind() -> None:
     expected = set(STANDARD_AGENT_TRANSCRIPT_KINDS)
     assert set(HTML_TRANSCRIPT_DISPOSITIONS) == expected
     assert set(STANDARD_AGENT_HISTORY_DISPOSITIONS) == expected
+    assert STANDARD_AGENT_HISTORY_DISPOSITIONS[MODEL_INPUT_COMPONENT_KIND] == "hidden"
+    assert STANDARD_AGENT_HISTORY_DISPOSITIONS[MODEL_INPUT_PREPARED_KIND] == "hidden"
+    assert STANDARD_AGENT_HISTORY_DISPOSITIONS[MODEL_CALL_OUTCOME_KIND] == "hidden"
+    assert HTML_TRANSCRIPT_DISPOSITIONS[MODEL_CALL_OUTCOME_KIND] == "hidden"
 
 
 def test_export_session_to_html_embeds_system_prompt_and_tool_definitions(
@@ -629,7 +669,7 @@ def test_export_session_to_html_embeds_system_prompt_and_tool_definitions(
                 "required": ["path"],
                 "additionalProperties": False,
             },
-            execute=execute_probe,
+            execution=direct_execution(execute_probe),
         )
     )
     agent = Agent(initial_state={"system_prompt": "export prompt", "tools": []})

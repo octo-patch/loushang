@@ -70,6 +70,10 @@ class SideQuestionCoordinator:
         task = self._active_task
         return task is not None and not task.done()
 
+    def owns_current_task(self) -> bool:
+        task = asyncio.current_task()
+        return task is not None and self._active_task is task
+
     async def ask(
         self,
         question: str,
@@ -95,9 +99,31 @@ class SideQuestionCoordinator:
         task = self._active_task
         if task is None or task.done():
             return False
-        self._provider.cancel()
-        task.cancel()
+        # Detach first so repeated Session-finalization paths cannot invoke an
+        # external Provider's cancellation side effect more than once.
+        self._active_task = None
+        try:
+            self._provider.cancel()
+        finally:
+            task.cancel()
         return True
+
+    async def cancel_and_wait(self) -> bool:
+        """Cancel the owned request and join it before its Session is disposed."""
+
+        task = self._active_task
+        error: BaseException | None = None
+        cancelled = False
+        try:
+            cancelled = self.cancel()
+        except BaseException as exc:
+            error = exc
+        finally:
+            if task is not None and task is not asyncio.current_task():
+                await asyncio.gather(task, return_exceptions=True)
+        if error is not None:
+            raise error
+        return cancelled
 
 
 __all__ = [

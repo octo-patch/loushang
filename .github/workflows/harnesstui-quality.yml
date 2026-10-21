@@ -1,14 +1,22 @@
 name: Harnesstui Quality
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  harnesstui-quality:
-    runs-on: ubuntu-latest
+  harnesstui-and-coding-ui:
+    if: ${{ fromJSON(inputs.plan).workflows.harnesstui }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CI_PLAN: ${{ inputs.plan }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,5 +29,65 @@ jobs:
       - name: Install dependencies
         run: make bootstrap
 
+      - name: Create report directory
+        run: uv run python -c "from pathlib import Path; Path('.artifacts').mkdir(exist_ok=True)"
+
+      - name: Combined Harnesstui and Coding UI quality gate
+        if: ${{ fromJSON(inputs.plan).checks.harnesstui && fromJSON(inputs.plan).checks.coding_ui }}
+        env:
+          PYTEST_ADDOPTS: >-
+            -o faulthandler_timeout=60
+            --junitxml=.artifacts/harnesstui-all.xml
+        run: uv run python scripts/ci/run_checks.py harnesstui_all
+
       - name: Harnesstui quality gate
-        run: make check-harnesstui
+        if: ${{ fromJSON(inputs.plan).checks.harnesstui && !fromJSON(inputs.plan).checks.coding_ui }}
+        env:
+          PYTEST_ADDOPTS: >-
+            -o faulthandler_timeout=60
+            --junitxml=.artifacts/harnesstui-core.xml
+        run: uv run python scripts/ci/run_checks.py harnesstui
+
+      - name: Reject empty, skipped, or failing report
+        if: ${{ fromJSON(inputs.plan).checks.harnesstui && !fromJSON(inputs.plan).checks.coding_ui }}
+        run: uv run python scripts/dev/verify_pytest_xml.py .artifacts/harnesstui-core.xml
+
+      - name: Upload pytest report
+        if: ${{ always() && fromJSON(inputs.plan).checks.harnesstui && !fromJSON(inputs.plan).checks.coding_ui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: harnesstui-core-pytest-report
+          path: .artifacts/harnesstui-core.xml
+          if-no-files-found: warn
+
+      - name: Coding UI quality gate
+        if: ${{ fromJSON(inputs.plan).checks.coding_ui && !fromJSON(inputs.plan).checks.harnesstui }}
+        env:
+          PYTEST_ADDOPTS: >-
+            -o faulthandler_timeout=60
+            --junitxml=.artifacts/coding-ui.xml
+        run: uv run python scripts/ci/run_checks.py coding_ui
+
+      - name: Reject empty, skipped, or failing report
+        if: ${{ fromJSON(inputs.plan).checks.coding_ui && !fromJSON(inputs.plan).checks.harnesstui }}
+        run: uv run python scripts/dev/verify_pytest_xml.py .artifacts/coding-ui.xml
+
+      - name: Upload pytest report
+        if: ${{ always() && fromJSON(inputs.plan).checks.coding_ui && !fromJSON(inputs.plan).checks.harnesstui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coding-ui-pytest-report
+          path: .artifacts/coding-ui.xml
+          if-no-files-found: warn
+
+      - name: Reject empty, skipped, or failing combined report
+        if: ${{ fromJSON(inputs.plan).checks.harnesstui && fromJSON(inputs.plan).checks.coding_ui }}
+        run: uv run python scripts/dev/verify_pytest_xml.py .artifacts/harnesstui-all.xml
+
+      - name: Upload combined pytest report
+        if: ${{ always() && fromJSON(inputs.plan).checks.harnesstui && fromJSON(inputs.plan).checks.coding_ui }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: harnesstui-all-pytest-report
+          path: .artifacts/harnesstui-all.xml
+          if-no-files-found: warn

@@ -1,114 +1,125 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 
-def test_plugin_manager_resolves_local_plugin_package_roots(tmp_path) -> None:
-    from loushang.harness.resources.plugins import PluginManager
-
-    plugin_root = tmp_path / "plugins" / "review-pack"
-    package_root = plugin_root / "package"
-    package_root.mkdir(parents=True)
-    (plugin_root / "plugin.json").write_text(
-        json.dumps({"name": "review-pack", "version": "1.0.0", "packageRoot": "package"}),
-        encoding="utf-8",
-    )
-
-    manager = PluginManager()
-    plugin = manager.add_plugin_source(plugin_root)
-
-    assert plugin.manifest.name == "review-pack"
-    assert plugin.manifest.version == "1.0.0"
-    assert manager.get_plugin("review-pack") == plugin
-    assert manager.resolve_plugin("review-pack").package_roots == (package_root.resolve(),)
-    assert manager.resolve_package_roots() == (package_root.resolve(),)
-
-
-def test_plugin_manager_package_roots_feed_default_resource_loader(tmp_path) -> None:
-    from loushang.coding.resource_runtime import (
-        CodingResourceLoader as DefaultResourceLoader,
-    )
-    from loushang.harness.resources.plugins import PluginManager
-
-    project = tmp_path / "project"
-    plugin_root = tmp_path / "plugins" / "debug-pack"
-    skill_dir = plugin_root / "skills" / "debug"
-    project.mkdir()
-    skill_dir.mkdir(parents=True)
-    (skill_dir / "SKILL.md").write_text("Debugging skill", encoding="utf-8")
-
-    manager = PluginManager()
-    manager.add_plugin_source(plugin_root)
-
-    loader = DefaultResourceLoader(package_roots=manager.resolve_package_roots())
-    bundle = loader.discover_resources(project)
-
-    assert [skill.name for skill in bundle.skills] == ["debug"]
-    assert bundle.skills[0].source_kind == "external_package"
-    assert bundle.skills[0].content == "Debugging skill"
-
-
-def test_plugin_manager_can_disable_and_refresh_plugins(tmp_path) -> None:
-    from loushang.harness.resources.plugins import PluginManager
-
-    plugin_root = tmp_path / "plugins" / "demo"
-    plugin_root.mkdir(parents=True)
-
-    manager = PluginManager()
-    manager.add_plugin_source(plugin_root)
-    assert [plugin.manifest.name for plugin in manager.list_enabled_plugins()] == ["demo"]
-
-    disabled = manager.disable_plugin("demo")
-    assert disabled.enabled is False
-    assert manager.list_enabled_plugins() == []
-    assert manager.resolve_package_roots() == ()
-
-    (plugin_root / "plugin.json").write_text(json.dumps({"name": "renamed"}), encoding="utf-8")
-    refreshed = manager.refresh_plugins()
-    assert [plugin.manifest.name for plugin in refreshed] == ["renamed"]
-
-
-def test_plugin_manager_accepts_initial_disabled_plugins(tmp_path) -> None:
-    from loushang.harness.resources.plugins import PluginManager
-
-    plugin_root = tmp_path / "plugins" / "demo"
-    plugin_root.mkdir(parents=True)
-    (plugin_root / "plugin.json").write_text(json.dumps({"name": "demo"}), encoding="utf-8")
-
-    manager = PluginManager(disabled_plugins=("demo",))
-    plugin = manager.add_plugin_source(plugin_root)
-
-    assert plugin.enabled is False
-    assert manager.list_enabled_plugins() == []
-
-
-def test_plugin_manager_tracks_https_remote_sources_without_local_resolution() -> None:
-    from loushang.harness.resources.plugins import PluginManager
-
-    manager = PluginManager()
-    source = "https://packages.example.invalid/review-pack.git"
-
-    remote = manager.add_plugin_source(source)
-
-    assert remote.manifest.name == "review-pack"
-    assert remote.enabled is False
-    assert remote.source.kind == "remote"
-    assert remote.source.url == source
-    assert manager.resolve_package_roots() == ()
-    assert manager.list_remote_plugins() == [remote]
-
-
-def test_plugin_types_are_exported_from_harness() -> None:
+def test_plugin_authority_publishes_local_package_roots(tmp_path: Path) -> None:
+    from loushang.coding.resource_runtime import CodingPackageMaterializer
     from loushang.harness.resources.plugins import (
-        PluginManager,
-        PluginManifest,
-        PluginRegistry,
-        PluginResolver,
+        PluginResolutionAuthority,
         PluginSource,
     )
 
-    assert PluginManager is not None
-    assert PluginManifest is not None
-    assert PluginRegistry is not None
-    assert PluginResolver is not None
-    assert PluginSource is not None
+    plugin_root = _plugin(
+        tmp_path / "plugins" / "review-pack",
+        name="review-pack",
+        package_root="package",
+    )
+    package_root = plugin_root / "package"
+    package_root.mkdir()
+    authority = PluginResolutionAuthority()
+    inspection = authority.inspect(PluginSource(path=plugin_root))
+    materializer = CodingPackageMaterializer(install_root=tmp_path / "installed")
+
+    runtime = authority.publish_runtime((inspection,), binding_store=materializer)
+    try:
+        [plugin] = runtime.plugins
+        resources = authority.resolve_resources(plugin)
+
+        assert plugin.manifest.name == "review-pack"
+        assert plugin.manifest.version == "1.0.0"
+        assert resources.package_roots == (runtime.packages[0].root / "package",)
+        assert resources.package_roots[0] != package_root
+    finally:
+        runtime.close()
+
+
+def test_published_plugin_roots_feed_coding_resource_loader(tmp_path: Path) -> None:
+    from loushang.coding.resource_runtime import (
+        CodingPackageMaterializer,
+        CodingResourceLoader,
+    )
+    from loushang.harness.resources.plugins import (
+        PluginResolutionAuthority,
+        PluginSource,
+    )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    plugin_root = _plugin(tmp_path / "plugins" / "debug-pack", name="debug-pack")
+    skill_dir = plugin_root / "skills" / "debug"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("Debugging skill", encoding="utf-8")
+    authority = PluginResolutionAuthority()
+    inspection = authority.inspect(PluginSource(path=plugin_root))
+    materializer = CodingPackageMaterializer(install_root=tmp_path / "installed")
+
+    runtime = authority.publish_runtime((inspection,), binding_store=materializer)
+    try:
+        roots = authority.resolve_resources(runtime.plugins[0]).package_roots
+        bundle = CodingResourceLoader(package_roots=roots).discover_resources(project)
+
+        assert [skill.name for skill in bundle.skills] == ["debug"]
+        assert bundle.skills[0].source_kind == "external_package"
+        assert bundle.skills[0].content == "Debugging skill"
+    finally:
+        runtime.close()
+
+
+def test_plugin_authority_applies_product_disabled_policy(tmp_path: Path) -> None:
+    from loushang.harness.resources.plugins import (
+        PluginResolutionAuthority,
+        PluginSource,
+    )
+
+    plugin_root = _plugin(tmp_path / "plugins" / "demo", name="demo")
+    inspection = PluginResolutionAuthority(disabled_plugins=("demo",)).inspect(
+        PluginSource(path=plugin_root)
+    )
+
+    assert inspection.plugin is not None
+    assert inspection.plugin.enabled is False
+    assert inspection.runtime_ready is True
+
+
+def test_remote_plugin_source_remains_inert_without_materialization() -> None:
+    from loushang.harness.resources.plugins import (
+        PluginResolutionAuthority,
+        PluginSource,
+    )
+
+    source = "https://packages.example.invalid/review-pack.git"
+    inspection = PluginResolutionAuthority().inspect(
+        PluginSource(url=source, kind="remote")
+    )
+
+    assert inspection.package is None
+    assert inspection.plugin is not None
+    assert inspection.plugin.enabled is False
+    assert inspection.plugin.source.url == source
+    assert inspection.runtime_ready is False
+
+
+def test_public_plugin_surface_excludes_retired_inventory_adapters() -> None:
+    import loushang.harness.resources.plugins as public_plugins
+
+    assert hasattr(public_plugins, "PluginResolutionAuthority")
+    assert hasattr(public_plugins, "PluginRegistry")
+    assert hasattr(public_plugins, "PluginSource")
+    assert not hasattr(public_plugins, "PluginManager")
+    assert not hasattr(public_plugins, "PluginResolver")
+
+
+def _plugin(
+    root: Path,
+    *,
+    name: str,
+    package_root: str | None = None,
+) -> Path:
+    root.mkdir(parents=True)
+    manifest: dict[str, object] = {"name": name, "version": "1.0.0"}
+    if package_root is not None:
+        manifest["packageRoot"] = package_root
+    (root / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root

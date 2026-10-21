@@ -7,23 +7,48 @@ Product wire formats and display projections remain outside Harness.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from inspect import isawaitable
+from typing import Literal, Protocol, cast
 
 from loushang.agent.types import AgentMessage
+from loushang.ai.json_codec import deserialize_message
 from loushang.ai.model import ModelSelection
 from loushang.ai.types import AssistantMessage
 from loushang.harness.runtime.types import RunState
+from loushang.harness.session.model_call import (
+    project_model_request_options,
+    project_model_tools,
+)
 from loushang.harness.transcript import (
     AGENT_MESSAGE_KIND,
     CONTEXT_COMPACTION_CHECKPOINT_KIND,
+    MODEL_CALL_OUTCOME_KIND,
+    MODEL_INPUT_PREPARED_KIND,
     AgentTranscriptInspector,
+    AgentTranscriptRecord,
     AgentTranscriptSession,
-    ContextCompactionCheckpoint,
+    ModelCallOutcome,
+    ProviderContextAnchor,
+    ReplayContextSurfaceMeasurement,
     build_context_usage_snapshot,
     calculate_context_tokens,
     estimate_context_tokens,
+    measure_replay_context_surface,
+    measure_structural_envelope_fingerprint,
+    project_context_from_provider_anchor,
+    project_model_call_usage,
+)
+
+TokenUsageTotalsSource = Literal[
+    "attempt_usage_facts",
+    "logical_outcome_derived",
+    "legacy_derived",
+    "mixed_derived",
+]
+_PROVIDER_CONTEXT_ANCHOR_PURPOSES = frozenset(
+    {"main", "main_turn", "continuation", "retry"}
 )
 
 
@@ -89,12 +114,27 @@ class ContextUsage:
     threshold_tokens: int | None = None
     threshold_reason: Literal["compact_percent", "reserve_tokens"] | None = None
     source: Literal[
-        "assistant_usage", "estimated_from_last_usage", "estimated", "unknown"
+        "assistant_usage",
+        "provider_anchor",
+        "estimated_from_last_usage",
+        "estimated",
+        "unknown",
     ] = "unknown"
     last_usage_index: int | None = None
     stale_after_compaction: bool = False
     compactable: bool = False
     reason: str | None = None
+    authority: Literal["provider_usage", "local_estimator", "unknown"] = "unknown"
+    accuracy: Literal["projected", "estimated", "unknown"] = "unknown"
+    transcript_revision: int | None = None
+    leaf_id: str | None = None
+    estimator_id: str | None = None
+    surface_fingerprint: str | None = None
+    provider_anchor: ProviderContextAnchor | None = None
+    structural_envelope_fingerprint: str | None = None
+    structural_envelope_status: Literal[
+        "logical_match", "logical_mismatch", "unavailable"
+    ] = "unavailable"
 
 
 @dataclass(frozen=True)
@@ -104,6 +144,8 @@ class TokenUsageTotals:
     cache_read: int = 0
     cache_write: int = 0
     total: int = 0
+    source: TokenUsageTotalsSource = "legacy_derived"
+    incomplete_attempts: bool = True
 
 
 @dataclass(frozen=True)
@@ -134,13 +176,23 @@ class AgentSessionInspector:
     get_active_tool_names: Callable[[], list[str]]
     is_retrying: Callable[[], bool]
     is_compacting: Callable[[], bool]
-    get_last_diagnostics: Callable[[int], list[object]]
+    get_last_diagnostics: Callable[[int], Sequence[object]]
     get_model_selection: Callable[[], ModelSelection | None]
     is_host_running: Callable[[], bool] | None = None
     get_compaction_reserve_tokens: Callable[[], int] = lambda: 0
     get_compaction_compact_percent: Callable[[], float] = lambda: 100.0
     get_compaction_keep_recent_tokens: Callable[[], int | None] = lambda: None
     _transcript: AgentTranscriptInspector = field(init=False, repr=False)
+    _provider_anchor_cache_key: tuple[int, str | None] | None = field(
+        init=False,
+        default=None,
+        repr=False,
+    )
+    _provider_anchor_cache: ProviderContextAnchor | None = field(
+        init=False,
+        default=None,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         self._transcript = AgentTranscriptInspector(self.session)
@@ -167,8 +219,11 @@ class AgentSessionInspector:
     def get_context_usage(self) -> ContextUsage:
         context = self.session.build_context()
         messages = list(context.messages)
-        branch_entries: list[object] = list(self.session.get_branch())
-        counts = self._transcript.message_counts()
+        branch_records = self.session.get_branch()
+        branch_entries: list[object] = list(branch_records)
+        transcript_revision = len(self.session.get_entries())
+        leaf_id = self.session.get_leaf_id()
+        counts = self._transcript.message_counts(messages=messages)
         snapshot = build_context_usage_snapshot(
             messages,
             branch_entries,
@@ -176,7 +231,27 @@ class AgentSessionInspector:
             reserve_tokens=self.get_compaction_reserve_tokens(),
             compact_percent=self.get_compaction_compact_percent(),
             keep_recent_tokens=self.get_compaction_keep_recent_tokens(),
+            transcript_revision=transcript_revision,
+            leaf_id=leaf_id,
         )
+        provider_anchor = self._get_provider_context_anchor(
+            branch_records,
+            transcript_revision=transcript_revision,
+            leaf_id=leaf_id,
+        )
+        if provider_anchor is not None and self._anchor_matches_active_model(
+            provider_anchor
+        ):
+            snapshot = project_context_from_provider_anchor(
+                snapshot,
+                provider_anchor,
+                self._measure_current_model_surface(messages),
+                structural_envelope_fingerprint=(
+                    self._current_structural_envelope_fingerprint()
+                ),
+            )
+        else:
+            snapshot = replace(snapshot, provider_anchor=provider_anchor)
         estimated_context_tokens = (
             estimate_context_tokens(messages).tokens if messages else 0
         )
@@ -206,7 +281,159 @@ class AgentSessionInspector:
             stale_after_compaction=snapshot.stale_after_compaction,
             compactable=snapshot.compactable,
             reason=snapshot.reason,
+            authority=snapshot.authority,
+            accuracy=snapshot.accuracy,
+            transcript_revision=snapshot.transcript_revision,
+            leaf_id=snapshot.leaf_id,
+            estimator_id=snapshot.estimator_id,
+            surface_fingerprint=snapshot.surface_fingerprint,
+            provider_anchor=snapshot.provider_anchor,
+            structural_envelope_fingerprint=(
+                snapshot.structural_envelope_fingerprint
+            ),
+            structural_envelope_status=snapshot.structural_envelope_status,
         )
+
+    def _get_provider_context_anchor(
+        self,
+        branch_entries: Sequence[AgentTranscriptRecord],
+        *,
+        transcript_revision: int,
+        leaf_id: str | None,
+    ) -> ProviderContextAnchor | None:
+        cache_key = (transcript_revision, leaf_id)
+        if self._provider_anchor_cache_key == cache_key:
+            return self._provider_anchor_cache
+        anchor = self._derive_provider_context_anchor(branch_entries)
+        self._provider_anchor_cache_key = cache_key
+        self._provider_anchor_cache = anchor
+        return anchor
+
+    def _anchor_matches_active_model(self, anchor: ProviderContextAnchor) -> bool:
+        model = self.agent.model
+        return (
+            anchor.provider_id == getattr(model, "provider_id", None)
+            and anchor.endpoint_id == getattr(model, "endpoint_id", None)
+            and anchor.api_id == getattr(model, "api", None)
+            and anchor.model_id == getattr(model, "id", None)
+        )
+
+    def _current_structural_envelope_fingerprint(self) -> str | None:
+        system_prompt = getattr(self.agent, "system_prompt", None)
+        tools = getattr(self.agent, "tools", None)
+        get_effective_call_options = getattr(
+            self.agent, "get_effective_call_options", None
+        )
+        model = self.agent.model
+        if (
+            not isinstance(system_prompt, str)
+            or tools is None
+            or not callable(get_effective_call_options)
+        ):
+            return None
+        call_options = get_effective_call_options()
+        return measure_structural_envelope_fingerprint(
+            system_prompt=system_prompt,
+            tools=project_model_tools(tools),
+            request_options=project_model_request_options(call_options),
+            provider_id=str(getattr(model, "provider_id", "")),
+            endpoint_id=str(getattr(model, "endpoint_id", "")),
+            api_id=str(getattr(model, "api", "")),
+            model_id=str(getattr(model, "id", "")),
+        )
+
+    def _measure_current_model_surface(
+        self,
+        messages: Sequence[AgentMessage],
+    ) -> ReplayContextSurfaceMeasurement | None:
+        if getattr(self.agent, "transform_context", None) is not None:
+            return None
+        convert_to_llm = getattr(self.agent, "convert_to_llm", None)
+        if not callable(convert_to_llm):
+            return None
+        try:
+            projected = convert_to_llm(list(messages))
+        except Exception:
+            return None
+        if isawaitable(projected):
+            close = getattr(projected, "close", None)
+            if callable(close):
+                close()
+            return None
+        if not isinstance(projected, Sequence) or isinstance(
+            projected, str | bytes | bytearray
+        ):
+            return None
+        return measure_replay_context_surface(
+            cast(Sequence[AgentMessage], projected)
+        )
+
+    def _derive_provider_context_anchor(
+        self,
+        branch_entries: Sequence[AgentTranscriptRecord],
+    ) -> ProviderContextAnchor | None:
+        # A provider observation made before compaction describes the old full
+        # prompt. Rebuilding it is expensive and cannot calibrate the summary.
+        for index in range(len(branch_entries) - 1, -1, -1):
+            if branch_entries[index].kind == CONTEXT_COMPACTION_CHECKPOINT_KIND:
+                branch_entries = branch_entries[index + 1 :]
+                if not branch_entries:
+                    return None
+                break
+        ledger = project_model_call_usage(tuple(branch_entries))
+        for attempt in reversed(ledger.attempts):
+            if not attempt.terminal:
+                continue
+            provider_prompt_tokens = (
+                attempt.usage.input
+                + attempt.usage.cache_read
+                + attempt.usage.cache_write
+            )
+            if provider_prompt_tokens <= 0:
+                continue
+            rebuilt = self.session.rebuild_model_input(
+                attempt.model_input_snapshot_id
+            )
+            snapshot = rebuilt.snapshot
+            if snapshot.purpose not in _PROVIDER_CONTEXT_ANCHOR_PURPOSES:
+                continue
+            raw_messages = rebuilt.logical_input.get("messages")
+            if not isinstance(raw_messages, list):
+                continue
+            messages = [
+                deserialize_message(dict(message))
+                for message in raw_messages
+                if isinstance(message, Mapping)
+            ]
+            if len(messages) != len(raw_messages):
+                continue
+            sampled_surface = measure_replay_context_surface(messages)
+            sampled_envelope = measure_structural_envelope_fingerprint(
+                system_prompt=rebuilt.logical_input["system_prompt"],
+                tools=rebuilt.logical_input["tools"],
+                request_options=rebuilt.logical_input["request_options"],
+                provider_id=snapshot.provider_id,
+                endpoint_id=snapshot.endpoint_id,
+                api_id=snapshot.api_id,
+                model_id=snapshot.model_id,
+            )
+            return ProviderContextAnchor(
+                invocation_id=attempt.invocation_id,
+                attempt=attempt.attempt,
+                model_input_snapshot_id=attempt.model_input_snapshot_id,
+                provider_prompt_tokens=provider_prompt_tokens,
+                sampled_prepared_payload_hash=rebuilt.prepared_payload_hash,
+                sampled_surface_tokens=sampled_surface.tokens,
+                sampled_surface_fingerprint=sampled_surface.surface_fingerprint,
+                source_revision=snapshot.source_revision,
+                commit_revision=snapshot.commit_revision,
+                provider_id=snapshot.provider_id,
+                endpoint_id=snapshot.endpoint_id,
+                api_id=snapshot.api_id,
+                model_id=snapshot.model_id,
+                sampled_structural_envelope_fingerprint=sampled_envelope,
+            )
+        return None
 
     def build_session_stats(self) -> SessionStats:
         context_usage = self.get_context_usage()
@@ -245,55 +472,151 @@ class AgentSessionInspector:
         return self._transcript.recent_assistant_texts(self.agent.state.messages)
 
 
-def _build_token_usage_totals(branch_entries: list[object]) -> TokenUsageTotals:
-    latest_compaction = _latest_compaction_with_index(branch_entries)
+def _build_token_usage_totals(
+    branch_entries: Sequence[AgentTranscriptRecord],
+) -> TokenUsageTotals:
     input_tokens = 0
     output_tokens = 0
     cache_read_tokens = 0
     cache_write_tokens = 0
     total_tokens = 0
-    start_index = 0
+    ledger = project_model_call_usage(tuple(branch_entries))
+    fact_invocations = {attempt.invocation_id for attempt in ledger.attempts}
+    terminal_fact_snapshots: dict[str, set[str]] = {}
+    for attempt in ledger.attempts:
+        if attempt.terminal:
+            terminal_fact_snapshots.setdefault(attempt.invocation_id, set()).add(
+                attempt.model_input_snapshot_id
+            )
+    fact_usage = ledger.usage
+    input_tokens += fact_usage.input
+    output_tokens += fact_usage.output
+    cache_read_tokens += fact_usage.cache_read
+    cache_write_tokens += fact_usage.cache_write
+    total_tokens += calculate_context_tokens(fact_usage)
+    fact_outcome_invocations: set[str] = set()
+    fallback_outcome_count = 0
+    covered_assistant_indexes = _outcome_covered_assistant_indexes(branch_entries)
+    legacy_count = 0
 
-    if latest_compaction is not None:
-        compaction, index = latest_compaction
-        input_tokens += compaction.tokens_before
-        total_tokens += compaction.tokens_before
-        start_index = index + 1
-
-    for entry in branch_entries[start_index:]:
-        if getattr(entry, "kind", None) != AGENT_MESSAGE_KIND:
+    for index, entry in enumerate(branch_entries):
+        payload = getattr(entry, "payload", None)
+        if (
+            getattr(entry, "kind", None) == MODEL_CALL_OUTCOME_KIND
+            and isinstance(payload, ModelCallOutcome)
+        ):
+            if payload.invocation_id in fact_invocations:
+                fact_outcome_invocations.add(payload.invocation_id)
+                continue
+            fallback_outcome_count += 1
+            usage = payload.usage
+        elif (
+            index not in covered_assistant_indexes
+            and getattr(entry, "kind", None) == AGENT_MESSAGE_KIND
+            and isinstance(payload, AssistantMessage)
+            and payload.stop_reason not in {"aborted", "error"}
+        ):
+            legacy_count += 1
+            usage = payload.usage
+        else:
             continue
-        message = getattr(entry, "payload", None)
-        if not isinstance(message, AssistantMessage):
-            continue
-        if message.stop_reason in {"aborted", "error"}:
-            continue
-        usage = message.usage
         input_tokens += int(getattr(usage, "input", 0) or 0)
         output_tokens += int(getattr(usage, "output", 0) or 0)
         cache_read_tokens += int(getattr(usage, "cache_read", 0) or 0)
         cache_write_tokens += int(getattr(usage, "cache_write", 0) or 0)
         total_tokens += calculate_context_tokens(usage)
 
+    facts_complete = ledger.complete
+    if facts_complete:
+        facts_complete = fact_invocations == fact_outcome_invocations and all(
+            set(outcome.model_input_snapshot_ids)
+            == terminal_fact_snapshots.get(outcome.invocation_id, set())
+            for entry in branch_entries
+            if getattr(entry, "kind", None) == MODEL_CALL_OUTCOME_KIND
+            and isinstance((outcome := getattr(entry, "payload", None)), ModelCallOutcome)
+            and outcome.invocation_id in fact_invocations
+        )
+    has_facts = bool(ledger.attempts)
+    has_fallback = bool(fallback_outcome_count or legacy_count)
     return TokenUsageTotals(
         input=input_tokens,
         output=output_tokens,
         cache_read=cache_read_tokens,
         cache_write=cache_write_tokens,
         total=total_tokens,
+        source=(
+            "mixed_derived"
+            if has_facts and has_fallback
+            else "attempt_usage_facts"
+            if has_facts
+            else "mixed_derived"
+            if fallback_outcome_count and legacy_count
+            else "logical_outcome_derived"
+            if fallback_outcome_count
+            else "legacy_derived"
+        ),
+        incomplete_attempts=(not facts_complete or has_fallback),
     )
 
 
-def _latest_compaction_with_index(
-    entries: list[object],
-) -> tuple[ContextCompactionCheckpoint, int] | None:
-    for index in range(len(entries) - 1, -1, -1):
-        entry = entries[index]
-        if getattr(entry, "kind", None) != CONTEXT_COMPACTION_CHECKPOINT_KIND:
+def _outcome_covered_assistant_indexes(
+    entries: Sequence[AgentTranscriptRecord],
+) -> set[int]:
+    """Find legacy assistant projections already represented by durable outcomes."""
+
+    snapshot_indexes = {
+        snapshot_id: index
+        for index, entry in enumerate(entries)
+        if getattr(entry, "kind", None) == MODEL_INPUT_PREPARED_KIND
+        and isinstance((snapshot_id := getattr(entry.payload, "snapshot_id", None)), str)
+    }
+    assistant_indexes = [
+        index
+        for index, entry in enumerate(entries)
+        if getattr(entry, "kind", None) == AGENT_MESSAGE_KIND
+        and isinstance(getattr(entry, "payload", None), AssistantMessage)
+    ]
+    covered: set[int] = set()
+    for outcome_index, entry in enumerate(entries):
+        outcome = getattr(entry, "payload", None)
+        if (
+            getattr(entry, "kind", None) != MODEL_CALL_OUTCOME_KIND
+            or not isinstance(outcome, ModelCallOutcome)
+            or outcome.disposition != "completed"
+        ):
             continue
-        if isinstance(getattr(entry, "payload", None), ContextCompactionCheckpoint):
-            return entry.payload, index
-    return None
+        attempt_indexes = [
+            snapshot_indexes[snapshot_id]
+            for snapshot_id in outcome.model_input_snapshot_ids
+            if snapshot_id in snapshot_indexes
+        ]
+        if not attempt_indexes:
+            continue
+        first_attempt_index = min(attempt_indexes)
+        following = next(
+            (
+                assistant_index
+                for assistant_index in assistant_indexes
+                if assistant_index > outcome_index
+                and not any(
+                    getattr(candidate, "kind", None)
+                    in {MODEL_INPUT_PREPARED_KIND, MODEL_CALL_OUTCOME_KIND}
+                    for candidate in entries[outcome_index + 1 : assistant_index]
+                )
+            ),
+            None,
+        )
+        if following is not None:
+            covered.add(following)
+            continue
+        preceding = [
+            assistant_index
+            for assistant_index in assistant_indexes
+            if first_attempt_index < assistant_index < outcome_index
+        ]
+        if preceding:
+            covered.add(preceding[-1])
+    return covered
 
 
 __all__ = [

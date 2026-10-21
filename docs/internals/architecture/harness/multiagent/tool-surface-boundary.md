@@ -1,10 +1,9 @@
 # Multi-Agent Tool Surface Boundary
 
-> Status: **draft boundary, implementation aligned in part**。本文保留
-> spawn / send / wait 三个核心交互的参数、结果与提示纪律；一期公共
-> tool pack 另含 `list_agents` / `interrupt_agent` / `close_agent`，
-> 其当前实施状态以
-> [Temporary Implementation Plan](implementation-plan.md) 为准。
+> Status: **implemented**（已实现，与 `MultiAgentToolPack` 代码一致）。
+> 七件套工具（spawn_agent / send_message / wait_agent / get_agent_result /
+> list_agents / interrupt_agent / close_agent）已完整交付；参数、结果与提示纪律
+> 与当前实现一致。
 
 ## Scope
 
@@ -13,9 +12,15 @@ multiagent 内核之外唯一依赖 agent 工具框架的位置：它把
 Control / AgentInputFacade / Registry 的能力封装为模型可调用工具，
 并承载提示纪律（briefing 要求、通知纪律）这一模型行为的关键杠杆。
 
+这套工具面表达的是“可持续寻址的协作 actor”，不是所有由 Agent 实现的
+远端能力。一次性远端 Agent 应注册为普通 `invoke -> result` tool；长时但
+不可交互的调用应使用最小 job contract。只有需要 steering、follow-up、
+等待 activity 或显式关闭时，才使用本工具面。远程与本地的边界决策见
+[Remote Agent Capability Boundary](remote-agent-capability-boundary.md)。
+
 本文定义：
 
-- 三件套工具的参数面与结果 shape
+- 七件套工具的参数面与结果 shape
 - 参数校验与错误语义
 - 提示纪律资源（可替换）
 - 产品裁剪（暴露子集、类型白名单）
@@ -99,7 +104,21 @@ spawn 立即返回（ARD-002 全异步）；子 agent 的结果**不在此返回
 }
 ```
 
-只给摘要不给内容——通知全文在后续 turn 作为 user-role 消息出现。
+`wait_agent` 只给活动摘要；完成通知在后续 turn 到达，短结果携带原文，
+长结果携带截断预览与读取引用。
+
+### `get_agent_result`
+
+完成通知若超过内联预算，会标明截断并给出精确的 path、incarnation、
+round_id。原接收方可按字符偏移分段读取原文，无须启动子 agent 新一轮：
+
+```json
+{"path":"/root/research_auth","incarnation":1,"round_id":1,"offset":0,"limit":4000}
+```
+
+返回 `chunk`、`next_offset`（末页为 null）、`total_chars` 和状态。
+读取限于当前 Control 生命周期；关闭子 agent 不删除既有结果，路径重用
+也不改变结果归属。`wait_agent` 仍只报告活动，不承载正文。
 
 ## Validation And Error Semantics
 
@@ -117,6 +136,8 @@ spawn 立即返回（ARD-002 全异步）；子 agent 的结果**不在此返回
 | `agent_reference_ambiguous` | Registry | 相对名歧义（附候选全路径） |
 | `agent_not_found` | Registry | 目标不存在 |
 | `agent_not_addressable` | AgentInputFacade | 目标已 close，不可投递 |
+| `agent_result_not_found` | Control | 精确的 incarnation / round 结果不存在或已随会话释放 |
+| `agent_authority_denied` | Control | 非完成通知的原接收方尝试读取结果 |
 | `invalid_fork_option` | ContextFactory | fork 档位非法或与 model 覆盖冲突 |
 | `spawn_rejected` | Control | 其他 spawn 拒绝（如类型工具为空） |
 

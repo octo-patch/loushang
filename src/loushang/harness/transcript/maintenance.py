@@ -1,69 +1,42 @@
-"""Maintenance primitives for the optional Agent transcript profile.
+"""Compaction lifecycle for the optional Agent transcript profile.
 
-The profile owns durable conversation facts.  This module owns the reusable
-runtime calculations around those facts: context-budget observations and
-automatic retry lifecycle.  Product code supplies settings, continuation, and
-presentation/diagnostic adapters; it does not need to reimplement the state
-machines.
+The profile owns durable conversation facts. Adjacent ``context_usage`` owns
+context-budget observations; this module owns compaction decisions and
+lifecycle mechanics around those facts. Product code supplies policy and
+presentation or diagnostic adapters.
 """
 
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import UTC, datetime
+from time import monotonic
 from typing import Any, Literal, Protocol
 
 from loushang.agent.types import AgentMessage
-from loushang.ai.types import AssistantMessage, ToolResultMessage, UserMessage
-from loushang.harness.context.budget import calculate_compaction_budget
+from loushang.ai.types import AssistantMessage
 from loushang.harness.context.compaction import CompactionCoordinator
-from loushang.harness.context.usage import ContextUsageEstimate
 from loushang.harness.conversation import ConversationRecord
 from loushang.harness.events import (
     CompactionReason,
     ContextCompactionCompleted,
     ContextCompactionStarted,
-    RetryAttempt,
-    RetryCompleted,
-    RetryOutcome,
-    RetryStarted,
     SessionRuntimeEventPayload,
 )
-from loushang.harness.runtime import CancellationController, CancellationSignal
-from loushang.harness.runtime.retry import RetryCoordinator, RetryPolicy
-from loushang.harness.transcript.kinds import (
-    AGENT_MESSAGE_KIND,
-    CONTEXT_COMPACTION_CHECKPOINT_KIND,
+from loushang.harness.transcript.context_usage import (
+    ContextUsageSnapshot,
+    build_context_usage_snapshot,
+    calculate_context_tokens,
+    current_context_usage,
+    estimate_context_tokens,
+    estimate_message_tokens,
+    has_post_compaction_usage,
+    latest_compaction_entry,
+    model_context_window,
 )
 from loushang.harness.transcript.types import AgentTranscriptRecord
-
-ContextUsageSource = Literal[
-    "assistant_usage", "estimated_from_last_usage", "estimated", "unknown"
-]
-
-
-@dataclass(frozen=True)
-class ContextUsageSnapshot:
-    """One context-budget observation over an Agent transcript branch."""
-
-    tokens: int | None
-    context_window: int | None
-    reserve_tokens: int
-    compact_percent: float = 100.0
-    keep_recent_tokens: int | None = None
-    percent_threshold_tokens: int | None = None
-    reserve_threshold_tokens: int | None = None
-    threshold_tokens: int | None = None
-    threshold_reason: Literal["compact_percent", "reserve_tokens"] | None = None
-    percent: float | None = None
-    source: ContextUsageSource = "unknown"
-    last_usage_index: int | None = None
-    stale_after_compaction: bool = False
-    compactable: bool = False
-    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -84,6 +57,32 @@ class CompactionResult:
     first_kept_entry_id: str
     tokens_before: int
     details: object | None = None
+    model_input_snapshot_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.model_input_snapshot_ids, tuple) or any(
+            not isinstance(item, str) or not item.strip()
+            for item in self.model_input_snapshot_ids
+        ):
+            raise TypeError(
+                "compaction Model Input snapshot ids must be non-empty strings"
+            )
+        if len(set(self.model_input_snapshot_ids)) != len(
+            self.model_input_snapshot_ids
+        ):
+            raise ValueError("compaction Model Input snapshot ids must be unique")
+
+
+class CompactionAborted(RuntimeError):
+    """A Product hook deliberately stopped compaction before commit."""
+
+
+@dataclass(frozen=True)
+class AutoCompactionOutcome:
+    """Explicit control result for one automatic-compaction check."""
+
+    result: CompactionResult | None = None
+    should_continue: bool = False
 
 
 @dataclass(frozen=True)
@@ -94,6 +93,15 @@ class CompactionStatus:
     last_result: CompactionResult | None = None
     last_error: str | None = None
     aborted: bool = False
+    last_started_at: str | None = None
+    last_completed_at: str | None = None
+    last_stage: str | None = None
+    last_tokens_before: int | None = None
+    last_tokens_after: int | None = None
+    last_summary_mode: Literal["stream", "complete", "hook"] | None = None
+    last_succeeded: bool | None = None
+    context_window: int | None = None
+    reserve_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -131,208 +139,9 @@ class TranscriptCompactionPolicy:
     keep_recent_tokens: int | None = None
 
 
-_NON_RETRYABLE_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"requires an api key",
-        r"\bapi[-_ ]?key\b",
-        r"authorization",
-        r"authentication",
-        r"\bunauthorized\b",
-        r"\bforbidden\b",
-        r"\b401\b",
-        r"\b403\b",
-        r"access[_ -]?terminated",
-        r"access.?denied",
-        r"permission.?denied",
-        r"currently only available",
-    )
-)
-
-_RETRYABLE_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r"overloaded",
-        r"provider.?returned.?error",
-        r"rate.?limit",
-        r"too many requests",
-        r"\b429\b",
-        r"\b500\b",
-        r"\b502\b",
-        r"\b503\b",
-        r"\b504\b",
-        r"service.?unavailable",
-        r"server.?error",
-        r"internal.?error",
-        r"network.?error",
-        r"network.*connection.*lost",
-        r"connection.?error",
-        r"connection.?refused",
-        r"connection.*lost",
-        r"fetch failed",
-        r"upstream.?connect",
-        r"socket hang up",
-        r"ended without",
-        r"timed? out",
-        r"timeout",
-        r"terminated",
-        r"retry delay",
-    )
-)
-
-RetrySettingsProvider = Callable[[], RetryPolicy]
 EventDispatcher = Callable[[SessionRuntimeEventPayload], Awaitable[None]]
-ContinueRun = Callable[[], Awaitable[None]]
 RuntimeExceptionRecorder = Callable[..., None]
-RetrySleeper = Callable[[int, CancellationSignal], Awaitable[None]]
-WaitForIdle = Callable[[], Awaitable[None]]
-MessageProvider = Callable[[], list[AgentMessage]]
-MessageSetter = Callable[[list[AgentMessage]], None]
-ContextWindowProvider = Callable[[], int | None]
 ContextOverflowPredicate = Callable[[AssistantMessage, int], bool]
-
-
-class AgentTranscriptRetryRuntime:
-    """Run retry policy against one Agent transcript's live message state."""
-
-    def __init__(
-        self,
-        *,
-        get_policy: RetrySettingsProvider,
-        get_messages: MessageProvider,
-        set_messages: MessageSetter,
-        get_context_window: ContextWindowProvider,
-        dispatch_event: EventDispatcher,
-        continue_run: ContinueRun,
-        record_runtime_exception: RuntimeExceptionRecorder,
-        sleep_for_retry: RetrySleeper,
-        is_context_overflow_fn: ContextOverflowPredicate,
-        wait_for_idle: WaitForIdle | None = None,
-    ) -> None:
-        self._get_policy = get_policy
-        self._get_messages = get_messages
-        self._set_messages = set_messages
-        self._get_context_window = get_context_window
-        self._dispatch_event = dispatch_event
-        self._record_runtime_exception = record_runtime_exception
-        self._is_context_overflow = is_context_overflow_fn
-        self._coordinator = RetryCoordinator(
-            create_cancel_handle=CancellationController,
-            cancel=lambda controller: controller.abort(),
-            delay=lambda delay_ms, controller: sleep_for_retry(
-                delay_ms, controller.signal
-            ),
-            continue_run=continue_run,
-            on_started=self._on_started,
-            on_finished=self._on_finished,
-            wait_for_idle=wait_for_idle,
-        )
-
-    @property
-    def attempt(self) -> int:
-        return self._coordinator.attempt
-
-    @attempt.setter
-    def attempt(self, value: int) -> None:
-        self._coordinator.attempt = value
-
-    @property
-    def retry_future(self) -> asyncio.Future[None] | object | None:
-        return self._coordinator.future
-
-    @retry_future.setter
-    def retry_future(self, value: asyncio.Future[None] | object | None) -> None:
-        self._coordinator.future = value
-
-    @property
-    def is_retrying(self) -> bool:
-        return self._coordinator.is_retrying
-
-    @property
-    def cancel_handle(self) -> CancellationController | None:
-        return self._coordinator.cancel_handle
-
-    @cancel_handle.setter
-    def cancel_handle(self, value: CancellationController | None) -> None:
-        self._coordinator.cancel_handle = value
-
-    def abort(self) -> None:
-        self._coordinator.abort()
-
-    async def wait(self) -> None:
-        await self._coordinator.wait()
-
-    def ensure_future(self) -> asyncio.Future[None]:
-        return self._coordinator.ensure_waiter()
-
-    async def finish(
-        self,
-        *,
-        success: bool,
-        attempt: int,
-        final_error: str | None = None,
-    ) -> None:
-        await self._coordinator.finish(
-            RetryOutcome(
-                success=success,
-                attempt=attempt,
-                error=final_error,
-                cancelled=final_error == "Retry cancelled",
-            )
-        )
-
-    async def finish_success_if_needed(
-        self, assistant_message: AssistantMessage
-    ) -> None:
-        if assistant_message.stop_reason != "error" and self.attempt > 0:
-            await self.finish(success=True, attempt=self.attempt)
-
-    def should_prepare_retry(self, assistant_message: AssistantMessage) -> bool:
-        return self._get_policy().enabled and self.is_retryable_error(assistant_message)
-
-    def is_retryable_error(self, assistant_message: AssistantMessage) -> bool:
-        return is_retryable_assistant_error(
-            assistant_message,
-            context_window=self._get_context_window() or 0,
-            is_context_overflow_fn=self._is_context_overflow,
-        )
-
-    async def handle_retryable_error(self, assistant_message: AssistantMessage) -> bool:
-        return await self._coordinator.retry(
-            assistant_message.error_message or "",
-            policy=self._get_policy(),
-            before_retry=self._remove_failed_assistant,
-        )
-
-    async def _on_started(self, attempt: RetryAttempt) -> None:
-        await self._dispatch_event(RetryStarted(attempt=attempt))
-
-    async def _on_finished(self, outcome: RetryOutcome) -> None:
-        final_error = (
-            ("Retry cancelled" if outcome.cancelled else outcome.error)
-            if not outcome.success
-            else None
-        )
-        if final_error is not None:
-            self._record_runtime_exception(
-                code="retry_cancelled" if outcome.cancelled else "retry_failed",
-                exc=final_error,
-            )
-        await self._dispatch_event(
-            RetryCompleted(
-                outcome=RetryOutcome(
-                    success=outcome.success,
-                    attempt=outcome.attempt,
-                    error=final_error,
-                    cancelled=outcome.cancelled,
-                )
-            )
-        )
-
-    def _remove_failed_assistant(self) -> None:
-        messages = self._get_messages()
-        if messages and getattr(messages[-1], "role", None) == "assistant":
-            self._set_messages(messages[:-1])
 
 
 class TranscriptCompactionStore(Protocol):
@@ -347,6 +156,7 @@ class TranscriptCompactionStore(Protocol):
         tokens_before: int,
         details: object | None = None,
         from_hook: bool | None = None,
+        model_input_snapshot_ids: tuple[str, ...] = (),
     ) -> str: ...
 
 
@@ -378,7 +188,6 @@ CompactionHook = Callable[
     [CompactionHookRequest], Awaitable[CompactionHookDecision | None]
 ]
 CompactionCommitObserver = Callable[[CompactionResult, str, bool], Awaitable[None]]
-CompactionRunner = Callable[..., Awaitable[CompactionResult | None]]
 HasQueuedMessages = Callable[[], bool]
 
 
@@ -404,6 +213,8 @@ class AgentTranscriptCompactionRuntime:
         before_compaction: CompactionHook | None = None,
         after_compaction: CompactionCommitObserver | None = None,
         record_runtime_exception: RuntimeExceptionRecorder = _noop_record_runtime_exception,
+        product_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._transcript = transcript
         self._get_policy = get_policy
@@ -417,14 +228,28 @@ class AgentTranscriptCompactionRuntime:
         self._before_compaction = before_compaction
         self._after_compaction = after_compaction
         self._record_runtime_exception = record_runtime_exception
+        self._product_id = product_id
+        self._session_id = session_id
         self._lifecycle: CompactionCoordinator[CompactionResult] = (
             CompactionCoordinator()
         )
         self._overflow_recovery_attempted = False
+        self._last_started_at: str | None = None
+        self._last_completed_at: str | None = None
+        self._last_stage: str | None = None
+        self._last_tokens_before: int | None = None
+        self._last_tokens_after: int | None = None
+        self._last_summary_mode: Literal["stream", "complete", "hook"] | None = None
+        self._last_succeeded: bool | None = None
+        self._last_context_window: int | None = None
+        self._last_reserve_tokens: int | None = None
 
     @property
     def is_compacting(self) -> bool:
         return self._lifecycle.is_compacting
+
+    def owns_current_task(self) -> bool:
+        return self._lifecycle.owns_current_task()
 
     def get_status(self) -> CompactionStatus:
         status = self._lifecycle.get_status()
@@ -434,10 +259,25 @@ class AgentTranscriptCompactionRuntime:
             last_result=status.last_result,
             last_error=status.last_error,
             aborted=status.aborted,
+            last_started_at=self._last_started_at,
+            last_completed_at=self._last_completed_at,
+            last_stage=self._last_stage,
+            last_tokens_before=self._last_tokens_before,
+            last_tokens_after=self._last_tokens_after,
+            last_summary_mode=self._last_summary_mode,
+            last_succeeded=self._last_succeeded,
+            context_window=self._last_context_window,
+            reserve_tokens=self._last_reserve_tokens,
         )
 
     def abort(self) -> None:
         self._lifecycle.abort()
+
+    async def cancel_and_wait(self) -> None:
+        """Abort and join the active compaction before owner disposal."""
+
+        self.abort()
+        await self._lifecycle.wait()
 
     def clear_overflow_recovery_attempted(self) -> None:
         self._overflow_recovery_attempted = False
@@ -446,30 +286,26 @@ class AgentTranscriptCompactionRuntime:
         self,
         assistant_message: AssistantMessage,
         *,
-        compact_internal_fn: CompactionRunner | None = None,
-        continue_run_fn: ContinueRun | None = None,
         is_context_overflow_fn: ContextOverflowPredicate | None = None,
-    ) -> CompactionResult | None:
+    ) -> AutoCompactionOutcome:
         policy = self._get_policy()
         if not policy.enabled:
-            return None
+            return AutoCompactionOutcome()
         context_window = model_context_window(self._get_model()) or 0
-        if context_window <= 0:
-            return None
         branch = self._transcript.get_branch()
         latest_compaction = latest_compaction_entry(branch)
         if latest_compaction is not None and _message_is_before_or_at_entry(
             assistant_message, latest_compaction
         ):
-            return None
+            return AutoCompactionOutcome()
 
-        run_compact = compact_internal_fn or self.compact
         if is_context_overflow_fn is not None and is_context_overflow_fn(
             assistant_message, context_window
         ):
             if self._overflow_recovery_attempted:
                 message = (
-                    "Context overflow recovery failed after one compact-and-retry attempt. "
+                    "Context capacity recovery failed after one compact-and-retry "
+                    "attempt. "
                     "Try reducing context or switching to a larger-context model."
                 )
                 usage = _snapshot_payload(self.build_usage_snapshot(policy))
@@ -478,45 +314,67 @@ class AgentTranscriptCompactionRuntime:
                         reason="overflow",
                         result=None,
                         aborted=False,
-                        will_retry=True,
+                        will_retry=False,
                         error_message=message,
                         usage_before=usage,
                         usage_after=usage,
+                        stage="failed",
+                        product_id=self._product_id,
+                        session_id=self._session_id,
+                        duration_ms=0.0,
+                        tokens_before=_usage_tokens(usage),
+                        tokens_after=_usage_tokens(usage),
                     )
                 )
-                return None
+                return AutoCompactionOutcome()
             self._overflow_recovery_attempted = True
-            result = await run_compact(
+            result = await self.compact(
                 reason="overflow", will_retry=True, raise_on_error=False
             )
-            if result is not None and continue_run_fn is not None:
-                asyncio.ensure_future(continue_run_fn())
-            return result
+            return AutoCompactionOutcome(
+                result=result,
+                should_continue=result is not None,
+            )
 
-        context_messages = self._get_context_messages()
+        if context_window <= 0:
+            return AutoCompactionOutcome()
+
+        source_messages = tuple(self._get_context_messages())
+        context_messages = list(source_messages)
         if not any(message is assistant_message for message in context_messages):
             context_messages.append(assistant_message)
-        decision = build_threshold_compaction_decision(
-            context_messages,
-            branch,
-            self._get_model(),
+        model = self._get_model()
+        branch_snapshot = tuple(branch)
+        # Surface fingerprinting and token estimation scan every message. Keep
+        # terminal input and Working ticks live while this pure decision runs.
+        decision = await asyncio.to_thread(
+            build_threshold_compaction_decision,
+            tuple(context_messages),
+            branch_snapshot,
+            model,
             enabled=policy.enabled,
             reserve_tokens=policy.reserve_tokens,
             compact_percent=policy.compact_percent,
             keep_recent_tokens=policy.keep_recent_tokens,
+            include_surface_fingerprint=False,
         )
+        current_messages = tuple(self._get_context_messages())
+        if (
+            policy != self._get_policy()
+            or model != self._get_model()
+            or branch_snapshot != tuple(self._transcript.get_branch())
+            or current_messages not in (source_messages, tuple(context_messages))
+        ):
+            return AutoCompactionOutcome()
         if decision.usage.tokens is None or decision.action != "threshold":
-            return None
-        result = await run_compact(
+            return AutoCompactionOutcome()
+        result = await self.compact(
             reason="threshold", will_retry=False, raise_on_error=False
         )
-        if (
-            result is not None
-            and continue_run_fn is not None
-            and self._has_queued_messages()
-        ):
-            asyncio.ensure_future(continue_run_fn())
-        return result
+        return AutoCompactionOutcome(
+            result=result,
+            should_continue=result is not None and self._has_queued_messages(),
+        )
 
     async def compact(
         self,
@@ -528,52 +386,162 @@ class AgentTranscriptCompactionRuntime:
         execute_compaction: CompactionExecutor | None = None,
         prepare_compaction: PreparationProvider | None = None,
     ) -> CompactionResult | None:
+        started_at = monotonic()
         policy = self._get_policy()
         usage_before = _snapshot_payload(self.build_usage_snapshot(policy))
+        self._last_started_at = _utc_timestamp()
+        self._last_completed_at = None
+        self._last_stage = "started"
+        self._last_tokens_before = _usage_tokens(usage_before)
+        self._last_tokens_after = None
+        self._last_summary_mode = _summary_mode(self._get_model())
+        self._last_succeeded = None
+        self._last_context_window = _usage_integer(usage_before, "context_window")
+        self._last_reserve_tokens = policy.reserve_tokens
         await self._dispatch_event(
-            ContextCompactionStarted(reason=reason, usage=usage_before)
+            ContextCompactionStarted(
+                reason=reason,
+                usage=usage_before,
+                stage="started",
+                product_id=self._product_id,
+                session_id=self._session_id,
+                tokens_before=_usage_tokens(usage_before),
+            )
         )
+        committed: tuple[CompactionResult, str, bool] | None = None
+
+        async def execute_transaction() -> CompactionResult:
+            nonlocal committed
+            result, record_id, from_hook = await self._execute(
+                reason=reason,
+                custom_instructions=custom_instructions,
+                prepare_compaction=prepare_compaction or self._prepare_compaction,
+                execute_compaction=execute_compaction or self._execute_compaction,
+                policy=policy,
+            )
+            # A successful append is the commit point.  Refresh synchronously
+            # before yielding to Product observers so live context cannot lag
+            # behind a durable checkpoint.
+            self._refresh_context()
+            committed = (result, record_id, from_hook)
+            return result
+
+        task = asyncio.current_task()
+        abort_driver: Callable[[], None] | None = None
+        if task is not None:
+
+            def abort_task() -> None:
+                task.cancel()
+
+            abort_driver = abort_task
         try:
             result = await self._lifecycle.run(
-                lambda: self._execute(
-                    reason=reason,
-                    custom_instructions=custom_instructions,
-                    prepare_compaction=prepare_compaction or self._prepare_compaction,
-                    execute_compaction=execute_compaction or self._execute_compaction,
-                    policy=policy,
-                ),
+                execute_transaction,
                 reason=reason,
+                abort_driver=abort_driver,
             )
+        except asyncio.CancelledError:
+            await self._dispatch_compaction_completed(
+                reason=reason,
+                result=None,
+                aborted=True,
+                will_retry=will_retry,
+                policy=policy,
+                usage_before=usage_before,
+                started_at=started_at,
+                stage="aborted",
+            )
+            if raise_on_error:
+                raise
+            return None
         except Exception as exc:
             aborted = is_compaction_aborted(exc)
             if not aborted:
                 self._record_runtime_exception(code="compaction_failed", exc=exc)
-            await self._dispatch_event(
-                ContextCompactionCompleted(
-                    reason=reason,
-                    result=None,
-                    aborted=aborted,
-                    will_retry=will_retry,
-                    usage_before=usage_before,
-                    usage_after=_snapshot_payload(self.build_usage_snapshot(policy)),
-                    error_message=None if aborted else f"Compaction failed: {exc}",
-                )
+            await self._dispatch_compaction_completed(
+                reason=reason,
+                result=None,
+                aborted=aborted,
+                will_retry=will_retry,
+                policy=policy,
+                usage_before=usage_before,
+                started_at=started_at,
+                stage="aborted" if aborted else "failed",
+                error_message=None if aborted else f"Compaction failed: {exc}",
             )
             if raise_on_error:
                 raise
             return None
 
+        post_commit_failed = False
+        if committed is not None and self._after_compaction is not None:
+            committed_result, record_id, from_hook = committed
+            try:
+                await self._after_compaction(
+                    committed_result,
+                    record_id,
+                    from_hook,
+                )
+            except Exception as exc:
+                post_commit_failed = True
+                self._record_runtime_exception(
+                    code="compaction_post_commit_failed",
+                    exc=exc,
+                )
+
+        if committed is not None and committed[2]:
+            self._last_summary_mode = "hook"
+
+        await self._dispatch_compaction_completed(
+            reason=reason,
+            result=_compaction_result_payload(result),
+            aborted=False,
+            will_retry=will_retry,
+            policy=policy,
+            usage_before=usage_before,
+            started_at=started_at,
+            stage="post_hook_failed" if post_commit_failed else "committed",
+            checkpoint_record_id=committed[1] if committed is not None else None,
+        )
+        return result
+
+    async def _dispatch_compaction_completed(
+        self,
+        *,
+        reason: CompactionReason,
+        result: object | None,
+        aborted: bool,
+        will_retry: bool,
+        policy: TranscriptCompactionPolicy,
+        usage_before: Mapping[str, object],
+        started_at: float,
+        stage: Literal["aborted", "failed", "committed", "post_hook_failed"],
+        error_message: str | None = None,
+        checkpoint_record_id: str | None = None,
+    ) -> None:
+        usage_after = _snapshot_payload(self.build_usage_snapshot(policy))
+        self._last_completed_at = _utc_timestamp()
+        self._last_stage = stage
+        self._last_tokens_after = _usage_tokens(usage_after)
+        self._last_succeeded = stage in {"committed", "post_hook_failed"}
         await self._dispatch_event(
             ContextCompactionCompleted(
                 reason=reason,
-                result=asdict(result),
-                aborted=False,
+                result=result,
+                aborted=aborted,
                 will_retry=will_retry,
+                error_message=error_message,
                 usage_before=usage_before,
-                usage_after=_snapshot_payload(self.build_usage_snapshot(policy)),
+                usage_after=usage_after,
+                stage=stage,
+                product_id=self._product_id,
+                session_id=self._session_id,
+                duration_ms=round(max(monotonic() - started_at, 0.0) * 1_000, 3),
+                tokens_before=_usage_tokens(usage_before),
+                tokens_after=_usage_tokens(usage_after),
+                checkpoint_record_id=checkpoint_record_id,
             )
         )
-        return result
 
     def build_usage_snapshot(
         self, policy: TranscriptCompactionPolicy | None = None
@@ -596,7 +564,7 @@ class AgentTranscriptCompactionRuntime:
         prepare_compaction: PreparationProvider,
         execute_compaction: CompactionExecutor,
         policy: TranscriptCompactionPolicy,
-    ) -> CompactionResult:
+    ) -> tuple[CompactionResult, str, bool]:
         preparation = prepare_compaction(
             self._transcript.get_branch(),
             policy.keep_recent_tokens or 0,
@@ -617,7 +585,7 @@ class AgentTranscriptCompactionRuntime:
                 )
             )
             if decision is not None and decision.cancel:
-                raise RuntimeError("Compaction cancelled")
+                raise CompactionAborted("Compaction cancelled")
             if decision is not None and decision.result is not None:
                 result = decision.result
                 from_hook = True
@@ -631,149 +599,9 @@ class AgentTranscriptCompactionRuntime:
             result.tokens_before,
             details=result.details,
             from_hook=from_hook,
+            model_input_snapshot_ids=result.model_input_snapshot_ids,
         )
-        if self._after_compaction is not None:
-            await self._after_compaction(result, record_id, from_hook)
-        self._refresh_context()
-        return result
-
-
-def calculate_context_tokens(usage: object) -> int:
-    """Extract total tokens from stable AI usage values or their JSON form."""
-
-    total_tokens = _usage_value(usage, "totalTokens", "total_tokens")
-    if isinstance(total_tokens, int) and total_tokens > 0:
-        return total_tokens
-    return sum(
-        _integer_usage_value(_usage_value(usage, *keys))
-        for keys in (
-            ("input",),
-            ("output",),
-            ("cacheRead", "cache_read"),
-            ("cacheWrite", "cache_write"),
-        )
-    )
-
-
-def estimate_context_tokens(messages: Sequence[AgentMessage]) -> ContextUsageEstimate:
-    """Estimate current context using the latest completed assistant usage."""
-
-    sequence = list(messages)
-    last_usage = _last_assistant_usage_info(sequence)
-    if last_usage is None:
-        estimated = sum(estimate_message_tokens(message) for message in sequence)
-        return ContextUsageEstimate(
-            tokens=estimated,
-            usage_tokens=0,
-            trailing_tokens=estimated,
-            last_usage_index=None,
-        )
-
-    usage, usage_index = last_usage
-    usage_tokens = calculate_context_tokens(usage)
-    trailing_tokens = sum(
-        estimate_message_tokens(message) for message in sequence[usage_index + 1 :]
-    )
-    return ContextUsageEstimate(
-        tokens=usage_tokens + trailing_tokens,
-        usage_tokens=usage_tokens,
-        trailing_tokens=trailing_tokens,
-        last_usage_index=usage_index,
-    )
-
-
-def current_context_usage(
-    messages: Sequence[AgentMessage],
-    branch_entries: Sequence[object],
-    model: object | None,
-) -> tuple[int | None, int | None, float | None]:
-    snapshot = build_context_usage_snapshot(
-        messages, branch_entries, model, reserve_tokens=0
-    )
-    return snapshot.tokens, snapshot.context_window, snapshot.percent
-
-
-def build_context_usage_snapshot(
-    messages: Sequence[AgentMessage],
-    branch_entries: Sequence[object],
-    model: object | None,
-    *,
-    reserve_tokens: int,
-    compact_percent: float = 100.0,
-    keep_recent_tokens: int | None = None,
-) -> ContextUsageSnapshot:
-    context_window = model_context_window(model)
-    if context_window is None:
-        return ContextUsageSnapshot(
-            tokens=None,
-            context_window=None,
-            reserve_tokens=reserve_tokens,
-            compact_percent=compact_percent,
-            keep_recent_tokens=keep_recent_tokens,
-            threshold_tokens=None,
-            threshold_reason=None,
-            percent=None,
-            source="unknown",
-            last_usage_index=None,
-            stale_after_compaction=False,
-            compactable=False,
-            reason="unknown_context_window",
-        )
-
-    budget = calculate_compaction_budget(
-        context_window=context_window,
-        compact_percent=compact_percent,
-        reserve_tokens=reserve_tokens,
-    )
-    latest_compaction = latest_compaction_entry(branch_entries)
-    if latest_compaction is not None and not has_post_compaction_usage(
-        branch_entries, latest_compaction
-    ):
-        return ContextUsageSnapshot(
-            tokens=None,
-            context_window=context_window,
-            reserve_tokens=reserve_tokens,
-            compact_percent=budget.compact_percent,
-            keep_recent_tokens=keep_recent_tokens,
-            percent_threshold_tokens=budget.percent_threshold_tokens,
-            reserve_threshold_tokens=budget.reserve_threshold_tokens,
-            threshold_tokens=budget.threshold_tokens,
-            threshold_reason=budget.threshold_reason,
-            percent=None,
-            source="unknown",
-            last_usage_index=None,
-            stale_after_compaction=True,
-            compactable=False,
-            reason="stale_usage_after_compaction",
-        )
-
-    estimate = estimate_context_tokens(messages) if messages else None
-    tokens = estimate.tokens if estimate is not None else 0
-    last_usage_index = estimate.last_usage_index if estimate is not None else None
-    if estimate is None or last_usage_index is None:
-        source: ContextUsageSource = "estimated"
-    elif estimate.trailing_tokens > 0:
-        source = "estimated_from_last_usage"
-    else:
-        source = "assistant_usage"
-    compactable = tokens > budget.threshold_tokens
-    return ContextUsageSnapshot(
-        tokens=tokens,
-        context_window=context_window,
-        reserve_tokens=reserve_tokens,
-        compact_percent=budget.compact_percent,
-        keep_recent_tokens=keep_recent_tokens,
-        percent_threshold_tokens=budget.percent_threshold_tokens,
-        reserve_threshold_tokens=budget.reserve_threshold_tokens,
-        threshold_tokens=budget.threshold_tokens,
-        threshold_reason=budget.threshold_reason,
-        percent=(tokens / context_window) * 100,
-        source=source,
-        last_usage_index=last_usage_index,
-        stale_after_compaction=False,
-        compactable=compactable,
-        reason="threshold" if compactable else None,
-    )
+        return result, record_id, from_hook
 
 
 def build_threshold_compaction_decision(
@@ -785,6 +613,7 @@ def build_threshold_compaction_decision(
     reserve_tokens: int,
     compact_percent: float = 100.0,
     keep_recent_tokens: int | None = None,
+    include_surface_fingerprint: bool = True,
 ) -> CompactionDecision:
     snapshot = build_context_usage_snapshot(
         messages,
@@ -793,6 +622,7 @@ def build_threshold_compaction_decision(
         reserve_tokens=reserve_tokens,
         compact_percent=compact_percent,
         keep_recent_tokens=keep_recent_tokens,
+        include_surface_fingerprint=include_surface_fingerprint,
     )
     if enabled and snapshot.compactable:
         return CompactionDecision(
@@ -809,51 +639,9 @@ def build_threshold_compaction_decision(
     )
 
 
-def model_context_window(model: object | None) -> int | None:
-    capabilities: object | None = getattr(model, "capabilities", None)
-    raw_context_window: object | None = getattr(capabilities, "context_window", None)
-    if raw_context_window is None:
-        raw_context_window = getattr(model, "context_window", None)
-    return _positive_int(raw_context_window)
-
-
-def latest_compaction_entry(
-    entries: Sequence[object],
-) -> ConversationRecord[object] | None:
-    for entry in reversed(entries):
-        if (
-            isinstance(entry, ConversationRecord)
-            and entry.kind == CONTEXT_COMPACTION_CHECKPOINT_KIND
-        ):
-            return entry
-    return None
-
-
-def has_post_compaction_usage(
-    entries: Sequence[object], compaction: ConversationRecord[object]
-) -> bool:
-    try:
-        compaction_index = list(entries).index(compaction)
-    except ValueError:
-        return False
-    for entry in reversed(entries[compaction_index + 1 :]):
-        if (
-            not isinstance(entry, ConversationRecord)
-            or entry.kind != AGENT_MESSAGE_KIND
-        ):
-            continue
-        message = entry.payload
-        if not isinstance(message, AssistantMessage):
-            continue
-        if message.stop_reason in {"aborted", "error"}:
-            return False
-        return calculate_context_tokens(message.usage) > 0
-    return False
-
-
 def is_compaction_aborted(exc: Exception) -> bool:
     return (
-        str(exc) == "Compaction cancelled" or getattr(exc, "name", None) == "AbortError"
+        isinstance(exc, CompactionAborted) or getattr(exc, "name", None) == "AbortError"
     )
 
 
@@ -875,6 +663,35 @@ def _entry_timestamp_ms(timestamp: str) -> float | None:
 
 def _snapshot_payload(snapshot: ContextUsageSnapshot) -> dict[str, Any]:
     return asdict(snapshot)
+
+
+def _compaction_result_payload(result: CompactionResult) -> dict[str, Any]:
+    payload = asdict(result)
+    if not result.model_input_snapshot_ids:
+        payload.pop("model_input_snapshot_ids")
+    return payload
+
+
+def _usage_tokens(usage: Mapping[str, object]) -> int | None:
+    tokens = usage.get("tokens")
+    return tokens if isinstance(tokens, int) and not isinstance(tokens, bool) else None
+
+
+def _usage_integer(usage: Mapping[str, object], key: str) -> int | None:
+    value = usage.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _summary_mode(
+    model: object | None,
+) -> Literal["stream", "complete"] | None:
+    if model is None:
+        return None
+    return "stream" if bool(getattr(model, "supports_stream", False)) else "complete"
+
+
+def _utc_timestamp() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _with_preparation_details(
@@ -902,122 +719,12 @@ def _merge_preparation_result_details(
     return merged
 
 
-def is_retryable_assistant_error(
-    message: AssistantMessage,
-    *,
-    context_window: int,
-    is_context_overflow_fn: ContextOverflowPredicate,
-) -> bool:
-    if message.stop_reason != "error" or not message.error_message:
-        return False
-    if is_context_overflow_fn(message, context_window):
-        return False
-    if any(
-        pattern.search(message.error_message)
-        for pattern in _NON_RETRYABLE_ERROR_PATTERNS
-    ):
-        return False
-    return any(
-        pattern.search(message.error_message) for pattern in _RETRYABLE_ERROR_PATTERNS
-    )
-
-
-def _usage_value(usage: object, *keys: str) -> object | None:
-    if isinstance(usage, Mapping):
-        for key in keys:
-            value = usage.get(key)
-            if value is not None:
-                return value
-        return None
-    for key in keys:
-        if hasattr(usage, key):
-            value = getattr(usage, key)
-            if value is not None:
-                return value
-    return None
-
-
-def _integer_usage_value(value: object | None) -> int:
-    if isinstance(value, bool):
-        return 0
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float | str):
-        try:
-            return int(value)
-        except ValueError:
-            return 0
-    return 0
-
-
-def _positive_int(value: object | None) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value if value > 0 else None
-    if isinstance(value, float | str):
-        try:
-            parsed = int(value)
-        except ValueError:
-            return None
-        return parsed if parsed > 0 else None
-    return None
-
-
-def _last_assistant_usage_info(
-    messages: Sequence[AgentMessage],
-) -> tuple[object, int] | None:
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if isinstance(message, AssistantMessage) and message.stop_reason not in (
-            "aborted",
-            "error",
-        ):
-            return message.usage, index
-    return None
-
-
-def estimate_message_tokens(message: AgentMessage) -> int:
-    chars = 0
-    if isinstance(message, UserMessage):
-        if isinstance(message.content, str):
-            chars = len(message.content)
-        else:
-            for block in message.content:
-                if getattr(block, "type", None) == "text":
-                    chars += len(str(getattr(block, "text", "")))
-                elif getattr(block, "type", None) == "image":
-                    chars += 4_800
-        return (chars + 3) // 4
-    if isinstance(message, AssistantMessage):
-        for assistant_block in message.content:
-            block_type = getattr(assistant_block, "type", None)
-            if block_type == "text":
-                chars += len(str(getattr(assistant_block, "text", "")))
-            elif block_type == "thinking":
-                chars += len(str(getattr(assistant_block, "thinking", "")))
-            elif block_type == "toolCall":
-                chars += len(str(getattr(assistant_block, "name", ""))) + len(
-                    str(getattr(assistant_block, "arguments", ""))
-                )
-            elif block_type == "image":
-                chars += 4_800
-        return (chars + 3) // 4
-    if isinstance(message, ToolResultMessage):
-        for block in message.content:
-            if getattr(block, "type", None) == "text":
-                chars += len(str(getattr(block, "text", "")))
-            elif getattr(block, "type", None) == "image":
-                chars += 4_800
-        return (chars + 3) // 4
-    return 0
-
-
 __all__ = [
+    "AutoCompactionOutcome",
     "AgentTranscriptCompactionRuntime",
-    "AgentTranscriptRetryRuntime",
     "CompactionHookDecision",
     "CompactionHookRequest",
+    "CompactionAborted",
     "CompactionDecision",
     "CompactionPlan",
     "CompactionPreparation",
@@ -1033,7 +740,6 @@ __all__ = [
     "estimate_context_tokens",
     "estimate_message_tokens",
     "has_post_compaction_usage",
-    "is_retryable_assistant_error",
     "is_compaction_aborted",
     "latest_compaction_entry",
     "model_context_window",

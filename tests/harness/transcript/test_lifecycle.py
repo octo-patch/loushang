@@ -20,7 +20,6 @@ from loushang.harness.transcript import (
     AgentTranscriptRuntimeBinding,
     ModelSelectionSnapshot,
     create_agent_transcript_file_store,
-    delete_agent_transcript_jsonl,
     write_agent_transcript_export,
 )
 
@@ -90,7 +89,9 @@ def test_lifecycle_creates_restores_and_disposes_native_session(tmp_path: Path) 
         assert not context.session_file.exists()
         assert created.transcript.is_materialized is False
         staged = await created.transcript.append_model_selection(
-            ModelSelectionSnapshot(provider="provider", model_id="model")
+            ModelSelectionSnapshot(
+                endpoint_id="test-endpoint", provider="provider", model_id="model"
+            )
         )
         assert staged.receipt is None
         assert not context.session_file.exists()
@@ -114,6 +115,56 @@ def test_lifecycle_creates_restores_and_disposes_native_session(tmp_path: Path) 
         await restored.dispose()
 
         assert disposed == ["created", "restored"]
+
+    asyncio.run(scenario())
+
+
+def test_lifecycle_graph_ownership_retries_failed_runtime_release(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        attempts = 0
+
+        async def bind_runtime(context, binding: str):
+            nonlocal attempts
+
+            async def dispose() -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("transient transcript cleanup")
+
+            return AgentTranscriptRuntimeBinding(
+                store=MemoryConversationStore(
+                    record_id=lambda record: record.record_id
+                ),
+                key=ConversationKey("memory", context.header.conversation_id),
+                profile=AgentTranscriptProfile.default(),
+                product_binding=binding,
+                dispose=dispose,
+            )
+
+        lifecycle = AgentTranscriptLifecycle(bind_runtime=bind_runtime)
+        session = await lifecycle.create(
+            lifecycle.new_context(
+                session_dir=tmp_path,
+                cwd="/workspace",
+                persist=False,
+                header=_header(),
+            ),
+            "graph-owned",
+        )
+        session._begin_graph_construction()
+        session._commit_graph_ownership()
+
+        with pytest.raises(RuntimeError, match="transient transcript cleanup"):
+            await session._dispose_graph_owned()
+        assert session.ownership_state == "graph_owned"
+        await session._dispose_graph_owned()
+        await session.dispose()
+
+        assert session.ownership_state == "disposed"
+        assert attempts == 2
 
     asyncio.run(scenario())
 
@@ -293,14 +344,15 @@ def test_lifecycle_releases_binding_after_create_failure_and_protects_active_fil
         assert disposed == ["failed"]
 
         source = tmp_path / "deletable.jsonl"
+        from ._maintenance import delete_with_maintenance
         write_agent_transcript_export(source, _header(), [_record("record-1")])
         with pytest.raises(ValueError, match="currently active"):
-            await delete_agent_transcript_jsonl(
+            await delete_with_maintenance(
                 source,
                 current_session_file=source,
             )
-        assert await delete_agent_transcript_jsonl(source)
+        assert await delete_with_maintenance(source)
         assert not source.exists()
-        assert not await delete_agent_transcript_jsonl(source)
+        assert not await delete_with_maintenance(source)
 
     asyncio.run(scenario())

@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 def _run_git(args: list[str], *, cwd) -> None:
@@ -32,7 +35,6 @@ def test_package_materializer_records_pending_remote_sources(tmp_path) -> None:
     from loushang.coding.resource_runtime import (
         CodingPackageMaterializer as PackageMaterializer,
     )
-
     materializer = PackageMaterializer(install_root=tmp_path / "packages")
     source = "https://packages.example.invalid/review-pack.git"
 
@@ -334,6 +336,72 @@ def test_python_package_installer_backend_falls_back_to_pip_when_uv_is_missing(t
     assert installed.installer == "pip"
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX epoch fence")
+@pytest.mark.parametrize("backend_kind", ("git", "python"))
+@pytest.mark.parametrize("aliased", (False, True))
+def test_direct_backends_refuse_fenced_legacy_install_root(
+    tmp_path, backend_kind: str, aliased: bool
+) -> None:
+    from loushang.harness.resources.packages.materializer import (
+        GitPackageMaterializerBackend,
+        PackageMaterializationRecord,
+        PythonPackageInstallerBackend,
+    )
+    from loushang.harness.resources.plugins.revisions import PluginRevisionError
+
+    legacy_root = tmp_path / "packages"
+    install_root = legacy_root / "installed"
+    install_root.mkdir(parents=True)
+    (tmp_path / "packages.epochs" / "new-epoch").mkdir(parents=True)
+    target_root = tmp_path / "installed-alias" if aliased else install_root
+    if aliased:
+        target_root.symlink_to(install_root, target_is_directory=True)
+    calls: list[str] = []
+
+    class RecordingGitBackend(GitPackageMaterializerBackend):
+        def _run_git(
+            self, args: list[str], *, cwd: Path | None = None, check: bool = True
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(args[0])
+            if args[0] == "clone":
+                target = Path(args[-1])
+                (target / ".git").mkdir(parents=True)
+                (target / "bypass.txt").write_bytes(b"old Store write")
+            return subprocess.CompletedProcess(
+                args, 0, "deadbeef\n" if args[0] == "rev-parse" else "", ""
+            )
+
+    def runner(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args[0])
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    if backend_kind == "git":
+        target = target_root / "git-plugin"
+        record = PackageMaterializationRecord(
+            source="https://packages.example.test/git-plugin.git",
+            name="git-plugin",
+            lifecycle="materialization_pending",
+            target_path=target,
+        )
+        backend = RecordingGitBackend()
+    else:
+        target = target_root / "python-plugin"
+        record = PackageMaterializationRecord(
+            source="pypi:python-plugin==1.0",
+            name="python-plugin",
+            lifecycle="materialization_pending",
+            target_path=target,
+            source_type="python",
+            requirement="python-plugin==1.0",
+        )
+        backend = PythonPackageInstallerBackend(runner=runner)
+    with pytest.raises(PluginRevisionError) as refusal:
+        backend(record)
+    assert refusal.value.code == "plugin_revision_epoch_fenced"
+    assert calls == []
+    assert not target.exists()
+
+
 def test_package_materializer_materializes_python_package_sources_and_persists_lockfile(tmp_path) -> None:
     from loushang.coding.resource_runtime import (
         CodingPackageMaterializer as PackageMaterializer,
@@ -497,7 +565,10 @@ def test_git_package_materializer_backend_clones_remote_plugin_source(tmp_path) 
     from loushang.harness.resources.packages.materializer import (
         GitPackageMaterializerBackend,
     )
-    from loushang.harness.resources.plugins import PluginManager
+    from loushang.harness.resources.plugins import (
+        PluginResolutionAuthority,
+        PluginSource,
+    )
 
     source_repo = tmp_path / "source"
     source_repo.mkdir()
@@ -506,6 +577,7 @@ def test_git_package_materializer_backend_clones_remote_plugin_source(tmp_path) 
         encoding="utf-8",
     )
     (source_repo / "package").mkdir()
+    (source_repo / "package" / ".keep").write_text("", encoding="utf-8")
     _run_git(["init"], cwd=source_repo)
     _run_git(["config", "user.email", "test@example.invalid"], cwd=source_repo)
     _run_git(["config", "user.name", "Test User"], cwd=source_repo)
@@ -525,10 +597,13 @@ def test_git_package_materializer_backend_clones_remote_plugin_source(tmp_path) 
     assert record.lifecycle == "installed"
     assert record.target_path == tmp_path / "packages" / "review-pack"
     assert (record.target_path / "plugin.json").is_file()
-    manager = PluginManager()
-    plugin = manager.add_plugin_source(record.target_path)
-    assert plugin.manifest.name == "review-pack"
-    assert plugin.manifest.version == "1.2.3"
+    inspection = PluginResolutionAuthority().inspect(
+        PluginSource(path=record.target_path)
+    )
+    inspection.raise_for_error()
+    assert inspection.package is not None
+    assert inspection.package.manifest.name == "review-pack"
+    assert inspection.package.manifest.version == "1.2.3"
 
 
 def test_package_materializer_updates_existing_git_checkout(tmp_path) -> None:
@@ -952,12 +1027,31 @@ def test_package_materializer_reports_corrupt_lockfile_and_writes_atomically(tmp
     from loushang.coding.resource_runtime import (
         CodingPackageMaterializer as PackageMaterializer,
     )
+    from loushang.harness.resources.plugins.manifest import PluginManifestError
 
     lockfile = tmp_path / "package-lock.json"
     lockfile.write_text("not json", encoding="utf-8")
     materializer = PackageMaterializer(install_root=tmp_path / "packages")
 
     assert materializer.get_lockfile_diagnostics()[0]["code"] == "package_lockfile_unreadable"
+
+    with pytest.raises(PluginManifestError) as caught:
+        materializer.prepare_remote_source(
+            "https://packages.example.invalid/review-pack.git"
+        )
+    assert caught.value.code == "plugin_binding_lock_invalid"
+    assert lockfile.read_text(encoding="utf-8") == "not json"
+
+    valid_lock = json.dumps(
+        {
+            "version": 4,
+            "packages": [],
+            "pluginBindings": [],
+            "pluginBindingHeads": [],
+        }
+    )
+    lockfile.write_text(valid_lock, encoding="utf-8")
+    materializer = PackageMaterializer(install_root=tmp_path / "packages")
 
     original_replace = Path.replace
 
@@ -971,7 +1065,7 @@ def test_package_materializer_reports_corrupt_lockfile_and_writes_atomically(tmp
     with pytest.raises(RuntimeError, match="replace failed"):
         materializer.prepare_remote_source("https://packages.example.invalid/review-pack.git")
 
-    assert lockfile.read_text(encoding="utf-8") == "not json"
+    assert lockfile.read_text(encoding="utf-8") == valid_lock
 
 
 def test_package_materializer_skips_ref_pinned_update_checks(tmp_path) -> None:
@@ -1671,7 +1765,10 @@ def test_package_projection_reports_invalid_remote_manifest_diagnostics(tmp_path
 
     assert entries[0]["version"] == ""
     assert entries[0]["diagnostics"] == 1
-    assert entries[0]["manifestDiagnostics"][0]["code"] == "invalid_package_manifest"
+    assert (
+        entries[0]["manifestDiagnostics"][0]["code"]
+        == "plugin_declaration_invalid_json"
+    )
 
 
 def test_package_projection_reports_denied_materializer_security(tmp_path) -> None:

@@ -2,7 +2,10 @@
 
 ## Status
 
-Draft / exploratory.
+- Authority: proposed — non-normative architecture draft catalog
+- Design status: proposed
+- Implementation status: not-applicable
+- Owner: Loushang architecture
 
 This directory contains architecture drafts and research notes. They may be high
 value design inputs, but they are not accepted architecture unless a live ARD or
@@ -26,9 +29,36 @@ Current live references:
 
 ## Documents
 
+Standalone drafts:
+
+- [GUI 原生开发交接：Windows / macOS](gui-native-development-handoff.md)
+- [Loushang GUI Requirements](gui-requirements.md)
+- [GUI 系统上下文与边界合同](gui-system-context-and-boundary-contract.md)
+- [Loushang GUI Reference System Inventory](gui-reference-system-inventory.md)
+- [Loushang GUI Engineering Bootstrap Plan](gui-engineering-bootstrap-plan.md)
+- [Loushang GUI Engineering Bootstrap Review](gui-engineering-bootstrap-review.md)
+- [Foundation Refactor Plan](foundation-refactor-plan.md)
+- [Foundation Phase 0 Inventory](foundation-phase-0-inventory.md)
+- [Loushang Future Target Architecture V3.1](future-loushang-architecture-v3.1.md)
+- [Application Service Refactor](application-service-refactor.md)
+- [AppService Hosted Boundary With An Embedded TUI](appservice-embedded-tui-hosted-boundary-plan.md)
+- [AppHost Top-Level Placement (promoted to ARD-003)](apphost-top-level-placement.md)
+- [AppHost A0 Component Discovery (completed validation)](apphost-component-discovery-a0.md)
+- [AppHost A0 Contract Baseline (promoted to canonical AppHost scope)](apphost-contract-baseline-a0.md)
+- [Hosted Product Runtime V1 Delivery Plan](hosted-product-runtime-v1-plan.md)
+- [Harnesstui Named Mux And Daemon Attach](harnesstui-named-mux-daemon-attach-design.md)
+- [lmux：命名多 Tab 与自动后台服务设计](lmux-managed-service-design.md)
 - [Loushang Runtime Architecture](loushang-runtime-architecture.md)
 - [Loushang Work / Method / Channel / Harness Architecture](loushang-work-method-channel-harness-architecture.md)
+- [Method / Ontology Action Driven Multi-Agent Collaboration Requirements](method-ontology-action-multi-agent-collaboration-requirements.md)
 - [P3 Fixed MethodPlan Flow Research](p3-fixed-methodplan-flow-research.md)
 - [Method Deviation And Evolution](method-deviation-and-evolution.md)
 - [Methodology System Reference Survey](loushang-methodology-system-reference-survey.md)
-- [WorkBuddy Lessons For Loushang](workbuddy-lessons-for-loushang.md)
+- [Loushang Ontology Operational Infrastructure Architecture](../ontology/drafts/loushang-ontology-operational-infrastructure.md)
+- [Tencent WorkBuddy Case Lessons For Loushang](workbuddy-lessons-for-loushang.md)
+- [Ontology-Native Intelligent Workplace Product Insight](ontology-native-intelligent-workplace-product-insight.md)
+- [Ontology-Driven Application Engineering](ontology-driven-application-engineering.md)
+- [Application Model And Artifact Compiler](application-model-and-artifact-compiler.md)
+- [Pluggable Transcript Compaction Strategies](pluggable-transcript-compaction-strategies.md)
+- [Project-Declared Configuration And Pluggable Conversation Persistence](project-declared-configuration-and-pluggable-conversation-persistence.md)
+- [服务端 Harness 与业务 Product 边界（讨论稿，含架构图）](server-side-harness-and-business-product.md)

@@ -1,0 +1,13779 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import csv
+import inspect
+import io
+import json
+import os
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import zipfile
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
+from hashlib import sha256
+from pathlib import Path
+from threading import Lock
+from unittest.mock import patch
+
+import pytest
+
+from loushang.harness.journal import journal_file_lock
+from loushang.harness.package_product.product_local_wheel_inventory import (
+    PackageProductLocalWheelInventory,
+)
+from loushang.harness.package_product.product_local_wheel_runtime import (
+    PosixLocalWheelProductRuntimeFactory,
+    PosixLocalWheelProductSessionOwner,
+    compose_posix_local_wheel_product,
+)
+from loushang.harness.package_product.product_rebind_lease import (
+    PackageProductRebindLeaseReader,
+    PackageProductRebindLeaseReadError,
+)
+from loushang.harness.package_product.product_rebind_source import (
+    PackageProductRebindSourceReader,
+)
+from loushang.harness.package_product.product_root_gc_runtime import (
+    open_posix_local_wheel_product_root_gc,
+)
+from loushang.harness.package_product.product_staging_adoption import (
+    PackageProductStagingAdoptionOwner,
+)
+from loushang.harness.plugin_management.ledger import PluginDesiredStateLedger
+from loushang.harness.plugin_management.package_gc_binding import (
+    PluginPackageGcBindingError,
+    PluginPackageGcBindingJournal,
+)
+from loushang.harness.plugin_management.package_gc_claim_audit import (
+    PluginPackageGcClaimAudit,
+)
+from loushang.harness.plugin_management.package_gc_reservation import (
+    PluginPackageGcReservationJournal,
+)
+from loushang.harness.plugin_management.package_product import (
+    CommittedSetPackageRevisionProjection,
+    PackageProductGcAdmissionError,
+    PluginManagementPackageDesiredStateAdapter,
+)
+from loushang.harness.plugin_management.records import PluginPackageRevisionRefV1
+from loushang.harness.plugin_management.service import PluginManagementService
+from loushang.harness.resources.packages.operations import PackageOperationsRuntime
+from loushang.harness.resources.packages.plugin_lifecycle import (
+    PackageClassificationBasisFactV1,
+    PackageClassificationFactsV1,
+    PackageLifecycleIngressRequestV1,
+    PackageLifecycleIngressRequestV2,
+    PackageLifecycleJournal,
+    PackageLifecycleOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.acquisition import (
+    AcquiredPackageCandidate,
+    AuthenticatedSourceEnvelopeV1,
+    AuthenticatedSourceStreamPort,
+    BoundedAcquisitionSinkPort,
+    PackageAcquisitionBudgetV1,
+    PackageAcquisitionError,
+    PackageAcquisitionOwner,
+    PackageAcquisitionRequestV1,
+    PackageAuthenticatedSourceEvidenceV1,
+    PackageQuarantineStore,
+    SourceAdapterResultV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.adoption import (
+    PackageLegacyAdoptionOwner,
+    PackageLegacyAdoptionRequestV1,
+    PackageLegacyStateEvidenceV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.adoption_transaction import (
+    PackageLegacyAdoptionTransactionAdapter,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.cleanup import (
+    PackageQuarantineCleanupJournal,
+    PackageQuarantineCleanupOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.closure import (
+    NormalizedPackageRequirementV1,
+    PackageClosureBudgetV1,
+    PackageClosureVerifier,
+    PackageResolutionEnvironmentV1,
+    ResolvedPackageRequirementV1,
+    VerifiedClosurePlanNodeV2,
+    VerifiedClosurePlanV2,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.closure_journal import (
+    PackageClosureResolutionBasisV1,
+    PackageClosureResolutionJournal,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.closure_owner import (
+    PackageDependencySelectionRequestV1,
+    PackageDependencySelectionV1,
+    PackageRecursiveClosureOwner,
+    PackageRecursiveClosureRequestV2,
+    VerifiedPackageClosureCandidate,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.closure_runtime import (
+    PackageClosureExecutionRequestV2,
+    PackageClosureLifecycleOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.commit_admission import (
+    PackageCommitAdmissionOwner,
+    PackageCommitAdmissionRequestV1,
+    PackageCommitLifecycleOwner,
+    PackagePublicationReceiptV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.commit_records import (
+    DependencyClosureLockV2,
+    PluginRevisionRefV1,
+    VerifiedArtifactRefV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.committed_sets import (
+    PACKAGE_COMMITTED_SET_JOURNAL_CODEC,
+    PackageCommittedSetJournal,
+    PackageCommittedSetJournalError,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.epoch_fence import (
+    PackageEpochFenceJournal,
+    PackageEpochFenceReceiptV1,
+    PackageEpochFenceRequestV1,
+    PackageEpochLeaseSnapshotV1,
+    PackageEpochRuntimeAdmissionOwner,
+    PackageEpochRuntimeAdmissionReceiptV1,
+    PackageEpochRuntimeAdmissionRequestV1,
+    PackageEpochRuntimeAdmissionResultV1,
+    PackageEpochRuntimeLeaseV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.lease_registry import (
+    PackageEpochRuntimeLeaseRegistryError,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.local_source import (
+    PackagePinnedLocalWheelSourceAuthority,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.offline_restore import (
+    PACKAGE_PRE_B_SNAPSHOT_DOMAINS,
+    PackageOfflineRestoreOwner,
+    PackageOfflineRestoreRequestV1,
+    PackageOfflineRestoreSnapshotEvidenceV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.phase_evidence import (
+    PackageArtifactEvidenceJournal,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.posix_epoch_coordination import (
+    PackagePosixEpochCutoverCoordination,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.posix_epoch_cutover import (
+    PackageEpochCutoverQuiescenceReceiptV1,
+    PackageEpochCutoverSnapshotReceiptV1,
+    PackagePosixEpochCutoverError,
+    PackagePosixEpochCutoverOwner,
+    PackagePosixEpochCutoverRequestV1,
+    PackagePosixEpochCutoverResultV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.posix_materialization import (
+    PosixPackageDependencyMaterializationStore,
+    PosixPackagePluginRootMaterializationStore,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.posix_offline_restore import (
+    PackagePosixOfflineRestoreMaterializer,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.posix_pre_fence_registration import (
+    PackagePosixPreFenceRegistrationError,
+    PackagePosixPreFenceRegistrationOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.product_retention import (
+    PackageProductRetentionSettlementOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.records import (
+    PackageLifecycleCancelRequestV1,
+    PackageLifecyclePhase,
+    PackageLifecycleRebindRequestV1,
+    PackageLifecycleRequestV1,
+    PackageLifecycleRetryRequestV1,
+    PackageLifecycleStatusV1,
+    PluginBoundPackageClassificationV1,
+    canonical_json_bytes,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.retention_handoff import (
+    PackageDependencyPinReceiptV1,
+    PackageDesiredStateCommitRequestV1,
+    PackageDesiredStateCommitResultV1,
+    PackageRetentionHandoffJournal,
+    PackageRetentionHandoffOwner,
+    PackageRetentionHandoffReceiptV1,
+    PackageRetentionHandoffRequestV1,
+    PackageRetentionHandoffResultV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.runtime import (
+    PackageArtifactExecutionRequestV1,
+    PackageArtifactLifecycleOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.staging import (
+    PackageArtifactStagingJournal,
+    PackageArtifactStagingReceiptV1,
+    PackageArtifactStagingRequestV1,
+    PackagePluginRootTargetV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.staging_set_runtime import (
+    PackageStagingSetLifecycleOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.store_settlements import (
+    PackageStoreSettlementJournal,
+    PackageStoreSettlementRecordV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.transaction_pin_runtime import (
+    PackageTransactionPinLifecycleOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.transaction_pins import (
+    PackageTransactionPinJournal,
+    PackageTransactionPinReceiptV1,
+    PackageTransactionPinRequestV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.transaction_retention import (
+    PackageJournaledTransactionRetentionOwner,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.tree_transfer import (
+    PackagePhysicalStagingError,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.wheel import (
+    PackageInspectionBudgetV1,
+    PackageWheelVerifier,
+    VerifiedWheelCandidate,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.windows_epoch_cutover import (
+    PackageWindowsEpochCutoverOwner,
+    PackageWindowsEpochCutoverRequestV1,
+    PackageWindowsEpochCutoverResultV1,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.windows_materialization import (
+    WindowsPackageDependencyMaterializationStore,
+    WindowsPackagePluginRootMaterializationStore,
+)
+from loushang.harness.resources.packages.plugin_lifecycle.windows_offline_restore import (
+    PackageWindowsOfflineRestoreMaterializer,
+)
+from loushang.harness.resources.packages.product_activation import (
+    PackageProductActivationError,
+)
+from loushang.harness.resources.packages.product_admission_binding import (
+    PackageProductAdmissionBindingJournal,
+)
+from loushang.harness.resources.packages.product_composition import (
+    PackageCommittedProductHandoffRecovery,
+    PackageRetentionHandoffRecovery,
+)
+from loushang.harness.resources.packages.product_contract import (
+    PackageProductLifecycleIntentV1,
+    PackageProductUpdateCheckRequestV1,
+)
+from loushang.harness.resources.packages.product_epoch_guard import (
+    PackageProductPosixFencedRuntimeOwner,
+)
+from loushang.harness.resources.packages.product_handoff import (
+    PackageProductHandoffFinalizer,
+)
+from loushang.harness.resources.packages.product_lifecycle import (
+    PackageProductEntrypoint,
+    PackageProductLifecycleExecutionBinding,
+    PackageProductLifecycleRouter,
+    PackageProductPublishAttemptV1,
+    PackageProductReboundRouteRequestV1,
+    PackageProductRouteContractError,
+    PackageProductRouteRequestV1,
+)
+from loushang.harness.resources.packages.product_local_wheel_policy import (
+    PackageProductLocalWheelBindingV1,
+    PackageProductLocalWheelDependencyV1,
+    PackageProductLocalWheelPolicy,
+    PackageProductRebindSourceError,
+)
+from loushang.harness.resources.packages.product_rebind_admission_binding import (
+    PackageProductRebindAdmissionBindingJournal,
+)
+from loushang.harness.resources.packages.product_root_target import (
+    PackageProductRootTargetAuthority,
+)
+from loushang.harness.resources.packages.product_staging_adoption_binding import (
+    PackageProductStagingAdoptionBindingJournal,
+)
+from loushang.harness.resources.packages.product_transaction import (
+    PackageProductLifecycleTransaction,
+    PackageProductWheelExecutionFactory,
+)
+from loushang.harness.resources.packages.source_resolver import PackageSourceResolver
+from loushang.harness.resources.plugins.dependencies import (
+    PluginDependencyClosureLock,
+)
+from loushang.harness.sandbox.package_legacy_runtime import (
+    PackageLinuxLegacyRuntimeActivationOwner,
+)
+from loushang.harness.sandbox.package_windows_legacy_runtime import (
+    PackageWindowsLegacyRuntimeActivationOwner,
+)
+
+IMPLEMENTED_B1_MANIFEST_CASES = (
+    "B-CLASS-PLUGIN",
+    "B-CLASS-NONPLUGIN",
+    "B-CLASS-INDETERMINATE",
+    "B-CLASS-SPOOF",
+    "B-CRASH-ACCEPTED",
+    "B-CRASH-CLASSIFIED",
+    "B-CONCUR-CONFLICT",
+    "B-ENTRY-DISABLED",
+)
+
+IMPLEMENTED_B2_MANIFEST_CASES = (
+    "B-ACQ-AUTH",
+    "B-ACQ-PROVENANCE",
+    "B-ACQ-BYTES",
+    "B-ACQ-REDIRECT",
+    "B-ACQ-TIMEOUT",
+    "B-ACQ-DIGEST",
+)
+
+IMPLEMENTED_B2H_MANIFEST_CASES = (
+    "B-ARCH-TRUNCATED",
+    "B-ARCH-HEADERS",
+    "B-ARCH-OVERLAP",
+    "B-ARCH-COMPRESSION",
+    "B-ARCH-TRAILING",
+    "B-PATH-ABSOLUTE",
+    "B-PATH-TRAVERSAL",
+    "B-PATH-EMPTY",
+    "B-PATH-COLLISION-SEP",
+    "B-PATH-COLLISION-UNICODE",
+    "B-TYPE-SYMLINK",
+    "B-TYPE-DEVICE",
+    "B-TYPE-SOCKET",
+    "B-TYPE-FIFO",
+    "B-LIMIT-ENTRY",
+    "B-LIMIT-MEMORY",
+    "B-LIMIT-CPU",
+    "B-WHEEL-SDIST",
+    "B-WHEEL-ZIP",
+    "B-WHEEL-TAGS",
+    "B-WHEEL-METADATA",
+    "B-WHEEL-RECORD-HASH",
+    "B-WHEEL-RECORD-SET",
+    "B-WHEEL-RECORD-ALGO",
+)
+
+IMPLEMENTED_B2I_WINDOWS_MANIFEST_CASES = (
+    "B-PATH-WIN-ROOT",
+    "B-PATH-WIN-ADS",
+    "B-PATH-WIN-RESERVED",
+    "B-PATH-WIN-TRAILING",
+    "B-PATH-COLLISION-CASE",
+    "B-TYPE-REPARSE",
+    "B-TYPE-JUNCTION",
+)
+
+IMPLEMENTED_B2J_RECOVERY_MANIFEST_CASES = (
+    "B-ACQ-IDENTITY",
+    "B-CRASH-ACQUIRING",
+    "B-CRASH-ACQUIRED",
+    "B-CRASH-INSPECTING",
+    "B-CRASH-EXTRACTED",
+    "B-STATE-REJECT-CLEANUP",
+)
+
+IMPLEMENTED_B2K_HARDLINK_MANIFEST_CASES = ("B-TYPE-HARDLINK",)
+IMPLEMENTED_B3D_RECOVERY_MANIFEST_CASES = (
+    "B-CRASH-RESOLVING",
+    "B-CRASH-CLOSURE",
+)
+IMPLEMENTED_B3D_LIMIT_MANIFEST_CASES = (
+    "B-LIMIT-GRAPH",
+    "B-LIMIT-SOLVER",
+    "B-LIMIT-REQUESTS",
+)
+IMPLEMENTED_B3D_INTEGRITY_MANIFEST_CASES = (
+    "B-CLOSURE-MISSING",
+    "B-CLOSURE-DIGEST",
+    "B-CLOSURE-ORIGIN",
+    "B-CLOSURE-MARKER",
+    "B-CLOSURE-NAME",
+    "B-CLOSURE-CYCLE",
+    "B-CLOSURE-V1",
+)
+IMPLEMENTED_B3E_PIN_MANIFEST_CASES = ("B-CRASH-PINNED",)
+IMPLEMENTED_B3E_STAGING_SET_MANIFEST_CASES = (
+    "B-CRASH-STAGING",
+    "B-CRASH-SET",
+)
+IMPLEMENTED_B3E3C1_POSIX_MANIFEST_CASES = (
+    "B-PUB-PRECREATE",
+    "B-PUB-POSIX-ROOT-SWAP",
+    "B-PUB-POSIX-ANCESTOR-SWAP",
+    "B-PUB-POSIX-HANDLE-SUCCESS",
+    "B-PUB-POSIX-HANDLE-REJECT",
+)
+IMPLEMENTED_B3E3C2_WINDOWS_MANIFEST_CASES = (
+    "B-PUB-SWAP-WINDOWS",
+    "B-PUB-WIN-ROOT-ABA",
+    "B-PUB-WIN-ANCESTOR-ABA",
+    "B-PUB-WIN-HANDLE-SUCCESS",
+    "B-PUB-WIN-HANDLE-REJECT",
+)
+IMPLEMENTED_B3E3C3_SETTLEMENT_MANIFEST_CASES = (
+    "B-PUB-COLLISION",
+    "B-PUB-REUSE",
+)
+IMPLEMENTED_B4A_COMMIT_ADMISSION_MANIFEST_CASES = (
+    "B-PUB-UNCOMMITTED",
+    "B-ADMISSION-DEPENDENCY",
+    "B-ADMISSION-WRONG-SET",
+    "B-ADMISSION-WRONG-REQUEST",
+    "B-ADMISSION-WRONG-OPERATION",
+    "B-ADMISSION-WRONG-SCOPE",
+    "B-ADMISSION-WRONG-PLUGIN",
+    "B-ADMISSION-DIGEST-TAMPER",
+)
+IMPLEMENTED_B4B_RETENTION_HANDOFF_MANIFEST_CASES = (
+    "B-HANDOFF-BEFORE-DESIRED",
+    "B-HANDOFF-AFTER-DESIRED",
+    "B-HANDOFF-AFTER-SETTLEMENT",
+    "B-HANDOFF-DESIRED-REJECT",
+    "B-HANDOFF-STALE-RECEIPT",
+    "B-HANDOFF-CONCURRENT-REPLAY",
+)
+IMPLEMENTED_B4C0_EPOCH_ADMISSION_MANIFEST_CASES = (
+    "B-COMPAT-EPOCH",
+    "B-COMPAT-MIXED",
+)
+IMPLEMENTED_B4C1_POSIX_EPOCH_CUTOVER_MANIFEST_CASES = (
+    "B-COMPAT-CUTOVER-POSIX",
+    "B-COMPAT-PREFENCE-LIVE-POSIX",
+)
+IMPLEMENTED_B4C2_WINDOWS_EPOCH_CUTOVER_MANIFEST_CASES = (
+    "B-COMPAT-CUTOVER-WINDOWS",
+    "B-COMPAT-PREFENCE-LIVE-WINDOWS",
+)
+IMPLEMENTED_B4C3C_LINUX_OFFLINE_RESTORE_MANIFEST_CASES = (
+    "B-COMPAT-OFFLINE-RESTORE-POSIX",
+)
+IMPLEMENTED_B4C5_WINDOWS_OFFLINE_RESTORE_MANIFEST_CASES = (
+    "B-COMPAT-OFFLINE-RESTORE-WINDOWS",
+)
+IMPLEMENTED_B4C4D_LINUX_ADOPTION_MANIFEST_CASES = ("B-COMPAT-ADOPT",)
+IMPLEMENTED_B4C4E_LINUX_ADOPTION_FAILURE_MANIFEST_CASES = (
+    "B-COMPAT-ADOPT-UNAUTHORIZED",
+    "B-COMPAT-ADOPT-UNAVAILABLE",
+)
+IMPLEMENTED_B4C4F_LINUX_ADOPTION_COMMITTED_CRASH_MANIFEST_CASES = (
+    "B-COMPAT-ADOPT-CRASH-AFTER-COMMITTED",
+)
+IMPLEMENTED_B4C4G_LINUX_ADOPTION_PRECOMMIT_CRASH_MANIFEST_CASES = (
+    "B-COMPAT-ADOPT-CRASH",
+)
+IMPLEMENTED_B4D_STATE_MANIFEST_CASES = (
+    "B-CRASH-COMMITTED",
+    "B-CONCUR-SAME",
+    "B-CONCUR-STALE",
+    "B-STATE-CANCEL-EARLY",
+    "B-STATE-CANCEL-PINNED",
+    "B-STATE-STATUS",
+    "B-COMPAT-LEGACY",
+    "B-COMPAT-ROLLFORWARD",
+)
+IMPLEMENTED_B4D_LINUX_PIPELINE_MANIFEST_CASES = (
+    "B-CLASS-CHANGED",
+    "B-NOEXEC-IMPORT",
+    "B-NOEXEC-SETUP",
+    "B-NOEXEC-ENTRYPOINT",
+    "B-NOEXEC-ADJACENT",
+    "B-STATE-SECRETS",
+)
+IMPLEMENTED_B5_ROUTING_MANIFEST_CASES = (
+    "B-ENTRY-CLI",
+    "B-ENTRY-RPC",
+    "B-ENTRY-SESSION",
+    "B-ENTRY-STARTUP",
+    "B-ENTRY-OPERATIONS",
+    "B-ENTRY-MATERIALIZER",
+    "B-ENTRY-PUBLISH",
+)
+ADOPTION_PRECOMMIT_CRASH_PHASES: tuple[PackageLifecyclePhase, ...] = (
+    "acquiring",
+    "acquired",
+    "inspecting",
+    "extracted",
+    "resolving_closure",
+    "closure_verified",
+    "transaction_pinned",
+    "staging",
+    "set_published",
+)
+PLANNED_B3E3C_MATERIALIZATION_MANIFEST_CASES: tuple[str, ...] = ()
+PLANNED_B4_COMMIT_ADMISSION_MANIFEST_CASES: tuple[str, ...] = ()
+
+EXECUTABLE_MANIFEST_CASES = (
+    IMPLEMENTED_B1_MANIFEST_CASES
+    + IMPLEMENTED_B2_MANIFEST_CASES
+    + IMPLEMENTED_B2H_MANIFEST_CASES
+    + IMPLEMENTED_B2I_WINDOWS_MANIFEST_CASES
+    + IMPLEMENTED_B2J_RECOVERY_MANIFEST_CASES
+    + IMPLEMENTED_B2K_HARDLINK_MANIFEST_CASES
+    + IMPLEMENTED_B3D_RECOVERY_MANIFEST_CASES
+    + IMPLEMENTED_B3D_LIMIT_MANIFEST_CASES
+    + IMPLEMENTED_B3D_INTEGRITY_MANIFEST_CASES
+    + IMPLEMENTED_B3E_PIN_MANIFEST_CASES
+    + IMPLEMENTED_B3E_STAGING_SET_MANIFEST_CASES
+    + IMPLEMENTED_B3E3C1_POSIX_MANIFEST_CASES
+    + IMPLEMENTED_B3E3C3_SETTLEMENT_MANIFEST_CASES
+    + IMPLEMENTED_B4A_COMMIT_ADMISSION_MANIFEST_CASES
+    + IMPLEMENTED_B4B_RETENTION_HANDOFF_MANIFEST_CASES
+    + IMPLEMENTED_B4C0_EPOCH_ADMISSION_MANIFEST_CASES
+    + (
+        IMPLEMENTED_B4C1_POSIX_EPOCH_CUTOVER_MANIFEST_CASES
+        if os.name == "posix"
+        else ()
+    )
+    + (IMPLEMENTED_B3E3C2_WINDOWS_MANIFEST_CASES if os.name == "nt" else ())
+    + (IMPLEMENTED_B4C2_WINDOWS_EPOCH_CUTOVER_MANIFEST_CASES if os.name == "nt" else ())
+    + (
+        IMPLEMENTED_B4C3C_LINUX_OFFLINE_RESTORE_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + (
+        IMPLEMENTED_B4C5_WINDOWS_OFFLINE_RESTORE_MANIFEST_CASES
+        if os.name == "nt"
+        else ()
+    )
+    + (
+        IMPLEMENTED_B4C4D_LINUX_ADOPTION_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + (
+        IMPLEMENTED_B4C4E_LINUX_ADOPTION_FAILURE_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + (
+        IMPLEMENTED_B4C4F_LINUX_ADOPTION_COMMITTED_CRASH_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + (
+        IMPLEMENTED_B4C4G_LINUX_ADOPTION_PRECOMMIT_CRASH_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + IMPLEMENTED_B4D_STATE_MANIFEST_CASES
+    + (
+        IMPLEMENTED_B4D_LINUX_PIPELINE_MANIFEST_CASES
+        if sys.platform.startswith("linux")
+        else ()
+    )
+    + IMPLEMENTED_B5_ROUTING_MANIFEST_CASES
+)
+
+WHEEL_FILENAME = "acme_plugin-1.0-py3-none-any.whl"
+DIST_INFO = "acme_plugin-1.0.dist-info"
+
+
+def _record_digest(payload: bytes) -> str:
+    digest = base64.urlsafe_b64encode(sha256(payload).digest()).rstrip(b"=")
+    return "sha256=" + digest.decode()
+
+
+def _wheel_bytes(
+    *,
+    extra_files: dict[str, bytes] | None = None,
+    entry_modes: dict[str, int] | None = None,
+    windows_attributes: dict[str, int] | None = None,
+    package_metadata: bytes | None = None,
+    record_rows: list[tuple[str, str, str]] | None = None,
+) -> bytes:
+    files = {
+        "acme_plugin/__init__.py": b"VALUE = 1\n",
+        f"{DIST_INFO}/WHEEL": (
+            b"Wheel-Version: 1.0\n"
+            b"Generator: plc9b-manifest\n"
+            b"Root-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n\n"
+        ),
+        f"{DIST_INFO}/METADATA": package_metadata
+        or b"Metadata-Version: 2.1\nName: acme-plugin\nVersion: 1.0\n\n",
+    }
+    files.update(extra_files or {})
+    if record_rows is None:
+        record_rows = [
+            (name, _record_digest(payload), str(len(payload)))
+            for name, payload in files.items()
+        ]
+        record_rows.append((f"{DIST_INFO}/RECORD", "", ""))
+    record = io.StringIO(newline="")
+    csv.writer(record, lineterminator="\n").writerows(record_rows)
+    files[f"{DIST_INFO}/RECORD"] = record.getvalue().encode()
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            info = zipfile.ZipInfo(name)
+            if name in (windows_attributes or {}):
+                info.create_system = 0
+                info.external_attr = (windows_attributes or {})[name]
+            else:
+                info.create_system = 3
+                info.external_attr = (entry_modes or {}).get(
+                    name, stat.S_IFREG | 0o644
+                ) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _package_wheel_bytes(
+    project: str,
+    version: str,
+    *,
+    extra_files: dict[str, bytes] | None = None,
+    requires_dist: tuple[str, ...] = (),
+    requires_python: str | None = None,
+) -> bytes:
+    normalized = project.replace("-", "_")
+    dist_info = f"{normalized}-{version}.dist-info"
+    metadata = (
+        f"Metadata-Version: 2.1\nName: {project}\nVersion: {version}\n"
+        + ("" if requires_python is None else f"Requires-Python: {requires_python}\n")
+        + "".join(f"Requires-Dist: {item}\n" for item in requires_dist)
+        + "\n"
+    ).encode()
+    files = {
+        f"{normalized}/__init__.py": b"VALUE = 1\n",
+        f"{dist_info}/WHEEL": (
+            b"Wheel-Version: 1.0\n"
+            b"Generator: plc9b-manifest\n"
+            b"Root-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n\n"
+        ),
+        f"{dist_info}/METADATA": metadata,
+    }
+    files.update(extra_files or {})
+    rows = [
+        (name, _record_digest(payload), str(len(payload)))
+        for name, payload in files.items()
+    ]
+    rows.append((f"{dist_info}/RECORD", "", ""))
+    record = io.StringIO(newline="")
+    csv.writer(record, lineterminator="\n").writerows(rows)
+    files[f"{dist_info}/RECORD"] = record.getvalue().encode()
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in files.items():
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, payload)
+    return output.getvalue()
+
+
+def _record_rows() -> list[tuple[str, str, str]]:
+    files = {
+        "acme_plugin/__init__.py": b"VALUE = 1\n",
+        f"{DIST_INFO}/WHEEL": (
+            b"Wheel-Version: 1.0\n"
+            b"Generator: plc9b-manifest\n"
+            b"Root-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n\n"
+        ),
+        f"{DIST_INFO}/METADATA": (
+            b"Metadata-Version: 2.1\nName: acme-plugin\nVersion: 1.0\n\n"
+        ),
+    }
+    rows = [
+        (name, _record_digest(payload), str(len(payload)))
+        for name, payload in files.items()
+    ]
+    rows.append((f"{DIST_INFO}/RECORD", "", ""))
+    return rows
+
+
+def _hardlinked_source_wheel(
+    tmp_path: Path,
+) -> tuple[bytes, Path, Path, tuple[str, str]]:
+    source = tmp_path / "hardlinked-source"
+    source.mkdir()
+    first = source / "first.bin"
+    second = source / "second.bin"
+    payload = b"one-source-inode"
+    first.write_bytes(payload)
+    os.link(first, second)
+    archive_names = (
+        "acme_plugin/hardlink-first.bin",
+        "acme_plugin/hardlink-second.bin",
+    )
+    files = {
+        f"{DIST_INFO}/WHEEL": (
+            b"Wheel-Version: 1.0\n"
+            b"Generator: plc9b-hardlink-manifest\n"
+            b"Root-Is-Purelib: true\n"
+            b"Tag: py3-none-any\n\n"
+        ),
+        f"{DIST_INFO}/METADATA": (
+            b"Metadata-Version: 2.1\nName: acme-plugin\nVersion: 1.0\n\n"
+        ),
+        archive_names[0]: payload,
+        archive_names[1]: payload,
+    }
+    rows = [
+        (name, _record_digest(content), str(len(content)))
+        for name, content in files.items()
+    ]
+    rows.append((f"{DIST_INFO}/RECORD", "", ""))
+    record = io.StringIO(newline="")
+    csv.writer(record, lineterminator="\n").writerows(rows)
+    files[f"{DIST_INFO}/RECORD"] = record.getvalue().encode()
+
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in files.items():
+            if name in archive_names:
+                continue
+            info = zipfile.ZipInfo(name)
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, content)
+        archive.write(first, archive_names[0])
+        archive.write(second, archive_names[1])
+    return output.getvalue(), first, second, archive_names
+
+
+def _corrupt_local_header(payload: bytes) -> bytes:
+    changed = bytearray(payload)
+    central = changed.index(b"PK\x01\x02")
+    local_offset = struct.unpack_from("<L", changed, central + 42)[0]
+    changed[local_offset + 8 : local_offset + 10] = struct.pack("<H", 0)
+    return bytes(changed)
+
+
+def _claim_overlapping_local_entry(payload: bytes) -> bytes:
+    changed = bytearray(payload)
+    central_offsets: list[int] = []
+    cursor = 0
+    while (offset := changed.find(b"PK\x01\x02", cursor)) >= 0:
+        central_offsets.append(offset)
+        cursor = offset + 4
+    assert len(central_offsets) >= 2
+    first_local = struct.unpack_from("<L", changed, central_offsets[0] + 42)[0]
+    struct.pack_into("<L", changed, central_offsets[1] + 42, first_local)
+    return bytes(changed)
+
+
+def _claim_unsupported_compression(payload: bytes) -> bytes:
+    changed = bytearray(payload)
+    central = changed.index(b"PK\x01\x02")
+    struct.pack_into("<H", changed, central + 10, 99)
+    return bytes(changed)
+
+
+@dataclass(frozen=True)
+class _InspectionFixture:
+    payload: bytes
+    wheel_filename: str = WHEEL_FILENAME
+    supported_tags: frozenset[str] = frozenset({"py3-none-any"})
+    budgets: PackageInspectionBudgetV1 = PackageInspectionBudgetV1()
+    verifier: PackageWheelVerifier | None = None
+
+
+def _inspection_fixture(case_id: str) -> _InspectionFixture:
+    base = _wheel_bytes()
+    if case_id == "B-ARCH-TRUNCATED":
+        return _InspectionFixture(payload=base[:-8])
+    if case_id == "B-ARCH-HEADERS":
+        return _InspectionFixture(payload=_corrupt_local_header(base))
+    if case_id == "B-ARCH-OVERLAP":
+        return _InspectionFixture(payload=_claim_overlapping_local_entry(base))
+    if case_id == "B-ARCH-COMPRESSION":
+        return _InspectionFixture(payload=_claim_unsupported_compression(base))
+    if case_id == "B-ARCH-TRAILING":
+        return _InspectionFixture(payload=base + b"attacker-payload")
+    if case_id == "B-PATH-ABSOLUTE":
+        return _InspectionFixture(
+            payload=_wheel_bytes(extra_files={"/absolute.py": b"hostile"})
+        )
+    if case_id == "B-PATH-TRAVERSAL":
+        return _InspectionFixture(
+            payload=_wheel_bytes(extra_files={"../escape.py": b"hostile"})
+        )
+    if case_id == "B-PATH-EMPTY":
+        return _InspectionFixture(
+            payload=_wheel_bytes(extra_files={"pkg//empty.py": b"hostile"})
+        )
+    if case_id == "B-PATH-COLLISION-SEP":
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={
+                    "pkg/name.py": b"one",
+                    "pkg\\name.py": b"two",
+                }
+            )
+        )
+    if case_id == "B-PATH-COLLISION-UNICODE":
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={
+                    "pkg/caf\N{LATIN SMALL LETTER E WITH ACUTE}.py": b"one",
+                    "pkg/cafe\N{COMBINING ACUTE ACCENT}.py": b"two",
+                }
+            )
+        )
+    windows_paths = {
+        "B-PATH-WIN-ROOT": "C:/escape.py",
+        "B-PATH-WIN-ADS": "pkg/file.py:stream",
+        "B-PATH-WIN-RESERVED": "pkg/CON",
+        "B-PATH-WIN-TRAILING": "pkg/trailing. ",
+    }
+    if case_id in windows_paths:
+        return _InspectionFixture(
+            payload=_wheel_bytes(extra_files={windows_paths[case_id]: b"hostile"})
+        )
+    if case_id == "B-PATH-COLLISION-CASE":
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={
+                    "pkg/Name.py": b"one",
+                    "pkg/name.py": b"two",
+                }
+            )
+        )
+    entry_types = {
+        "B-TYPE-SYMLINK": stat.S_IFLNK | 0o777,
+        "B-TYPE-DEVICE": stat.S_IFCHR | 0o600,
+        "B-TYPE-SOCKET": stat.S_IFSOCK | 0o600,
+        "B-TYPE-FIFO": stat.S_IFIFO | 0o600,
+    }
+    if case_id in entry_types:
+        name = "pkg/hostile-entry"
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={name: b"hostile"},
+                entry_modes={name: entry_types[case_id]},
+            )
+        )
+    if case_id == "B-TYPE-REPARSE":
+        name = "pkg/reparse-entry"
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={name: b"hostile"},
+                windows_attributes={name: 0x400},
+            )
+        )
+    if case_id == "B-TYPE-JUNCTION":
+        name = "pkg/junction/"
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                extra_files={name: b""},
+                windows_attributes={name: 0x400 | 0x10},
+            )
+        )
+    if case_id == "B-LIMIT-ENTRY":
+        return _InspectionFixture(
+            payload=_wheel_bytes(extra_files={"pkg/large.bin": b"x" * 200}),
+            budgets=PackageInspectionBudgetV1(
+                max_entries=4,
+                max_total_expanded_bytes=128,
+                max_entry_expanded_bytes=64,
+            ),
+        )
+    if case_id == "B-LIMIT-MEMORY":
+        return _InspectionFixture(
+            payload=base,
+            budgets=PackageInspectionBudgetV1(max_metadata_bytes=64),
+        )
+    if case_id == "B-LIMIT-CPU":
+        return _InspectionFixture(
+            payload=base,
+            budgets=PackageInspectionBudgetV1(max_wall_time_ms=1),
+            verifier=PackageWheelVerifier(clock=_AdvancingInspectionClock()),
+        )
+    if case_id == "B-WHEEL-SDIST":
+        return _InspectionFixture(
+            payload=base,
+            wheel_filename="acme_plugin-1.0.tar.gz",
+        )
+    if case_id == "B-WHEEL-ZIP":
+        return _InspectionFixture(
+            payload=base,
+            wheel_filename="acme_plugin-1.0.zip",
+        )
+    if case_id == "B-WHEEL-TAGS":
+        return _InspectionFixture(
+            payload=base,
+            supported_tags=frozenset({"cp313-cp313-win_amd64"}),
+        )
+    if case_id == "B-WHEEL-METADATA":
+        return _InspectionFixture(
+            payload=_wheel_bytes(
+                package_metadata=(
+                    b"Metadata-Version: 2.1\nName: another-project\nVersion: 9\n\n"
+                )
+            )
+        )
+    rows = _record_rows()
+    if case_id == "B-WHEEL-RECORD-HASH":
+        rows[0] = (rows[0][0], "sha256=" + "A" * 43, rows[0][2])
+        return _InspectionFixture(payload=_wheel_bytes(record_rows=rows))
+    if case_id == "B-WHEEL-RECORD-SET":
+        rows.pop(0)
+        return _InspectionFixture(payload=_wheel_bytes(record_rows=rows))
+    if case_id == "B-WHEEL-RECORD-ALGO":
+        rows[0] = (rows[0][0], "md5=deadbeef", rows[0][2])
+        return _InspectionFixture(payload=_wheel_bytes(record_rows=rows))
+    raise AssertionError(f"Unhandled PLC9B2h inspection fixture: {case_id}")
+
+
+@dataclass
+class _Authority:
+    facts: PackageClassificationFactsV1
+
+    def classification_facts(
+        self,
+        _request: object,
+    ) -> PackageClassificationFactsV1:
+        return self.facts
+
+
+@dataclass
+class _Clock:
+    now: float = 100.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@dataclass
+class _AdvancingInspectionClock:
+    now: float = 100.0
+
+    def __call__(self) -> float:
+        self.now += 0.002
+        return self.now
+
+
+@dataclass
+class _StableClassificationRecheck:
+    def recheck(
+        self,
+        _request: PackageLifecycleRequestV1,
+        prior: PluginBoundPackageClassificationV1,
+    ) -> PluginBoundPackageClassificationV1:
+        return prior
+
+
+@dataclass
+class _ChangedClassificationRecheck:
+    def recheck(
+        self,
+        _request: PackageLifecycleRequestV1,
+        prior: PluginBoundPackageClassificationV1,
+    ) -> PluginBoundPackageClassificationV1:
+        facts = PackageClassificationFactsV1(
+            facts=prior.basis_facts.facts,
+            policy_revision="classification-policy:changed",
+            classifier_epoch=prior.classifier_epoch + 1,
+        )
+        return PluginBoundPackageClassificationV1(
+            decision=prior.decision,
+            request_fingerprint=prior.request_fingerprint,
+            basis_facts=facts,
+            policy_revision=facts.policy_revision,
+            classifier_epoch=facts.classifier_epoch,
+            canonical_source_identity=prior.canonical_source_identity,
+        )
+
+
+@dataclass
+class _TransactionPinRetentionState:
+    receipts: dict[str, PackageTransactionPinReceiptV1] = field(default_factory=dict)
+    calls: list[PackageTransactionPinRequestV1] = field(default_factory=list)
+    physical_acquisitions: int = 0
+
+
+@dataclass
+class _TransactionPinRetentionOwner:
+    state: _TransactionPinRetentionState = field(
+        default_factory=_TransactionPinRetentionState
+    )
+
+    @property
+    def receipts(self) -> dict[str, PackageTransactionPinReceiptV1]:
+        return self.state.receipts
+
+    @property
+    def calls(self) -> list[PackageTransactionPinRequestV1]:
+        return self.state.calls
+
+    @property
+    def physical_acquisitions(self) -> int:
+        return self.state.physical_acquisitions
+
+    def acquire(
+        self,
+        request: PackageTransactionPinRequestV1,
+    ) -> PackageTransactionPinReceiptV1:
+        self.calls.append(request)
+        existing = self.receipts.get(request.operation_id)
+        if existing is not None:
+            if existing.pin_request != request:
+                raise RuntimeError("transaction pin request changed")
+            return existing
+        receipt = PackageTransactionPinReceiptV1.acquire(
+            request,
+            pin_id="f" * 64,
+            owner_identity="manifest-retention-owner",
+            owner_revision=1,
+            lease_id="manifest-transaction-pin",
+            lease_revision=1,
+        )
+        self.receipts[request.operation_id] = receipt
+        self.state.physical_acquisitions += 1
+        return receipt
+
+    def release(
+        self,
+        receipt: PackageTransactionPinReceiptV1,
+        *,
+        transition_evidence_ref: str,
+    ) -> PackageTransactionPinReceiptV1:
+        return PackageTransactionPinReceiptV1.transition(
+            receipt,
+            state="released",
+            owner_revision=receipt.owner_revision + 1,
+            lease_revision=receipt.lease_revision + 1,
+            transition_evidence_ref=transition_evidence_ref,
+        )
+
+
+class _ManifestCrashEdge(RuntimeError):
+    pass
+
+
+class _CrashAfterPhasePackageOwner(PackageLifecycleOwner):
+    def __init__(
+        self,
+        *,
+        journal: PackageLifecycleJournal,
+        facts: PackageClassificationFactsV1,
+        crash_after: PackageLifecyclePhase,
+    ) -> None:
+        super().__init__(
+            journal=journal,
+            classification_authority=_Authority(facts),
+            enabled=True,
+        )
+        self._crash_after: PackageLifecyclePhase | None = crash_after
+
+    def advance(
+        self,
+        operation_id: str,
+        *,
+        next_phase: PackageLifecyclePhase,
+        expected_phase: PackageLifecyclePhase,
+        expected_journal_revision: int,
+        expected_attempt_epoch: int,
+    ) -> PackageLifecycleStatusV1:
+        status = super().advance(
+            operation_id,
+            next_phase=next_phase,
+            expected_phase=expected_phase,
+            expected_journal_revision=expected_journal_revision,
+            expected_attempt_epoch=expected_attempt_epoch,
+        )
+        if self._crash_after == next_phase:
+            self._crash_after = None
+            raise _ManifestCrashEdge(next_phase)
+        return status
+
+
+@dataclass
+class _ManifestRootTargetAuthorityState:
+    calls: int = 0
+
+
+@dataclass
+class _ManifestRootTargetAuthority:
+    state: _ManifestRootTargetAuthorityState = field(
+        default_factory=_ManifestRootTargetAuthorityState
+    )
+
+    @property
+    def calls(self) -> int:
+        return self.state.calls
+
+    def issue_target(
+        self,
+        request: PackageLifecycleRequestV1,
+        _classification: PluginBoundPackageClassificationV1,
+    ) -> PackagePluginRootTargetV1:
+        self.state.calls += 1
+        return PackagePluginRootTargetV1.create(
+            operation_id=request.operation_id,
+            request_fingerprint=request.request_fingerprint,
+            product_id=request.product_id,
+            scope_id=request.scope_id,
+            installation_id="manifest-installation",
+            plugin_id=request.requested_plugin_id or "manifest-plugin",
+            authority_id="manifest-root-target-authority",
+            authority_revision="manifest-root-target:1",
+        )
+
+
+@dataclass
+class _ManifestDependencyStagingOwner:
+    receipts: dict[str, PackageArtifactStagingReceiptV1] = field(default_factory=dict)
+    physical_stages: int = 0
+
+    def stage_dependency(
+        self,
+        request: PackageArtifactStagingRequestV1,
+        _candidate: VerifiedWheelCandidate,
+    ) -> PackageArtifactStagingReceiptV1:
+        existing = self.receipts.get(request.staging_request_id)
+        if existing is not None:
+            return existing
+        node = request.plan_node
+        receipt = PackageArtifactStagingReceiptV1.create(
+            request,
+            stable_ref=VerifiedArtifactRefV1.create(
+                store_identity="manifest-dependency-store",
+                store_revision=f"dependency:{node.artifact_digest}",
+                distribution=node.distribution,
+                version=node.version,
+                artifact_digest=node.artifact_digest,
+                extraction_tree_digest=node.extraction_tree_digest,
+            ),
+        )
+        self.receipts[request.staging_request_id] = receipt
+        self.physical_stages += 1
+        return receipt
+
+
+@dataclass
+class _ManifestRootStagingOwner:
+    receipts: dict[str, PackageArtifactStagingReceiptV1] = field(default_factory=dict)
+    physical_stages: int = 0
+
+    def stage_root(
+        self,
+        request: PackageArtifactStagingRequestV1,
+        _candidate: VerifiedWheelCandidate,
+    ) -> PackageArtifactStagingReceiptV1:
+        existing = self.receipts.get(request.staging_request_id)
+        if existing is not None:
+            return existing
+        target = request.root_target
+        assert target is not None
+        node = request.plan_node
+        receipt = PackageArtifactStagingReceiptV1.create(
+            request,
+            stable_ref=PluginRevisionRefV1.create(
+                store_identity="manifest-plugin-revision-store",
+                store_revision=f"plugin:{node.artifact_digest}",
+                installation_id=target.installation_id,
+                plugin_id=target.plugin_id,
+                distribution=node.distribution,
+                version=node.version,
+                artifact_digest=node.artifact_digest,
+                extraction_tree_digest=node.extraction_tree_digest,
+            ),
+        )
+        self.receipts[request.staging_request_id] = receipt
+        self.physical_stages += 1
+        return receipt
+
+
+@dataclass
+class _ManifestNativeRootStagingState:
+    calls: int = 0
+    same_receipt: bool = False
+
+
+@dataclass
+class _ManifestNativeRootStagingOwner:
+    store: (
+        PosixPackagePluginRootMaterializationStore
+        | WindowsPackagePluginRootMaterializationStore
+    )
+    verify_reuse: bool = False
+    state: _ManifestNativeRootStagingState = field(
+        default_factory=_ManifestNativeRootStagingState
+    )
+
+    @property
+    def calls(self) -> int:
+        return self.state.calls
+
+    @property
+    def same_receipt(self) -> bool:
+        return self.state.same_receipt
+
+    def authorize_adoption(
+        self,
+        *,
+        store_id: str,
+        current_root_identity: str,
+        target: PackagePluginRootTargetV1,
+    ) -> bool:
+        return self.store.authorize_adoption(
+            store_id=store_id,
+            current_root_identity=current_root_identity,
+            target=target,
+        )
+
+    def stage_root(
+        self,
+        request: PackageArtifactStagingRequestV1,
+        candidate: VerifiedWheelCandidate,
+    ) -> PackageArtifactStagingReceiptV1:
+        self.state.calls += 1
+        receipt = self.store.stage_root(request, candidate)
+        if self.verify_reuse:
+            replay = self.store.stage_root(request, candidate)
+            assert replay == receipt
+            self.state.same_receipt = True
+        return receipt
+
+    def read_validate_root_receipt(
+        self, receipt: PackageArtifactStagingReceiptV1
+    ) -> PackageArtifactStagingReceiptV1:
+        return self.store.read_validate_root_receipt(receipt)
+
+    def read_operation_settlements(
+        self, operation_id: str
+    ) -> tuple[PackageStoreSettlementRecordV1, ...]:
+        return self.store.read_operation_settlements(operation_id)
+
+
+@dataclass
+class _SourceStream:
+    envelope: AuthenticatedSourceEnvelopeV1
+    chunks: tuple[bytes, ...]
+    request_count: int = 1
+    redirects: tuple[str, ...] = ()
+    clock: _Clock | None = None
+    advance_seconds: float = 0.0
+    requests_started: int = 0
+    redirects_started: int = 0
+    writes_started: int = 0
+
+    def transfer_to(self, sink: BoundedAcquisitionSinkPort) -> SourceAdapterResultV1:
+        for _index in range(self.request_count):
+            sink.begin_request()
+            self.requests_started += 1
+        for redirect in self.redirects:
+            sink.record_redirect(redirect)
+            self.redirects_started += 1
+        for chunk in self.chunks:
+            sink.write(chunk)
+            self.writes_started += 1
+            if self.clock is not None:
+                self.clock.now += self.advance_seconds
+        return SourceAdapterResultV1(disposition="complete")
+
+
+@dataclass
+class _SourceAuthority:
+    case_id: str
+    secret: str
+    payload: bytes | None = None
+    payloads: dict[str, bytes] | None = None
+    clock: _Clock | None = None
+    authorize_calls: int = 0
+    stream: _SourceStream | None = None
+
+    def authorize(self, request: PackageAcquisitionRequestV1) -> _SourceStream:
+        self.authorize_calls += 1
+        if self.case_id in {"B-ACQ-AUTH", "B-COMPAT-ADOPT-UNAUTHORIZED"}:
+            raise PackageAcquisitionError(
+                f"registry rejected credential {self.secret}",
+                code="package_source_unauthorized",
+                stage="acquiring",
+                retryable=False,
+                consumed_bytes=0,
+            )
+        if self.case_id == "B-CLOSURE-ORIGIN" and request.node_id != "root":
+            raise PackageAcquisitionError(
+                "Package dependency Source origin is unauthorized",
+                code="package_source_unauthorized",
+                stage="acquiring",
+                retryable=False,
+                consumed_bytes=0,
+            )
+
+        payload = (
+            (self.payloads or {}).get(request.canonical_source_identity)
+            if self.payloads is not None
+            else self.payload
+        )
+        chunks = (payload if payload is not None else b"wheel",)
+        request_count = 1
+        redirects: tuple[str, ...] = ()
+        advance_seconds = 0.0
+        canonical_source_identity = request.canonical_source_identity
+        expected_digest = sha256(b"".join(chunks)).hexdigest()
+        if self.case_id == "B-ACQ-PROVENANCE":
+            canonical_source_identity = "https://other.example.test/acme.whl"
+        elif self.case_id == "B-ACQ-BYTES":
+            chunks = (b"12345678", b"overflow")
+            expected_digest = sha256(b"".join(chunks)).hexdigest()
+        elif self.case_id == "B-ACQ-REDIRECT":
+            chunks = ()
+            redirects = (
+                "https://mirror-1.example.test/acme.whl",
+                "https://mirror-2.example.test/acme.whl",
+            )
+            expected_digest = sha256(b"").hexdigest()
+        elif self.case_id in {"B-ACQ-TIMEOUT", "B-COMPAT-ADOPT-UNAVAILABLE"}:
+            chunks = (b"first", b"second")
+            expected_digest = sha256(b"".join(chunks)).hexdigest()
+            advance_seconds = 0.006
+        elif self.case_id == "B-ACQ-DIGEST":
+            chunks = (b"changed-wheel",)
+            expected_digest = "d" * 64
+
+        self.stream = _SourceStream(
+            envelope=AuthenticatedSourceEnvelopeV1(
+                operation_id=request.operation_id,
+                node_id=request.node_id,
+                canonical_source_identity=canonical_source_identity,
+                origin_kind="https",
+                authentication_decision="authorized",
+                authority_id="source-authority:manifest",
+                requested_locator_digest=request.requested_locator_digest,
+                expected_artifact_digest=expected_digest,
+                redirect_policy_revision="redirect-policy:1",
+                policy_revision=request.policy_revision,
+                capture_epoch=1,
+            ),
+            chunks=chunks,
+            request_count=request_count,
+            redirects=redirects,
+            clock=self.clock,
+            advance_seconds=advance_seconds,
+        )
+        return self.stream
+
+
+@dataclass
+class _PinnedLocalSourceAuthority:
+    delegate: PackagePinnedLocalWheelSourceAuthority
+    authorize_calls: int = 0
+    stream: None = None
+    clock: None = None
+
+    def authorize(
+        self, request: PackageAcquisitionRequestV1
+    ) -> AuthenticatedSourceStreamPort:
+        self.authorize_calls += 1
+        return self.delegate.authorize(request)
+
+
+class _CleanupDebtWheelVerifier(PackageWheelVerifier):
+    def __init__(self, store: PackageQuarantineStore) -> None:
+        super().__init__()
+        self._store = store
+
+    def verify(
+        self,
+        candidate: AcquiredPackageCandidate,
+        *,
+        wheel_filename: str,
+        supported_tags: frozenset[str],
+        budgets: PackageInspectionBudgetV1,
+    ) -> VerifiedWheelCandidate:
+        attempt = self._store.root / self._store.attempt_names()[0]
+        (attempt / "manifest-cleanup-debt").write_bytes(b"bounded-debt")
+        return super().verify(
+            candidate,
+            wheel_filename=wheel_filename,
+            supported_tags=supported_tags,
+            budgets=budgets,
+        )
+
+
+@dataclass
+class _NoDependencyResolver:
+    calls: int = 0
+
+    def resolve(
+        self,
+        _request: PackageDependencySelectionRequestV1,
+    ) -> PackageDependencySelectionV1:
+        self.calls += 1
+        raise AssertionError("root-only closure must not consult the resolver")
+
+
+@dataclass(frozen=True)
+class _ManifestSelection:
+    version: str
+    source: str
+    filename: str
+    digest: str
+
+
+@dataclass
+class _ManifestResolver:
+    selections: dict[str | tuple[str, str], _ManifestSelection]
+    calls: list[str] = field(default_factory=list)
+
+    def resolve(
+        self,
+        request: PackageDependencySelectionRequestV1,
+    ) -> PackageDependencySelectionV1:
+        self.calls.append(request.requirement.project_name)
+        selected = (
+            self.selections.get(
+                (
+                    request.requirement.project_name,
+                    request.requirement.specifier_text,
+                )
+            )
+            or self.selections[request.requirement.project_name]
+        )
+        return PackageDependencySelectionV1(
+            operation_id=request.operation_id,
+            attempt_epoch=request.attempt_epoch,
+            parent_node_id=request.parent_node_id,
+            request_fingerprint=request.request_fingerprint,
+            resolution_environment_fingerprint=(
+                request.resolution_environment_fingerprint
+            ),
+            requirement_fingerprint=request.requirement_fingerprint,
+            project_name=request.requirement.project_name,
+            version=selected.version,
+            canonical_source_identity=selected.source,
+            wheel_filename=selected.filename,
+            expected_artifact_digest=selected.digest,
+            resolver_id="resolver:manifest",
+            resolver_revision="resolver-revision:1",
+        )
+
+
+@dataclass
+class _LegacyClosureBuilder:
+    verifier: PackageClosureVerifier = field(default_factory=PackageClosureVerifier)
+    calls: int = 0
+
+    def build(
+        self,
+        root: VerifiedWheelCandidate,
+        _request: PackageRecursiveClosureRequestV2,
+    ) -> VerifiedPackageClosureCandidate:
+        self.calls += 1
+        try:
+            self.verifier.verify(
+                PluginDependencyClosureLock(
+                    package_content_digest="a" * 64,
+                    python_distributions=(),
+                )
+            )
+        finally:
+            root.cleanup()
+        raise AssertionError("Legacy closure evidence unexpectedly satisfied v2")
+
+    def reacquire(
+        self,
+        root: VerifiedWheelCandidate,
+        request: PackageRecursiveClosureRequestV2,
+    ) -> VerifiedPackageClosureCandidate:
+        return self.build(root, request)
+
+
+def _facts(*present: str) -> PackageClassificationFactsV1:
+    present_set = set(present)
+    kinds = (
+        "explicit_plugin_intent",
+        "existing_plugin_binding",
+        "existing_plugin_history",
+        "independent_non_plugin_authority",
+    )
+    return PackageClassificationFactsV1(
+        facts=tuple(
+            PackageClassificationBasisFactV1(
+                kind=kind,  # type: ignore[arg-type]
+                present=kind in present_set,
+                authority_id=f"authority:{kind}",
+                owner_revision=f"revision:{kind}:1",
+            )
+            for kind in kinds
+        ),
+        policy_revision="classification-policy:1",
+        classifier_epoch=1,
+    )
+
+
+def _request(
+    *,
+    operation_id: str = "manifest-operation",
+    source: str = "https://packages.example.test/acme.whl",
+    environment_fingerprint: str = "e" * 64,
+) -> PackageLifecycleIngressRequestV1:
+    return PackageLifecycleIngressRequestV1(
+        operation_id=operation_id,
+        action="install",
+        product_id="coding",
+        scope_id="workspace:manifest",
+        requested_package="acme==1.0",
+        requested_plugin_id="acme.plugin",
+        source_locator=source,
+        policy_revision="package-policy:1",
+        quota_profile_revision="quota:1",
+        resolution_environment_fingerprint=environment_fingerprint,
+    )
+
+
+def _closure_environment() -> PackageResolutionEnvironmentV1:
+    return PackageResolutionEnvironmentV1.from_mapping(
+        {
+            "implementation_name": "cpython",
+            "implementation_version": "3.11.10",
+            "os_name": "posix",
+            "platform_machine": "x86_64",
+            "platform_python_implementation": "CPython",
+            "platform_release": "manifest",
+            "platform_system": "Linux",
+            "platform_version": "manifest",
+            "python_full_version": "3.11.10",
+            "python_version": "3.11",
+            "sys_platform": "linux",
+        },
+        supported_tags=("py3-none-any",),
+    )
+
+
+def _owner(
+    tmp_path: Path,
+    *,
+    facts: PackageClassificationFactsV1,
+    enabled: bool = True,
+) -> tuple[PackageLifecycleOwner, PackageLifecycleJournal]:
+    journal = PackageLifecycleJournal(tmp_path / "package-lifecycle.jsonl")
+    return (
+        PackageLifecycleOwner(
+            journal=journal,
+            classification_authority=_Authority(facts),
+            enabled=enabled,
+        ),
+        journal,
+    )
+
+
+_LIFECYCLE_PHASES: tuple[PackageLifecyclePhase, ...] = (
+    "accepted",
+    "classified",
+    "acquiring",
+    "acquired",
+    "inspecting",
+    "extracted",
+    "resolving_closure",
+    "closure_verified",
+    "transaction_pinned",
+    "staging",
+    "set_published",
+    "committed",
+)
+
+
+def _advance_lifecycle(
+    owner: PackageLifecycleOwner,
+    status: PackageLifecycleStatusV1,
+    target: PackageLifecyclePhase,
+) -> PackageLifecycleStatusV1:
+    current = status
+    start = _LIFECYCLE_PHASES.index(current.phase)
+    end = _LIFECYCLE_PHASES.index(target)
+    for next_phase in _LIFECYCLE_PHASES[start + 1 : end + 1]:
+        current = owner.advance(
+            current.operation_id,
+            next_phase=next_phase,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+    return current
+
+
+@dataclass
+class _ManifestProductTransaction:
+    owner: PackageLifecycleOwner
+    calls: list[PackageProductEntrypoint] = field(default_factory=list)
+
+    @property
+    def owner_binding_id(self) -> str:
+        return self.owner.binding_id
+
+    def finalize_committed(
+        self,
+        _request: PackageProductRouteRequestV1,
+        *,
+        current: PackageLifecycleStatusV1,
+    ) -> None:
+        assert (current.phase, current.disposition) == ("committed", "committed")
+
+    def execute(
+        self,
+        request: PackageProductRouteRequestV1,
+        *,
+        current: PackageLifecycleStatusV1,
+    ) -> PackageLifecycleStatusV1:
+        self.calls.append(request.entrypoint)
+        return _advance_lifecycle(self.owner, current, "committed")
+
+
+def _manifest_product_admission(
+    *, runtime_id: str = "runtime:product"
+) -> PackageEpochRuntimeAdmissionReceiptV1:
+    fence = PackageEpochFenceReceiptV1.create(
+        PackageEpochFenceRequestV1.create(
+            store_id="package-store:product",
+            prior_fence=None,
+            legacy_root_identity="1" * 64,
+            fenced_root_identity="2" * 64,
+            namespace_id="3" * 64,
+            minimum_runtime_version="1.0.0",
+            minimum_runtime_protocol_epoch=1,
+            quiescence_receipt_id="4" * 64,
+            snapshot_receipt_id="5" * 64,
+            root_switch_receipt_id="6" * 64,
+        )
+    )
+    lease = PackageEpochRuntimeLeaseV1.create(
+        runtime_id=runtime_id,
+        runtime_epoch=fence.epoch,
+        store_root_identity=fence.fenced_root_identity,
+        registration_receipt_id="7" * 64,
+    )
+    request = PackageEpochRuntimeAdmissionRequestV1.create(
+        fence=fence,
+        runtime_id=lease.runtime_id,
+        runtime_version="1.0.0",
+        runtime_protocol_epoch=1,
+        runtime_epoch=lease.runtime_epoch,
+        store_root_identity=lease.store_root_identity,
+        lease_id=lease.lease_id,
+    )
+    return PackageEpochRuntimeAdmissionReceiptV1.create(
+        request,
+        snapshot=PackageEpochLeaseSnapshotV1.create(
+            store_id=fence.store_id,
+            owner_revision=1,
+            active_leases=(lease,),
+        ),
+    )
+
+
+def _b2_owner(
+    tmp_path: Path,
+    *,
+    case_id: str,
+    secret: str,
+    payload: bytes | None = None,
+    payloads: dict[str, bytes] | None = None,
+    inspection_budgets: PackageInspectionBudgetV1 | None = None,
+    wheel_verifier: PackageWheelVerifier | None = None,
+    supported_tags: frozenset[str] | None = None,
+    cleanup_debt: bool = False,
+    crash_after_phase: PackageLifecyclePhase | None = None,
+    configured_source_authority: _PinnedLocalSourceAuthority | None = None,
+    classification_authority: PackageProductLocalWheelPolicy | None = None,
+):
+    lifecycle_journal = PackageLifecycleJournal(tmp_path / "package-lifecycle.jsonl")
+    kernel = (
+        PackageLifecycleOwner(
+            journal=lifecycle_journal,
+            classification_authority=(
+                classification_authority or _Authority(_facts("explicit_plugin_intent"))
+            ),
+            enabled=True,
+        )
+        if crash_after_phase is None
+        else _CrashAfterPhasePackageOwner(
+            journal=lifecycle_journal,
+            facts=_facts("explicit_plugin_intent"),
+            crash_after=crash_after_phase,
+        )
+    )
+    store = PackageQuarantineStore(tmp_path / "quarantine")
+    evidence_journal = PackageArtifactEvidenceJournal(
+        tmp_path / "package-artifact-evidence.jsonl"
+    )
+    cleanup_journal = PackageQuarantineCleanupJournal(
+        tmp_path / "package-quarantine-cleanup.jsonl"
+    )
+    cleanup_owner = PackageQuarantineCleanupOwner(
+        journal=cleanup_journal,
+        store=store,
+    )
+    clock = (
+        _Clock() if case_id in {"B-ACQ-TIMEOUT", "B-COMPAT-ADOPT-UNAVAILABLE"} else None
+    )
+    source_authority = (
+        configured_source_authority
+        if configured_source_authority is not None
+        else _SourceAuthority(
+            case_id=case_id,
+            secret=secret,
+            payload=payload,
+            payloads=payloads,
+            clock=clock,
+        )
+    )
+    artifact_owner = PackageArtifactLifecycleOwner(
+        kernel=kernel,
+        classification_recheck=(
+            classification_authority or _StableClassificationRecheck()
+        ),
+        acquisition_owner=PackageAcquisitionOwner(
+            source_authority=source_authority,
+            quarantine_store=store,
+            clock=clock,
+        ),
+        evidence_journal=evidence_journal,
+        cleanup_owner=cleanup_owner,
+        wheel_verifier=(
+            wheel_verifier
+            or (
+                _CleanupDebtWheelVerifier(store)
+                if cleanup_debt
+                else PackageWheelVerifier()
+            )
+        ),
+        acquisition_budgets=PackageAcquisitionBudgetV1(
+            max_transport_bytes=(8 if case_id == "B-ACQ-BYTES" else 256 * 1024),
+            max_requests=1,
+            max_redirects=1,
+            max_wall_time_ms=(
+                5
+                if case_id in {"B-ACQ-TIMEOUT", "B-COMPAT-ADOPT-UNAVAILABLE"}
+                else 1000
+            ),
+        ),
+        inspection_budgets=inspection_budgets or PackageInspectionBudgetV1(),
+        supported_tags=supported_tags or frozenset({"py3-none-any"}),
+    )
+    return (
+        kernel,
+        artifact_owner,
+        lifecycle_journal,
+        evidence_journal,
+        cleanup_journal,
+        store,
+        source_authority,
+    )
+
+
+def _b3d_owner(
+    tmp_path: Path,
+    *,
+    case_id: str,
+    secret: str,
+    root_payload: bytes | None = None,
+    payloads: dict[str, bytes] | None = None,
+    resolver: (
+        _NoDependencyResolver
+        | _ManifestResolver
+        | PackageProductLocalWheelPolicy
+        | None
+    ) = None,
+    closure_builder: _LegacyClosureBuilder | None = None,
+    crash_after_phase: PackageLifecyclePhase | None = None,
+    configured_source_authority: _PinnedLocalSourceAuthority | None = None,
+    classification_authority: PackageProductLocalWheelPolicy | None = None,
+):
+    components = _b2_owner(
+        tmp_path,
+        case_id=case_id,
+        secret=secret,
+        payload=root_payload or _wheel_bytes(),
+        payloads=payloads,
+        crash_after_phase=crash_after_phase,
+        configured_source_authority=configured_source_authority,
+        classification_authority=classification_authority,
+    )
+    (
+        kernel,
+        artifact_owner,
+        _lifecycle_journal,
+        evidence_journal,
+        _cleanup_journal,
+        _store,
+        _source_authority,
+    ) = components
+    resolution_journal = PackageClosureResolutionJournal(
+        tmp_path / "package-closure-resolution.jsonl"
+    )
+    resolver = resolver or _NoDependencyResolver()
+    recursive_owner = closure_builder or PackageRecursiveClosureOwner(
+        resolver=resolver,
+        acquisition_owner=artifact_owner._acquisition_owner,
+        evidence_journal=evidence_journal,
+        wheel_verifier=artifact_owner._wheel_verifier,
+        closure_verifier=PackageClosureVerifier(),
+        acquisition_budgets=artifact_owner._acquisition_budgets,
+        inspection_budgets=artifact_owner._inspection_budgets,
+        cleanup_owner=artifact_owner._cleanup_owner,
+        selection_journal=resolution_journal,
+    )
+    return (
+        *components,
+        PackageClosureLifecycleOwner(
+            kernel=kernel,
+            artifact_owner=artifact_owner,
+            closure_builder=recursive_owner,
+            resolution_journal=resolution_journal,
+        ),
+        resolution_journal,
+        resolver,
+    )
+
+
+def _artifact_execution(
+    status: PackageLifecycleStatusV1,
+    *,
+    secret: str,
+) -> PackageArtifactExecutionRequestV1:
+    return PackageArtifactExecutionRequestV1(
+        operation_id=status.operation_id,
+        request_fingerprint=status.request_fingerprint,
+        expected_attempt_epoch=status.attempt_epoch,
+        wheel_filename=WHEEL_FILENAME,
+        credential_reference=f"opaque:{secret}",
+    )
+
+
+def _land_artifact_phase(
+    *,
+    kernel: PackageLifecycleOwner,
+    artifact_owner: PackageArtifactLifecycleOwner,
+    evidence_journal: PackageArtifactEvidenceJournal,
+    classified: PackageLifecycleStatusV1,
+    target_phase: str,
+    secret: str,
+) -> tuple[
+    PackageLifecycleStatusV1,
+    AcquiredPackageCandidate | VerifiedWheelCandidate | None,
+    PackageArtifactExecutionRequestV1,
+]:
+    execution = _artifact_execution(classified, secret=secret)
+    if target_phase == "extracted":
+        result = artifact_owner.execute(execution)
+        assert result.status.phase == "extracted"
+        assert result.candidate is not None
+        return result.status, result.candidate, execution
+
+    acquiring = kernel.advance(
+        classified.operation_id,
+        next_phase="acquiring",
+        expected_phase="classified",
+        expected_journal_revision=classified.journal_revision,
+        expected_attempt_epoch=classified.attempt_epoch,
+    )
+    if target_phase == "acquiring":
+        return acquiring, None, execution
+
+    request = kernel.journal.request(acquiring.operation_id)
+    assert request is not None
+    acquisition_request = PackageAcquisitionRequestV1(
+        operation_id=request.operation_id,
+        attempt_epoch=acquiring.attempt_epoch,
+        node_id="root",
+        canonical_source_identity=request.canonical_source_identity,
+        request_fingerprint=request.request_fingerprint,
+        requested_locator_digest=sha256(
+            request.canonical_source_identity.encode("utf-8")
+        ).hexdigest(),
+        policy_revision=request.policy_revision,
+        credential_reference=f"opaque:{secret}",
+    )
+    authorized = artifact_owner._acquisition_owner.authorize_source(acquisition_request)
+    evidence_journal.append(
+        request_fingerprint=request.request_fingerprint,
+        evidence=PackageAuthenticatedSourceEvidenceV1(
+            attempt_epoch=acquiring.attempt_epoch,
+            envelope=authorized.envelope,
+        ),
+    )
+    candidate = artifact_owner._acquisition_owner.acquire_authorized(
+        acquisition_request,
+        authorized,
+        budgets=artifact_owner._acquisition_budgets,
+    )
+    evidence_journal.append(
+        request_fingerprint=request.request_fingerprint,
+        evidence=candidate.receipt,
+    )
+    acquired = kernel.advance(
+        acquiring.operation_id,
+        next_phase="acquired",
+        expected_phase="acquiring",
+        expected_journal_revision=acquiring.journal_revision,
+        expected_attempt_epoch=acquiring.attempt_epoch,
+    )
+    if target_phase == "acquired":
+        return acquired, candidate, execution
+
+    assert target_phase == "inspecting"
+    inspecting = kernel.advance(
+        acquired.operation_id,
+        next_phase="inspecting",
+        expected_phase="acquired",
+        expected_journal_revision=acquired.journal_revision,
+        expected_attempt_epoch=acquired.attempt_epoch,
+    )
+    return inspecting, candidate, execution
+
+
+@dataclass(frozen=True)
+class _ManifestCommitAdmissionFixture:
+    kernel: PackageLifecycleOwner
+    committed_sets: PackageCommittedSetJournal
+    pin_journal: PackageTransactionPinJournal
+    pin_receipt: PackageTransactionPinReceiptV1
+    commit_owner: PackageCommitLifecycleOwner
+    admission_owner: PackageCommitAdmissionOwner
+
+
+def test_committed_set_gc_tombstone_blocks_exact_root_republication(
+    tmp_path: Path,
+) -> None:
+    fixture = _manifest_commit_admission_fixture(tmp_path)
+    (record,) = fixture.committed_sets.records()
+    marker = fixture.committed_sets.tombstone(record)
+    assert fixture.committed_sets.tombstone(record) == marker
+    assert fixture.committed_sets.is_tombstoned(record.committed_set.root_ref.ref_id)
+    old_record = json.loads(
+        fixture.committed_sets.path.read_text(encoding="utf-8").splitlines()[-1]
+    )
+    with pytest.raises(ValueError):
+        PACKAGE_COMMITTED_SET_JOURNAL_CODEC.decode_record(old_record)
+    restarted = PackageCommittedSetJournal(fixture.committed_sets.path)
+    with pytest.raises(PackageCommittedSetJournalError) as caught:
+        restarted.publish(
+            record.closure_lock,
+            request_fingerprint=record.committed_set.request_fingerprint,
+            product_id=record.committed_set.product_id,
+            scope_id=record.committed_set.scope_id,
+            installation_id=record.committed_set.installation_id,
+            plugin_id=record.committed_set.plugin_id,
+            classification_fingerprint=(
+                record.committed_set.classification_fingerprint
+            ),
+        )
+    assert caught.value.code == "package_committed_set_gc_tombstoned"
+    assert restarted.records() == (record,)
+    assert len(restarted.read_events()) == 2
+
+
+def test_committed_set_read_events_is_non_repairing(tmp_path: Path) -> None:
+    journal = PackageCommittedSetJournal(tmp_path / "committed-sets.jsonl")
+    lock = journal.path.with_name(f"{journal.path.name}.lock")
+    assert journal.read_events() == ()
+    assert not journal.path.exists()
+    assert not lock.exists()
+
+    journal.path.write_bytes(b'{"partial":')
+    with journal_file_lock(journal.path, "exclusive"):
+        pass
+    original = journal.path.read_bytes()
+    with pytest.raises(PackageCommittedSetJournalError) as invalid:
+        journal.read_events()
+    assert invalid.value.code == "package_committed_set_journal_corrupt"
+    assert journal.path.read_bytes() == original
+    assert lock.exists()
+
+
+def test_gc_binding_read_records_is_non_repairing(tmp_path: Path) -> None:
+    journal = PluginPackageGcBindingJournal(tmp_path / "gc-bindings.jsonl")
+    lock = journal.path.with_name(f"{journal.path.name}.lock")
+    assert journal.read_records() == ()
+    assert not journal.path.exists()
+    assert not lock.exists()
+
+    journal.path.write_bytes(b'{"partial":')
+    with journal_file_lock(journal.path, "exclusive"):
+        pass
+    original = journal.path.read_bytes()
+    with pytest.raises(PluginPackageGcBindingError) as invalid:
+        journal.read_records()
+    assert invalid.value.code == "plugin_package_gc_binding_corrupt"
+    assert journal.path.read_bytes() == original
+
+
+def _manifest_commit_admission_fixture(
+    tmp_path: Path,
+) -> _ManifestCommitAdmissionFixture:
+    journal = PackageLifecycleJournal(tmp_path / "package-lifecycle.jsonl")
+    kernel = PackageLifecycleOwner(
+        journal=journal,
+        classification_authority=_Authority(_facts("explicit_plugin_intent")),
+        enabled=True,
+    )
+    status = kernel.submit(_request())
+    assert status.classification is not None
+    for phase in (
+        "acquiring",
+        "acquired",
+        "inspecting",
+        "extracted",
+        "resolving_closure",
+        "closure_verified",
+    ):
+        prior = status.phase
+        status = kernel.advance(
+            status.operation_id,
+            next_phase=phase,  # type: ignore[arg-type]
+            expected_phase=prior,
+            expected_journal_revision=status.journal_revision,
+            expected_attempt_epoch=status.attempt_epoch,
+        )
+
+    dependency = VerifiedClosurePlanNodeV2(
+        node_id="manifest-admission-dependency",
+        role="dependency",
+        distribution="dependency",
+        version="2.0",
+        canonical_source_identity="https://packages.example.test/dependency.whl",
+        source_envelope_fingerprint="1" * 64,
+        acquisition_receipt_fingerprint="2" * 64,
+        wheel_evidence_fingerprint="3" * 64,
+        artifact_digest="4" * 64,
+        extraction_tree_digest="5" * 64,
+        selected_extras=(),
+        requirements=(),
+        selected_edges=(),
+    )
+    root_requirement = ResolvedPackageRequirementV1(
+        requirement=NormalizedPackageRequirementV1.parse("dependency==2.0"),
+        marker_applies=True,
+        selected_node_id=dependency.node_id,
+        expected_source_identity=dependency.canonical_source_identity,
+        expected_artifact_digest=dependency.artifact_digest,
+    )
+    root = VerifiedClosurePlanNodeV2(
+        node_id="manifest-admission-root",
+        role="root",
+        distribution="acme",
+        version="1.0",
+        canonical_source_identity="https://packages.example.test/acme.whl",
+        source_envelope_fingerprint="a" * 64,
+        acquisition_receipt_fingerprint="b" * 64,
+        wheel_evidence_fingerprint="c" * 64,
+        artifact_digest="d" * 64,
+        extraction_tree_digest="e" * 64,
+        selected_extras=(),
+        requirements=(root_requirement,),
+        selected_edges=(dependency.node_id,),
+    )
+    plan = VerifiedClosurePlanV2.create(
+        operation_id=status.operation_id,
+        attempt_epoch=status.attempt_epoch,
+        root_node_id=root.node_id,
+        resolution_environment_fingerprint="e" * 64,
+        nodes=(root, dependency),
+        max_depth=1,
+    )
+    pin_request = PackageTransactionPinRequestV1.create(
+        plan,
+        request_fingerprint=status.request_fingerprint,
+        classification_fingerprint=status.classification.evidence_ref,
+        recovery_identity="manifest-commit-admission",
+    )
+    pin_receipt = PackageTransactionPinReceiptV1.acquire(
+        pin_request,
+        pin_id="f" * 64,
+        owner_identity="manifest-retention-owner",
+        owner_revision=1,
+        lease_id="manifest-admission-lease",
+        lease_revision=1,
+    )
+    pin_journal = PackageTransactionPinJournal(
+        tmp_path / "package-transaction-pins.jsonl"
+    )
+    pin_journal.append(pin_receipt)
+    for phase in ("transaction_pinned", "staging"):
+        prior = status.phase
+        status = kernel.advance(
+            status.operation_id,
+            next_phase=phase,  # type: ignore[arg-type]
+            expected_phase=prior,
+            expected_journal_revision=status.journal_revision,
+            expected_attempt_epoch=status.attempt_epoch,
+        )
+
+    root_ref = PluginRevisionRefV1.create(
+        store_identity="manifest-plugin-store",
+        store_revision="manifest-plugin-revision:1",
+        installation_id="manifest-installation",
+        plugin_id="acme.plugin",
+        distribution=root.distribution,
+        version=root.version,
+        artifact_digest=root.artifact_digest,
+        extraction_tree_digest=root.extraction_tree_digest,
+    )
+    dependency_ref = VerifiedArtifactRefV1.create(
+        store_identity="manifest-dependency-store",
+        store_revision="manifest-dependency-revision:1",
+        distribution=dependency.distribution,
+        version=dependency.version,
+        artifact_digest=dependency.artifact_digest,
+        extraction_tree_digest=dependency.extraction_tree_digest,
+    )
+    closure_lock = DependencyClosureLockV2.create(
+        plan,
+        stable_refs={
+            root.node_id: root_ref,
+            dependency.node_id: dependency_ref,
+        },
+    )
+    committed_sets = PackageCommittedSetJournal(
+        tmp_path / "package-committed-sets.jsonl"
+    )
+    committed_sets.publish(
+        closure_lock,
+        request_fingerprint=status.request_fingerprint,
+        product_id="coding",
+        scope_id="workspace:manifest",
+        installation_id="manifest-installation",
+        plugin_id="acme.plugin",
+        classification_fingerprint=status.classification.evidence_ref,
+    )
+    status = kernel.advance(
+        status.operation_id,
+        next_phase="set_published",
+        expected_phase="staging",
+        expected_journal_revision=status.journal_revision,
+        expected_attempt_epoch=status.attempt_epoch,
+    )
+    assert status.phase == "set_published"
+    return _ManifestCommitAdmissionFixture(
+        kernel=kernel,
+        committed_sets=committed_sets,
+        pin_journal=pin_journal,
+        pin_receipt=pin_receipt,
+        commit_owner=PackageCommitLifecycleOwner(
+            kernel=kernel,
+            committed_sets=committed_sets,
+            pin_journal=pin_journal,
+        ),
+        admission_owner=PackageCommitAdmissionOwner(
+            lifecycle_journal=journal,
+            committed_sets=committed_sets,
+            pin_journal=pin_journal,
+        ),
+    )
+
+
+def _manifest_admission_request(
+    receipt: PackagePublicationReceiptV1,
+    **changes: object,
+) -> PackageCommitAdmissionRequestV1:
+    values: dict[str, object] = {
+        "operation_id": receipt.operation_id,
+        "request_fingerprint": receipt.request_fingerprint,
+        "product_id": receipt.product_id,
+        "scope_id": receipt.scope_id,
+        "installation_id": receipt.installation_id,
+        "plugin_id": receipt.plugin_id,
+        "claimed_root_ref": receipt.committed_set.root_ref,
+        "committed_set_id": receipt.committed_set.set_id,
+        "closure_lock_digest": receipt.committed_set.closure_lock_digest,
+        "publication_receipt": receipt,
+    }
+    values.update(changes)
+    return PackageCommitAdmissionRequestV1.create(**values)  # type: ignore[arg-type]
+
+
+class _ManifestDesiredStateCommitOwner:
+    def __init__(self, *, inventory_revision: int = 0) -> None:
+        self.inventory_revision = inventory_revision
+        self.interruptions = 0
+        self.calls = 0
+        self.physical_commits = 0
+        self._results: dict[str, PackageDesiredStateCommitResultV1] = {}
+        self._lock = Lock()
+
+    def commit(
+        self,
+        request: PackageDesiredStateCommitRequestV1,
+    ) -> PackageDesiredStateCommitResultV1:
+        with self._lock:
+            self.calls += 1
+            repeated = self._results.get(request.desired_request_id)
+            if repeated is not None:
+                return repeated
+            if self.interruptions:
+                self.interruptions -= 1
+                raise RuntimeError("desired owner interrupted")
+            if request.expected_inventory_revision != self.inventory_revision:
+                result = PackageDesiredStateCommitResultV1.rejected(
+                    request,
+                    observed_inventory_revision=self.inventory_revision,
+                    owner_identity="manifest-desired-owner",
+                    owner_revision=max(self.inventory_revision, 1),
+                )
+            else:
+                self.inventory_revision += 1
+                self.physical_commits += 1
+                result = PackageDesiredStateCommitResultV1.committed(
+                    request,
+                    owner_identity="manifest-desired-owner",
+                    owner_revision=self.inventory_revision,
+                )
+            self._results[request.desired_request_id] = result
+            return result
+
+
+class _ManifestProcessCrash(BaseException):
+    pass
+
+
+class _ManifestRetentionSettlementOwner:
+    def __init__(self, pin_journal: PackageTransactionPinJournal) -> None:
+        self.pin_journal = pin_journal
+        self.settle_interruptions = 0
+        self.settle_postcommit_crashes = 0
+        self.acquire_calls = 0
+        self.abort_calls = 0
+        self.settle_calls = 0
+        self.physical_acquisitions = 0
+        self.physical_aborts = 0
+        self.physical_settlements = 0
+        self.zero_pin_observed = False
+        self._receipts: dict[str, PackageDependencyPinReceiptV1] = {}
+        self._lock = Lock()
+
+    def acquire(
+        self,
+        request: object,
+        *,
+        transaction_pin_receipt: PackageTransactionPinReceiptV1,
+    ) -> PackageDependencyPinReceiptV1:
+        from loushang.harness.resources.packages.plugin_lifecycle.retention_handoff import (
+            PackageDependencyPinRequestV1,
+        )
+
+        assert isinstance(request, PackageDependencyPinRequestV1)
+        with self._lock:
+            self.acquire_calls += 1
+            repeated = self._receipts.get(request.pin_request_id)
+            if repeated is not None:
+                return repeated
+            assert transaction_pin_receipt.state == "acquired"
+            pin_ids = tuple(
+                sha256(f"{request.pin_request_id}:{ref_id}".encode()).hexdigest()
+                for ref_id in request.target_ref_ids
+            )
+            receipt = PackageDependencyPinReceiptV1.acquire(
+                request,
+                pin_ids=pin_ids,
+                owner_identity="manifest-handoff-retention-owner",
+                owner_revision=1,
+                lease_revision=1,
+                transaction_pin_receipt=transaction_pin_receipt,
+            )
+            self._receipts[request.pin_request_id] = receipt
+            self.physical_acquisitions += 1
+            return receipt
+
+    def abort(
+        self,
+        receipt: PackageDependencyPinReceiptV1,
+        *,
+        failure: object,
+    ) -> PackageDependencyPinReceiptV1:
+        from loushang.harness.resources.packages.plugin_lifecycle.retention_handoff import (
+            PackageDesiredStateCommitFailureV1,
+        )
+
+        assert isinstance(failure, PackageDesiredStateCommitFailureV1)
+        with self._lock:
+            self.abort_calls += 1
+            current = self._receipts[receipt.request.pin_request_id]
+            if current.state == "aborted":
+                return current
+            assert current == receipt and current.state == "acquired"
+            aborted = PackageDependencyPinReceiptV1.abort(
+                current,
+                failure,
+                owner_revision=current.owner_revision + 1,
+                lease_revision=current.lease_revision + 1,
+            )
+            self._receipts[receipt.request.pin_request_id] = aborted
+            self.physical_aborts += 1
+            assert aborted.transaction_pin_receipt.state == "acquired"
+            return aborted
+
+    def settle(
+        self,
+        receipt: PackageDependencyPinReceiptV1,
+        *,
+        desired_receipt: object,
+    ) -> PackageDependencyPinReceiptV1:
+        from loushang.harness.resources.packages.plugin_lifecycle.retention_handoff import (
+            PackageDesiredStateCommitReceiptV1,
+        )
+
+        assert isinstance(desired_receipt, PackageDesiredStateCommitReceiptV1)
+        with self._lock:
+            self.settle_calls += 1
+            current = self._receipts[receipt.request.pin_request_id]
+            if current.state == "settled":
+                return current
+            assert current == receipt and current.state == "acquired"
+            if self.settle_interruptions:
+                self.settle_interruptions -= 1
+                raise RuntimeError("retention settlement interrupted")
+            if not current.dependency_pins_live:
+                self.zero_pin_observed = True
+            released = PackageTransactionPinReceiptV1.transition(
+                current.transaction_pin_receipt,
+                state="released",
+                owner_revision=current.transaction_pin_receipt.owner_revision + 1,
+                lease_revision=current.transaction_pin_receipt.lease_revision + 1,
+                transition_evidence_ref=desired_receipt.receipt_id,
+            )
+            self.pin_journal.append(released)
+            settled = PackageDependencyPinReceiptV1.settle(
+                current,
+                desired_receipt,
+                released,
+                owner_revision=current.owner_revision + 1,
+                lease_revision=current.lease_revision + 1,
+            )
+            self._receipts[receipt.request.pin_request_id] = settled
+            self.physical_settlements += 1
+            if self.settle_postcommit_crashes:
+                self.settle_postcommit_crashes -= 1
+                raise _ManifestProcessCrash
+            return settled
+
+    def current(
+        self,
+        request: PackageRetentionHandoffRequestV1,
+    ) -> PackageDependencyPinReceiptV1 | None:
+        with self._lock:
+            return self._receipts.get(request.dependency_pin_request.pin_request_id)
+
+
+@dataclass(frozen=True)
+class _ManifestRetentionHandoffFixture:
+    request: PackageRetentionHandoffRequestV1
+    journal: PackageRetentionHandoffJournal
+    owner: PackageRetentionHandoffOwner
+    admission: PackageCommitAdmissionOwner
+    retention: _ManifestRetentionSettlementOwner
+    desired: _ManifestDesiredStateCommitOwner
+    pin_journal: PackageTransactionPinJournal
+
+
+def _manifest_retention_handoff_fixture(
+    tmp_path: Path,
+    *,
+    desired_inventory_revision: int = 0,
+) -> _ManifestRetentionHandoffFixture:
+    admission = _manifest_commit_admission_fixture(tmp_path)
+    publication = admission.commit_owner.commit("manifest-operation")
+    admission_request = _manifest_admission_request(publication)
+    admission_result = admission.admission_owner.admit(admission_request)
+    assert admission_result.receipt is not None
+    desired_request = PackageDesiredStateCommitRequestV1.create(
+        admission_request,
+        command_id="manifest-desired-command",
+        command_fingerprint=sha256(b"manifest-desired-command").hexdigest(),
+        expected_inventory_revision=0,
+    )
+    request = PackageRetentionHandoffRequestV1.create(
+        admission_request=admission_request,
+        admission_receipt=admission_result.receipt,
+        transaction_pin_receipt=admission.pin_receipt,
+        desired_request=desired_request,
+    )
+    journal = PackageRetentionHandoffJournal(tmp_path / "retention-handoff.jsonl")
+    retention = _ManifestRetentionSettlementOwner(admission.pin_journal)
+    desired = _ManifestDesiredStateCommitOwner(
+        inventory_revision=desired_inventory_revision
+    )
+    return _ManifestRetentionHandoffFixture(
+        request=request,
+        journal=journal,
+        owner=PackageRetentionHandoffOwner(
+            journal=journal,
+            admission=admission.admission_owner,
+            retention=retention,
+            desired_state=desired,
+        ),
+        admission=admission.admission_owner,
+        retention=retention,
+        desired=desired,
+        pin_journal=admission.pin_journal,
+    )
+
+
+@dataclass(frozen=True)
+class _ManifestDesiredRevisionProjection:
+    ledger: PluginDesiredStateLedger
+
+    def project(
+        self,
+        request: PackageDesiredStateCommitRequestV1,
+    ) -> PluginPackageRevisionRefV1:
+        return PluginPackageRevisionRefV1(
+            plugin_id=request.plugin_id,
+            plugin_version=request.root_ref.version,
+            package_content_digest=request.root_ref.artifact_digest,
+            dependency_lock_digest="7" * 64,
+            package_source_identity="https://packages.example.test/acme.whl",
+        )
+
+    def inventory_revision(self) -> int:
+        return self.ledger.snapshot().inventory_revision
+
+
+def test_plc9a2_desired_adapter_commits_exact_disabled_revision_and_reports_cas(
+    tmp_path: Path,
+) -> None:
+    fixture = _manifest_retention_handoff_fixture(tmp_path)
+    gc_gate = PluginPackageGcReservationJournal(tmp_path / "gc-reservations.jsonl")
+    ledger = PluginDesiredStateLedger(
+        tmp_path / "product-desired.jsonl", gc_gate=gc_gate
+    )
+    service = PluginManagementService(
+        desired_state=ledger,
+        operation_journal_path=tmp_path / "product-operations.jsonl",
+    )
+    gc_bindings = PluginPackageGcBindingJournal(tmp_path / "gc-bindings.jsonl")
+    audit = PluginPackageGcClaimAudit(
+        bindings=gc_bindings,
+        management=service,
+        desired=ledger,
+        gate=gc_gate,
+    )
+    adapter = PluginManagementPackageDesiredStateAdapter(
+        management=service,
+        revisions=_ManifestDesiredRevisionProjection(ledger),
+        installation_scope="workspace",
+        actor_id="product-runtime",
+        policy_revision="product-policy:1",
+        gc_bindings=gc_bindings,
+        gc_gate=gc_gate,
+    )
+    with gc_gate.guard():
+        gc_bindings.prepare(
+            fixture.request.desired_request,
+            adapter.revisions.project(fixture.request.desired_request),
+        )
+    assert tuple(row.state for row in audit.snapshot()) == ("unsubmitted",)
+
+    result = adapter.commit(fixture.request.desired_request)
+
+    assert result.disposition == "committed"
+    assert result.receipt is not None
+    state = ledger.snapshot().installations[0]
+    assert state.selection.desired_state == "installed_disabled"
+    assert state.selection.package_revision is not None
+    assert (
+        state.selection.package_revision.package_content_digest
+        == fixture.request.desired_request.root_ref.artifact_digest
+    )
+    bindings = gc_bindings.for_revision(state.selection.package_revision)
+    assert len(bindings) == 1
+    claims = gc_bindings.claims()
+    assert len(claims) == 1
+    assert claims[0].request == fixture.request.desired_request
+    assert tuple(row.state for row in audit.snapshot()) == ("confirmed",)
+    assert bindings[0].request == fixture.request.desired_request
+    assert bindings[0].desired_transition_revision == 1
+    repeated = adapter.commit(fixture.request.desired_request)
+    assert repeated == result
+    assert gc_bindings.for_revision(state.selection.package_revision) == bindings
+    assert gc_bindings.claims() == claims
+
+    conflicting_request = PackageDesiredStateCommitRequestV1.create(
+        fixture.request.admission_request,
+        command_id="manifest-desired-conflict",
+        command_fingerprint=sha256(b"manifest-desired-conflict").hexdigest(),
+        expected_inventory_revision=0,
+    )
+    conflict = adapter.commit(conflicting_request)
+    assert conflict.disposition == "rejected"
+    assert conflict.failure is not None
+    assert conflict.failure.observed_inventory_revision == 1
+    assert len(gc_bindings.claims()) == 2
+    assert tuple(row.state for row in audit.snapshot()) == (
+        "confirmed",
+        "failed_unproven",
+    )
+
+
+def test_plc9b_gc_claim_survives_crash_before_committed_crosswalk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _manifest_retention_handoff_fixture(tmp_path)
+    gate = PluginPackageGcReservationJournal(tmp_path / "gc-reservations.jsonl")
+    ledger = PluginDesiredStateLedger(tmp_path / "product-desired.jsonl", gc_gate=gate)
+    service = PluginManagementService(
+        desired_state=ledger,
+        operation_journal_path=tmp_path / "product-operations.jsonl",
+    )
+    bindings = PluginPackageGcBindingJournal(tmp_path / "gc-bindings.jsonl")
+    adapter = PluginManagementPackageDesiredStateAdapter(
+        management=service,
+        revisions=_ManifestDesiredRevisionProjection(ledger),
+        installation_scope="workspace",
+        actor_id="product-runtime",
+        policy_revision="product-policy:1",
+        gc_bindings=bindings,
+        gc_gate=gate,
+    )
+    audit = PluginPackageGcClaimAudit(
+        bindings=bindings,
+        management=service,
+        desired=ledger,
+        gate=gate,
+    )
+    record = bindings.record
+
+    def interrupt(*_args: object) -> None:
+        raise RuntimeError("simulated crash after desired commit")
+
+    monkeypatch.setattr(bindings, "record", interrupt)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        adapter.commit(fixture.request.desired_request)
+    assert ledger.snapshot().inventory_revision == 1
+    assert len(PluginPackageGcBindingJournal(bindings.path).claims()) == 1
+    assert bindings.records() == ()
+    assert tuple(row.state for row in audit.snapshot()) == ("binding_missing",)
+
+    monkeypatch.setattr(bindings, "record", record)
+    assert adapter.commit(fixture.request.desired_request).disposition == "committed"
+    assert len(bindings.claims()) == 1
+    assert len(bindings.records()) == 1
+    assert tuple(row.state for row in audit.snapshot()) == ("confirmed",)
+
+
+def test_plc9b_desired_adapter_blocks_a_reserved_root_alias_before_commit(
+    tmp_path: Path,
+) -> None:
+    fixture = _manifest_retention_handoff_fixture(tmp_path)
+
+    class ReservedGate:
+        reserved = frozenset[PluginPackageRevisionRefV1]()
+
+        @contextmanager
+        def guard(self) -> Iterator[frozenset[PluginPackageRevisionRefV1]]:
+            yield self.reserved
+
+    gate = ReservedGate()
+    ledger = PluginDesiredStateLedger(tmp_path / "product-desired.jsonl", gc_gate=gate)
+    service = PluginManagementService(
+        desired_state=ledger,
+        operation_journal_path=tmp_path / "product-operations.jsonl",
+    )
+    bindings = PluginPackageGcBindingJournal(tmp_path / "gc-bindings.jsonl")
+    projector = _ManifestDesiredRevisionProjection(ledger)
+    first = PluginManagementPackageDesiredStateAdapter(
+        management=service,
+        revisions=projector,
+        installation_scope="workspace",
+        actor_id="product-runtime",
+        policy_revision="product-policy:1",
+        gc_bindings=bindings,
+        gc_gate=gate,
+    )
+    with pytest.raises(ValueError, match="management gate differ"):
+        replace(first, gc_gate=ReservedGate())
+    first.commit(fixture.request.desired_request)
+    original = projector.project(fixture.request.desired_request)
+    gate.reserved = frozenset({original})
+
+    class AlternateProjection(_ManifestDesiredRevisionProjection):
+        def project(
+            self, request: PackageDesiredStateCommitRequestV1
+        ) -> PluginPackageRevisionRefV1:
+            return replace(
+                super().project(request),
+                package_source_identity="https://packages.example.test/alias.whl",
+            )
+
+    alias_request = PackageDesiredStateCommitRequestV1.create(
+        fixture.request.admission_request,
+        command_id="manifest-desired-alias",
+        command_fingerprint=sha256(b"manifest-desired-alias").hexdigest(),
+        expected_inventory_revision=1,
+    )
+    alias_adapter = replace(first, revisions=AlternateProjection(ledger))
+    with pytest.raises(PackageProductGcAdmissionError) as blocked:
+        alias_adapter.commit(alias_request)
+    assert blocked.value.code == "package_product_gc_root_reserved"
+    assert ledger.snapshot().inventory_revision == 1
+    assert len(bindings.records()) == 1
+
+
+def test_plc9a2_retention_owner_repairs_release_before_settlement_crash(
+    tmp_path: Path,
+) -> None:
+    fixture = _manifest_retention_handoff_fixture(tmp_path)
+    journal = PackageRetentionHandoffJournal(tmp_path / "product-handoff.jsonl")
+    retention = PackageProductRetentionSettlementOwner(
+        path=tmp_path / "product-retention.jsonl",
+        transaction_pins=fixture.pin_journal,
+    )
+    owner = PackageRetentionHandoffOwner(
+        journal=journal,
+        admission=fixture.admission,
+        retention=retention,
+        desired_state=fixture.desired,
+    )
+    append = retention._append_unlocked
+    interrupted = True
+
+    def interrupt_settlement(
+        records: tuple[object, ...],
+        receipt: PackageDependencyPinReceiptV1,
+    ) -> None:
+        nonlocal interrupted
+        if interrupted and receipt.state == "settled":
+            interrupted = False
+            raise RuntimeError("simulated crash after transaction-pin release")
+        append(records, receipt)  # type: ignore[arg-type]
+
+    retention._append_unlocked = interrupt_settlement  # type: ignore[method-assign]
+    first = owner.execute(fixture.request)
+    assert first.disposition == "retryable_failure"
+    assert first.receipt is not None
+    assert first.receipt.state == "desired_committed"
+    released = fixture.pin_journal.current(
+        operation_id=fixture.request.operation_id,
+        pin_request_id=fixture.request.transaction_pin_receipt.pin_request.pin_request_id,
+    )
+    assert released is not None and released.state == "released"
+
+    recovery = PackageRetentionHandoffRecovery(
+        journal=journal,
+        owner=owner,
+    )
+    assert recovery.recover_exact("other-operation") == ()
+    assert journal.current(fixture.request.handoff_id) == first.receipt
+    recovered = recovery.recover_exact(fixture.request.operation_id)
+
+    assert recovered == (fixture.request.handoff_id,)
+    current = journal.current(fixture.request.handoff_id)
+    assert current is not None and current.state == "settled"
+    assert tuple(record.receipt.state for record in retention.records()) == (
+        "acquired",
+        "settled",
+    )
+
+
+@dataclass
+class _ManifestEpochLeaseAuthority:
+    snapshot_value: PackageEpochLeaseSnapshotV1
+    calls: int = 0
+
+    def snapshot(self, *, store_id: str) -> PackageEpochLeaseSnapshotV1:
+        self.calls += 1
+        assert store_id == self.snapshot_value.store_id
+        return self.snapshot_value
+
+
+@dataclass(frozen=True)
+class _ManifestEpochAdmissionFixture:
+    journal: PackageEpochFenceJournal
+    owner: PackageEpochRuntimeAdmissionOwner
+    leases: _ManifestEpochLeaseAuthority
+    request: PackageEpochRuntimeAdmissionRequestV1
+
+
+def _manifest_epoch_admission_fixture(
+    tmp_path: Path,
+    *,
+    mixed_epoch: bool,
+) -> _ManifestEpochAdmissionFixture:
+    journal = PackageEpochFenceJournal(tmp_path / "package-epoch.jsonl")
+    first = journal.publish(
+        PackageEpochFenceRequestV1.create(
+            store_id="package-store:manifest",
+            prior_fence=None,
+            legacy_root_identity="1" * 64,
+            fenced_root_identity="2" * 64,
+            namespace_id="3" * 64,
+            minimum_runtime_version="1.0.0",
+            minimum_runtime_protocol_epoch=1,
+            quiescence_receipt_id="4" * 64,
+            snapshot_receipt_id="5" * 64,
+            root_switch_receipt_id="6" * 64,
+        )
+    )
+    current = journal.publish(
+        PackageEpochFenceRequestV1.create(
+            store_id=first.store_id,
+            prior_fence=first,
+            legacy_root_identity=first.fenced_root_identity,
+            fenced_root_identity="7" * 64,
+            namespace_id="8" * 64,
+            minimum_runtime_version="2.0.0",
+            minimum_runtime_protocol_epoch=2,
+            quiescence_receipt_id="9" * 64,
+            snapshot_receipt_id="a" * 64,
+            root_switch_receipt_id="b" * 64,
+        )
+    )
+    current_lease = PackageEpochRuntimeLeaseV1.create(
+        runtime_id="runtime:manifest-current",
+        runtime_epoch=current.epoch,
+        store_root_identity=current.fenced_root_identity,
+        registration_receipt_id="c" * 64,
+    )
+    stale_lease = PackageEpochRuntimeLeaseV1.create(
+        runtime_id="runtime:manifest-stale",
+        runtime_epoch=first.epoch,
+        store_root_identity=first.fenced_root_identity,
+        registration_receipt_id="d" * 64,
+    )
+    active_leases = (current_lease, stale_lease) if mixed_epoch else (current_lease,)
+    leases = _ManifestEpochLeaseAuthority(
+        PackageEpochLeaseSnapshotV1.create(
+            store_id=current.store_id,
+            owner_revision=2,
+            active_leases=active_leases,
+        )
+    )
+    request_lease = current_lease if mixed_epoch else stale_lease
+    request = PackageEpochRuntimeAdmissionRequestV1.create(
+        fence=current,
+        runtime_id=request_lease.runtime_id,
+        runtime_version="2.0.0" if mixed_epoch else "1.0.0",
+        runtime_protocol_epoch=2 if mixed_epoch else 1,
+        runtime_epoch=request_lease.runtime_epoch,
+        store_root_identity=request_lease.store_root_identity,
+        lease_id=request_lease.lease_id,
+    )
+    return _ManifestEpochAdmissionFixture(
+        journal=journal,
+        owner=PackageEpochRuntimeAdmissionOwner(fences=journal, leases=leases),
+        leases=leases,
+        request=request,
+    )
+
+
+@dataclass
+class _ManifestEpochCutoverCoordination:
+    active_pre_fence_registration_ids: tuple[str, ...] = ()
+    calls: int = 0
+
+    def __post_init__(self) -> None:
+        self._lock = Lock()
+
+    @contextmanager
+    def exclusive_quiescence(
+        self,
+        *,
+        store_id: str,
+    ) -> Iterator[PackageEpochCutoverQuiescenceReceiptV1]:
+        with self._lock:
+            self.calls += 1
+            yield PackageEpochCutoverQuiescenceReceiptV1.create(
+                store_id=store_id,
+                owner_revision=1,
+                active_runtime_lease_ids=(),
+                active_pre_fence_registration_ids=(
+                    self.active_pre_fence_registration_ids
+                ),
+            )
+
+
+@dataclass
+class _ManifestEpochCutoverSnapshots:
+    calls: int = 0
+
+    def capture(
+        self,
+        *,
+        store_id: str,
+        legacy_root_identity: str,
+        quiescence_receipt_id: str,
+    ) -> PackageEpochCutoverSnapshotReceiptV1:
+        self.calls += 1
+        return PackageEpochCutoverSnapshotReceiptV1.create(
+            store_id=store_id,
+            legacy_root_identity=legacy_root_identity,
+            quiescence_receipt_id=quiescence_receipt_id,
+            snapshot_id=sha256(
+                f"{store_id}:{legacy_root_identity}:manifest".encode()
+            ).hexdigest(),
+            snapshot_revision=1,
+            entry_count=2,
+            byte_count=15,
+        )
+
+
+@dataclass(frozen=True)
+class _ManifestEpochCutoverFixture:
+    owner: PackagePosixEpochCutoverOwner
+    request: PackagePosixEpochCutoverRequestV1
+    journal: PackageEpochFenceJournal
+    coordination: _ManifestEpochCutoverCoordination
+    snapshots: _ManifestEpochCutoverSnapshots
+    authority: Path
+    legacy: Path
+    epochs: Path
+
+
+@dataclass(frozen=True)
+class _ManifestWindowsEpochCutoverFixture:
+    owner: PackageWindowsEpochCutoverOwner
+    request: PackageWindowsEpochCutoverRequestV1
+    journal: PackageEpochFenceJournal
+    coordination: _ManifestEpochCutoverCoordination
+    snapshots: _ManifestEpochCutoverSnapshots
+    authority: Path
+    legacy: Path
+    epochs: Path
+
+
+def _manifest_posix_epoch_cutover_fixture(
+    tmp_path: Path,
+    *,
+    pre_fence_live: bool,
+) -> _ManifestEpochCutoverFixture:
+    assert os.name == "posix"
+    authority = tmp_path / "manifest-package-epoch-authority"
+    legacy = authority / "legacy"
+    epochs = authority / "epochs"
+    authority.mkdir(mode=0o700)
+    legacy.mkdir(mode=0o700)
+    epochs.mkdir(mode=0o700)
+    (legacy / "state.json").write_bytes(b'{"legacy":1}\n')
+    coordination = _ManifestEpochCutoverCoordination(
+        active_pre_fence_registration_ids=(("f" * 64,) if pre_fence_live else ())
+    )
+    snapshots = _ManifestEpochCutoverSnapshots()
+    journal = PackageEpochFenceJournal(tmp_path / "manifest-package-epoch.jsonl")
+    owner = PackagePosixEpochCutoverOwner(
+        authority,
+        store_id="package-store:manifest-posix-cutover",
+        epoch_journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+    )
+    request = PackagePosixEpochCutoverRequestV1.create(
+        store_id="package-store:manifest-posix-cutover",
+        prior_fence=None,
+        expected_legacy_root_identity=owner.current_root_identity(),
+        namespace_id="e" * 64,
+        minimum_runtime_version="2.0.0",
+        minimum_runtime_protocol_epoch=2,
+    )
+    return _ManifestEpochCutoverFixture(
+        owner=owner,
+        request=request,
+        journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        authority=authority,
+        legacy=legacy,
+        epochs=epochs,
+    )
+
+
+def _manifest_windows_epoch_cutover_fixture(
+    tmp_path: Path,
+    *,
+    pre_fence_live: bool,
+) -> _ManifestWindowsEpochCutoverFixture:
+    assert os.name == "nt"
+    authority = tmp_path / "manifest-package-epoch-authority"
+    legacy = authority / "legacy"
+    epochs = authority / "epochs"
+    legacy.mkdir(parents=True)
+    epochs.mkdir()
+    (legacy / "state.json").write_bytes(b'{"legacy":1}\n')
+    coordination = _ManifestEpochCutoverCoordination(
+        active_pre_fence_registration_ids=(("f" * 64,) if pre_fence_live else ())
+    )
+    snapshots = _ManifestEpochCutoverSnapshots()
+    journal = PackageEpochFenceJournal(tmp_path / "manifest-package-epoch.jsonl")
+    owner = PackageWindowsEpochCutoverOwner(
+        authority,
+        store_id="package-store:manifest-windows-cutover",
+        epoch_journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+    )
+    request = PackageWindowsEpochCutoverRequestV1.create(
+        store_id="package-store:manifest-windows-cutover",
+        prior_fence=None,
+        expected_legacy_root_identity=owner.current_root_identity(),
+        namespace_id="d" * 64,
+        minimum_runtime_version="2.0.0",
+        minimum_runtime_protocol_epoch=2,
+    )
+    return _ManifestWindowsEpochCutoverFixture(
+        owner=owner,
+        request=request,
+        journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        authority=authority,
+        legacy=legacy,
+        epochs=epochs,
+    )
+
+
+@dataclass
+class _ManifestOfflineRestoreSnapshots:
+    evidence: PackageOfflineRestoreSnapshotEvidenceV1
+    calls: int = 0
+
+    def snapshot(
+        self,
+        snapshot_receipt_id: str,
+    ) -> PackageOfflineRestoreSnapshotEvidenceV1 | None:
+        self.calls += 1
+        if snapshot_receipt_id != self.evidence.snapshot.receipt_id:
+            return None
+        return self.evidence
+
+
+@dataclass(frozen=True)
+class _ManifestLinuxOfflineRestoreFixture:
+    owner: PackageOfflineRestoreOwner
+    materializer: PackagePosixOfflineRestoreMaterializer
+    activation: PackageLinuxLegacyRuntimeActivationOwner
+    request: PackageOfflineRestoreRequestV1
+    journal: PackageEpochFenceJournal
+    coordination: _ManifestEpochCutoverCoordination
+    snapshots: _ManifestOfflineRestoreSnapshots
+    source: Path
+    restore_root: Path
+    activation_root: Path
+    current_b_root: Path
+
+
+@dataclass(frozen=True)
+class _ManifestWindowsOfflineRestoreFixture:
+    owner: PackageOfflineRestoreOwner
+    materializer: PackageWindowsOfflineRestoreMaterializer
+    activation: PackageWindowsLegacyRuntimeActivationOwner
+    request: PackageOfflineRestoreRequestV1
+    journal: PackageEpochFenceJournal
+    coordination: _ManifestEpochCutoverCoordination
+    snapshots: _ManifestOfflineRestoreSnapshots
+    source: Path
+    restore_root: Path
+    activation_root: Path
+    current_b_root: Path
+
+
+def _manifest_directory_identity(path: Path) -> str:
+    metadata = path.stat()
+    return sha256(
+        canonical_json_bytes(
+            {
+                "device": metadata.st_dev,
+                "fileType": "directory",
+                "identityVersion": 1,
+                "inode": metadata.st_ino,
+            }
+        )
+    ).hexdigest()
+
+
+def _manifest_tree_metrics(payload: Path) -> tuple[str, int, int]:
+    entries: list[dict[str, object]] = []
+    byte_count = 0
+    for path in sorted(payload.rglob("*"), key=lambda item: item.as_posix()):
+        relative = path.relative_to(payload).as_posix()
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if path.is_dir():
+            entries.append({"kind": "directory", "logicalPath": relative, "mode": mode})
+            continue
+        contents = path.read_bytes()
+        byte_count += len(contents)
+        entries.append(
+            {
+                "byteCount": len(contents),
+                "contentDigest": sha256(contents).hexdigest(),
+                "kind": "file",
+                "logicalPath": relative,
+                "mode": mode,
+            }
+        )
+    digest = sha256(
+        canonical_json_bytes({"entries": entries, "manifestVersion": 1})
+    ).hexdigest()
+    return digest, len(entries), byte_count
+
+
+def _manifest_legacy_runtime_command(current_b_root: Path) -> tuple[str, ...]:
+    script = f"""
+import os
+import pathlib
+import time
+
+if pathlib.Path("legacy-state.json").read_bytes() != b'{{"legacy":1}}\\n':
+    raise SystemExit(41)
+try:
+    pathlib.Path({str(current_b_root)!r}, "epoch-b.json").read_bytes()
+except OSError:
+    pass
+else:
+    raise SystemExit(42)
+descriptor = int(os.environ.pop("LOUSHANG_LEGACY_RUNTIME_READY_FD"))
+token = os.environ.pop("LOUSHANG_LEGACY_RUNTIME_READY_TOKEN")
+os.write(descriptor, f"ready:{{token}}\\n".encode())
+os.close(descriptor)
+while True:
+    time.sleep(60)
+"""
+    return ("/usr/bin/python3", "-I", "-S", "-c", script)
+
+
+def _manifest_linux_offline_restore_fixture(
+    tmp_path: Path,
+) -> _ManifestLinuxOfflineRestoreFixture:
+    assert sys.platform.startswith("linux")
+    store_id = "package-store:manifest-linux-offline-restore"
+    snapshot_root = tmp_path / "manifest-snapshot-authority"
+    restore_root = tmp_path / "manifest-restore-authority"
+    activation_root = tmp_path / "manifest-activation-authority"
+    current_b_root = tmp_path / "manifest-current-b-authority"
+    for root in (snapshot_root, restore_root, activation_root, current_b_root):
+        root.mkdir(mode=0o700)
+    (current_b_root / "epoch-b.json").write_bytes(b'{"epoch":"B"}\n')
+    snapshot_id = sha256(b"manifest-pre-b-snapshot").hexdigest()
+    source = snapshot_root / snapshot_id / "payload"
+    source.mkdir(parents=True, mode=0o700)
+    (source / "legacy-state.json").write_bytes(b'{"legacy":1}\n')
+    tree_digest, entry_count, byte_count = _manifest_tree_metrics(source)
+    snapshot = PackageEpochCutoverSnapshotReceiptV1.create(
+        store_id=store_id,
+        legacy_root_identity=sha256(b"manifest-legacy-root").hexdigest(),
+        quiescence_receipt_id=sha256(b"manifest-quiescence").hexdigest(),
+        snapshot_id=snapshot_id,
+        snapshot_revision=1,
+        entry_count=entry_count,
+        byte_count=byte_count,
+    )
+    state_manifest = canonical_json_bytes(
+        {
+            "byteCount": snapshot.byte_count,
+            "coveredDomains": list(PACKAGE_PRE_B_SNAPSHOT_DOMAINS),
+            "entryCount": snapshot.entry_count,
+            "legacyRootIdentity": snapshot.legacy_root_identity,
+            "manifestVersion": 1,
+            "snapshotId": snapshot.snapshot_id,
+            "snapshotReceiptId": snapshot.receipt_id,
+            "snapshotRevision": snapshot.snapshot_revision,
+            "storeId": snapshot.store_id,
+            "treeDigest": tree_digest,
+        }
+    )
+    (source.parent / "state-manifest.json").write_bytes(state_manifest)
+    evidence = PackageOfflineRestoreSnapshotEvidenceV1.create(
+        snapshot,
+        snapshot_tree_digest=tree_digest,
+        state_manifest_digest=sha256(state_manifest).hexdigest(),
+    )
+    journal = PackageEpochFenceJournal(tmp_path / "manifest-offline-epoch.jsonl")
+    current = journal.publish(
+        PackageEpochFenceRequestV1.create(
+            store_id=store_id,
+            prior_fence=None,
+            legacy_root_identity=snapshot.legacy_root_identity,
+            fenced_root_identity=_manifest_directory_identity(current_b_root),
+            namespace_id=sha256(b"manifest-current-b-namespace").hexdigest(),
+            minimum_runtime_version="2.0.0",
+            minimum_runtime_protocol_epoch=2,
+            quiescence_receipt_id=snapshot.quiescence_receipt_id,
+            snapshot_receipt_id=snapshot.receipt_id,
+            root_switch_receipt_id=sha256(b"manifest-root-switch").hexdigest(),
+        )
+    )
+    request = PackageOfflineRestoreRequestV1.create(
+        current_fence=current,
+        genesis_fence=current,
+        snapshot_evidence=evidence,
+        restore_namespace_id=sha256(b"manifest-isolated-restore").hexdigest(),
+        legacy_runtime_version="1.9.0",
+    )
+    coordination = _ManifestEpochCutoverCoordination()
+    snapshots = _ManifestOfflineRestoreSnapshots(evidence)
+    materializer = PackagePosixOfflineRestoreMaterializer(
+        snapshot_root,
+        restore_root,
+        current_b_authority_root=current_b_root,
+        store_id=store_id,
+    )
+    activation = PackageLinuxLegacyRuntimeActivationOwner(
+        restore_root,
+        activation_root,
+        current_b_authority_root=current_b_root,
+        store_id=store_id,
+        legacy_runtime_version=request.legacy_runtime_version,
+        command=_manifest_legacy_runtime_command(current_b_root),
+    )
+    owner = PackageOfflineRestoreOwner(
+        store_id=store_id,
+        epoch_journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        materialization=materializer,
+        activation=activation,
+    )
+    return _ManifestLinuxOfflineRestoreFixture(
+        owner=owner,
+        materializer=materializer,
+        activation=activation,
+        request=request,
+        journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        source=source,
+        restore_root=restore_root,
+        activation_root=activation_root,
+        current_b_root=current_b_root,
+    )
+
+
+def _manifest_windows_offline_restore_fixture(
+    tmp_path: Path,
+) -> _ManifestWindowsOfflineRestoreFixture:
+    assert os.name == "nt"
+    store_id = "package-store:manifest-windows-offline-restore"
+    snapshot_root = tmp_path / "manifest-snapshot-authority"
+    restore_root = tmp_path / "manifest-restore-authority"
+    activation_root = tmp_path / "manifest-activation-authority"
+    current_b_root = tmp_path / "manifest-current-b-authority"
+    for root in (snapshot_root, restore_root, activation_root, current_b_root):
+        root.mkdir()
+    (current_b_root / "epoch-b.json").write_bytes(b'{"epoch":"B"}\n')
+    snapshot_id = sha256(b"manifest-windows-pre-b-snapshot").hexdigest()
+    source = snapshot_root / snapshot_id / "payload"
+    source.mkdir(parents=True)
+    (source / "legacy-state.json").write_bytes(b'{"legacy":1}\n')
+    tree_digest, entry_count, byte_count = _manifest_tree_metrics(source)
+    snapshot = PackageEpochCutoverSnapshotReceiptV1.create(
+        store_id=store_id,
+        legacy_root_identity=sha256(b"manifest-windows-legacy-root").hexdigest(),
+        quiescence_receipt_id=sha256(b"manifest-windows-quiescence").hexdigest(),
+        snapshot_id=snapshot_id,
+        snapshot_revision=1,
+        entry_count=entry_count,
+        byte_count=byte_count,
+    )
+    state_manifest = canonical_json_bytes(
+        {
+            "byteCount": snapshot.byte_count,
+            "coveredDomains": list(PACKAGE_PRE_B_SNAPSHOT_DOMAINS),
+            "entryCount": snapshot.entry_count,
+            "legacyRootIdentity": snapshot.legacy_root_identity,
+            "manifestVersion": 1,
+            "snapshotId": snapshot.snapshot_id,
+            "snapshotReceiptId": snapshot.receipt_id,
+            "snapshotRevision": snapshot.snapshot_revision,
+            "storeId": snapshot.store_id,
+            "treeDigest": tree_digest,
+        }
+    )
+    (source.parent / "state-manifest.json").write_bytes(state_manifest)
+    evidence = PackageOfflineRestoreSnapshotEvidenceV1.create(
+        snapshot,
+        snapshot_tree_digest=tree_digest,
+        state_manifest_digest=sha256(state_manifest).hexdigest(),
+    )
+    journal = PackageEpochFenceJournal(
+        tmp_path / "manifest-windows-offline-epoch.jsonl"
+    )
+    current = journal.publish(
+        PackageEpochFenceRequestV1.create(
+            store_id=store_id,
+            prior_fence=None,
+            legacy_root_identity=snapshot.legacy_root_identity,
+            fenced_root_identity=_manifest_directory_identity(current_b_root),
+            namespace_id=sha256(b"manifest-windows-current-b-namespace").hexdigest(),
+            minimum_runtime_version="2.0.0",
+            minimum_runtime_protocol_epoch=2,
+            quiescence_receipt_id=snapshot.quiescence_receipt_id,
+            snapshot_receipt_id=snapshot.receipt_id,
+            root_switch_receipt_id=sha256(b"manifest-windows-root-switch").hexdigest(),
+        )
+    )
+    request = PackageOfflineRestoreRequestV1.create(
+        current_fence=current,
+        genesis_fence=current,
+        snapshot_evidence=evidence,
+        restore_namespace_id=sha256(b"manifest-windows-isolated-restore").hexdigest(),
+        legacy_runtime_version="1.9.0",
+    )
+    coordination = _ManifestEpochCutoverCoordination()
+    snapshots = _ManifestOfflineRestoreSnapshots(evidence)
+    materializer = PackageWindowsOfflineRestoreMaterializer(
+        snapshot_root,
+        restore_root,
+        current_b_authority_root=current_b_root,
+        store_id=store_id,
+    )
+    command = (
+        os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"),
+        "/d",
+        "/q",
+        "/c",
+        (
+            "> %LOUSHANG_LEGACY_RUNTIME_READY_PATH% "
+            "echo %LOUSHANG_LEGACY_RUNTIME_READY_TOKEN% && "
+            "for /L %i in (1,1,2147483647) do ver >nul 2>&1"
+        ),
+    )
+    activation = PackageWindowsLegacyRuntimeActivationOwner(
+        restore_root,
+        activation_root,
+        current_b_authority_root=current_b_root,
+        store_id=store_id,
+        legacy_runtime_version=request.legacy_runtime_version,
+        command=command,
+    )
+    owner = PackageOfflineRestoreOwner(
+        store_id=store_id,
+        epoch_journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        materialization=materializer,
+        activation=activation,
+    )
+    return _ManifestWindowsOfflineRestoreFixture(
+        owner=owner,
+        materializer=materializer,
+        activation=activation,
+        request=request,
+        journal=journal,
+        coordination=coordination,
+        snapshots=snapshots,
+        source=source,
+        restore_root=restore_root,
+        activation_root=activation_root,
+        current_b_root=current_b_root,
+    )
+
+
+@dataclass
+class _ManifestAdoptionFenceReader:
+    journal: PackageEpochFenceJournal
+    calls: int = 0
+
+    def current(self, store_id: str) -> PackageEpochFenceReceiptV1 | None:
+        self.calls += 1
+        return self.journal.current(store_id)
+
+
+@dataclass
+class _ManifestAdoptionLegacyStateOwner:
+    root: Path
+    store_id: str
+    legacy_root_identity: str
+    calls: int = 0
+
+    def capture(self) -> PackageLegacyStateEvidenceV1:
+        state_digest, entry_count, byte_count = _manifest_tree_metrics(self.root)
+        return PackageLegacyStateEvidenceV1.create(
+            store_id=self.store_id,
+            legacy_root_identity=_manifest_directory_identity(self.root),
+            state_digest=state_digest,
+            entry_count=entry_count,
+            byte_count=byte_count,
+        )
+
+    def observe(
+        self,
+        *,
+        store_id: str,
+        legacy_root_identity: str,
+    ) -> PackageLegacyStateEvidenceV1:
+        assert store_id == self.store_id
+        assert legacy_root_identity == self.legacy_root_identity
+        self.calls += 1
+        return self.capture()
+
+
+@dataclass(frozen=True)
+class _ManifestNativeAdoptionFixture:
+    owner: PackageLegacyAdoptionOwner
+    request: PackageLegacyAdoptionRequestV1
+    execution: PackageClosureExecutionRequestV2
+    kernel: PackageLifecycleOwner
+    lifecycle_journal: PackageLifecycleJournal
+    evidence_journal: PackageArtifactEvidenceJournal
+    resolution_journal: PackageClosureResolutionJournal
+    pin_journal: PackageTransactionPinJournal
+    staging_journal: PackageArtifactStagingJournal
+    committed_sets: PackageCommittedSetJournal
+    fence_journal: PackageEpochFenceJournal
+    fence_reader: _ManifestAdoptionFenceReader
+    legacy_state: _ManifestAdoptionLegacyStateOwner
+    source_authority: _SourceAuthority | _PinnedLocalSourceAuthority
+    quarantine: PackageQuarantineStore
+    resolver: _NoDependencyResolver
+    retention: _TransactionPinRetentionOwner
+    root_targets: _ManifestRootTargetAuthority
+    root_staging: _ManifestNativeRootStagingOwner
+    root_settlements: PackageStoreSettlementJournal
+    current_root: Path
+    product_files: tuple[tuple[Path, bytes], ...]
+    product_projections: _ManifestProductProjectionOwner
+    product_projection_before: tuple[tuple[str, int, bytes], ...]
+    coordination: _ManifestAdoptionCoordination
+    commit: PackageCommitLifecycleOwner | _ManifestCrashAfterCommittedCommitOwner
+    closure_owner: PackageClosureLifecycleOwner
+    pin_owner: PackageTransactionPinLifecycleOwner
+    staging_owner: PackageStagingSetLifecycleOwner
+    secret: str
+
+
+@dataclass(frozen=True)
+class _NativeProductHandoff:
+    finalizer: PackageProductHandoffFinalizer
+    desired: PluginDesiredStateLedger
+    bindings: PluginPackageGcBindingJournal
+    journal: PackageRetentionHandoffJournal
+    revisions: CommittedSetPackageRevisionProjection
+
+
+@dataclass
+class _FailOnceProductHandoff:
+    delegate: PackageProductHandoffFinalizer
+    calls: int = 0
+
+    def finalize(
+        self,
+        request: PackageProductRouteRequestV1,
+        *,
+        current: PackageLifecycleStatusV1,
+    ) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("crash before Product handoff journal open")
+        self.delegate.finalize(request, current=current)
+
+
+def _native_product_handoff(
+    fixture: _ManifestNativeAdoptionFixture,
+    tmp_path: Path,
+    *,
+    rebind_bindings: PackageProductRebindAdmissionBindingJournal | None = None,
+    staging_bindings: PackageProductStagingAdoptionBindingJournal | None = None,
+) -> _NativeProductHandoff:
+    assert isinstance(fixture.commit, PackageCommitLifecycleOwner)
+    gate = PluginPackageGcReservationJournal(tmp_path / "product-gc-gate.jsonl")
+    desired = PluginDesiredStateLedger(tmp_path / "product-desired.jsonl", gc_gate=gate)
+    management = PluginManagementService(
+        desired_state=desired,
+        operation_journal_path=tmp_path / "product-management.jsonl",
+    )
+    bindings = PluginPackageGcBindingJournal(tmp_path / "product-gc-bindings.jsonl")
+    projection = CommittedSetPackageRevisionProjection(desired, fixture.committed_sets)
+    desired_adapter = PluginManagementPackageDesiredStateAdapter(
+        management=management,
+        revisions=projection,
+        installation_scope="workspace",
+        actor_id="product-runtime",
+        policy_revision="product-policy:1",
+        gc_bindings=bindings,
+        gc_gate=gate,
+    )
+    admission = PackageCommitAdmissionOwner(
+        lifecycle_journal=fixture.lifecycle_journal,
+        committed_sets=fixture.committed_sets,
+        pin_journal=fixture.pin_journal,
+    )
+    journal = PackageRetentionHandoffJournal(tmp_path / "product-handoff.jsonl")
+    handoff = PackageRetentionHandoffOwner(
+        journal=journal,
+        admission=admission,
+        retention=PackageProductRetentionSettlementOwner(
+            path=tmp_path / "product-retention.jsonl",
+            transaction_pins=fixture.pin_journal,
+        ),
+        desired_state=desired_adapter,
+    )
+    return _NativeProductHandoff(
+        finalizer=PackageProductHandoffFinalizer(
+            kernel=fixture.kernel,
+            commit=fixture.commit,
+            admission=admission,
+            transaction_pins=fixture.pin_journal,
+            journal=journal,
+            handoff=handoff,
+            inventory_revision=projection.inventory_revision,
+            rebind_bindings=rebind_bindings,
+            staging_bindings=staging_bindings,
+        ),
+        desired=desired,
+        bindings=bindings,
+        journal=journal,
+        revisions=projection,
+    )
+
+
+class _ManifestAdoptionCoordination:
+    def __init__(self) -> None:
+        self.lock = Lock()
+
+    @contextmanager
+    def hold(self, _request: PackageLegacyAdoptionRequestV1) -> Iterator[None]:
+        with self.lock:
+            yield
+
+
+@dataclass(frozen=True)
+class _ManifestProductProjectionOwner:
+    paths: tuple[tuple[str, Path], ...]
+
+    @classmethod
+    def create(cls, root: Path) -> _ManifestProductProjectionOwner:
+        root.mkdir(mode=0o700)
+        paths: list[tuple[str, Path]] = []
+        for domain in ("binding", "desired", "enablement", "instance"):
+            path = root / f"{domain}.json"
+            path.write_bytes(
+                canonical_json_bytes(
+                    {
+                        "domain": domain,
+                        "projectionVersion": 1,
+                        "revision": 1,
+                        "value": "legacy",
+                    }
+                )
+                + b"\n"
+            )
+            path.chmod(0o600)
+            paths.append((domain, path))
+        return cls(paths=tuple(paths))
+
+    def capture(self) -> tuple[tuple[str, int, bytes], ...]:
+        captured: list[tuple[str, int, bytes]] = []
+        for domain, path in self.paths:
+            payload = path.read_bytes()
+            document = json.loads(payload)
+            assert document["domain"] == domain
+            captured.append((domain, int(document["revision"]), payload))
+        return tuple(captured)
+
+
+class _ManifestCrashAfterCommitted(RuntimeError):
+    pass
+
+
+@dataclass
+class _ManifestCrashAfterCommittedCommitOwner:
+    owner: PackageCommitLifecycleOwner
+    crashed: bool = False
+    calls: int = 0
+    pre_crash_receipt: PackagePublicationReceiptV1 | None = None
+
+    def commit(self, operation_id: str) -> PackagePublicationReceiptV1:
+        self.calls += 1
+        receipt = self.owner.commit(operation_id)
+        if not self.crashed:
+            self.pre_crash_receipt = receipt
+            self.crashed = True
+            raise _ManifestCrashAfterCommitted
+        return receipt
+
+
+def _assert_manifest_secret_absent(root: Path, secret: str) -> None:
+    encoded = secret.encode()
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        assert all(secret not in component for component in relative.parts)
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            assert secret not in os.readlink(path)
+        elif stat.S_ISREG(metadata.st_mode):
+            assert encoded not in path.read_bytes()
+
+
+def _manifest_native_adoption_fixture(
+    tmp_path: Path,
+    *,
+    fenced_root_identity: str | None = None,
+    adoption_installation_id: str = "manifest-installation",
+    case_id: str = "B-COMPAT-ADOPT",
+    crash_after_committed: bool = False,
+    crash_after_phase: PackageLifecyclePhase | None = None,
+    root_payload: bytes | None = None,
+    secret: str = "manifest-secret-b-compat-adopt",
+    staging_classification_recheck: (
+        _StableClassificationRecheck | _ChangedClassificationRecheck | None
+    ) = None,
+    product_ingress: PackageLifecycleIngressRequestV2 | None = None,
+    product_root_target: bool = False,
+    configured_source_authority: _PinnedLocalSourceAuthority | None = None,
+    journaled_transaction_retention: bool = False,
+    classification_authority: PackageProductLocalWheelPolicy | None = None,
+    configured_resolver: PackageProductLocalWheelPolicy | None = None,
+) -> _ManifestNativeAdoptionFixture:
+    store_id = "package-store:manifest-adoption"
+    environment = _closure_environment()
+    (
+        kernel,
+        _artifact_owner,
+        lifecycle_journal,
+        evidence_journal,
+        _cleanup_journal,
+        quarantine,
+        source_authority,
+        closure_owner,
+        resolution_journal,
+        resolver,
+    ) = _b3d_owner(
+        tmp_path,
+        case_id=case_id,
+        secret=secret,
+        crash_after_phase=crash_after_phase,
+        root_payload=root_payload,
+        configured_source_authority=configured_source_authority,
+        classification_authority=classification_authority,
+        resolver=configured_resolver,
+    )
+    classified = kernel.submit(
+        product_ingress
+        or _request(
+            source=(
+                f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                f"?token={secret}#{secret}"
+            ),
+            environment_fingerprint=environment.fingerprint,
+        )
+    )
+    assert classified.classification is not None
+
+    legacy_root = tmp_path / "legacy-package-snapshot"
+    legacy_root.mkdir(mode=0o700)
+    product_payloads = {
+        "binding_history.json": b'{"binding":"legacy"}\n',
+        "desired_state.json": b'{"desired":"legacy"}\n',
+        "enablement_state.json": b'{"enabled":true}\n',
+        "fence_record.json": b'{"epoch":1}\n',
+        "instance_state.json": b'{"instance":"legacy"}\n',
+        "legacy_root_pointer.json": b'{"root":"legacy"}\n',
+        "lock_history.json": b'{"lock":"legacy"}\n',
+        "source_configuration.json": b'{"source":"private-index"}\n',
+        "store_bytes.bin": b"legacy-package-store-bytes\n",
+    }
+    product_files: list[tuple[Path, bytes]] = []
+    for name, payload in sorted(product_payloads.items()):
+        path = legacy_root / name
+        path.write_bytes(payload)
+        path.chmod(0o600)
+        product_files.append((path, payload))
+    legacy_root_identity = _manifest_directory_identity(legacy_root)
+    legacy_state = _ManifestAdoptionLegacyStateOwner(
+        root=legacy_root,
+        store_id=store_id,
+        legacy_root_identity=legacy_root_identity,
+    )
+    legacy_evidence = legacy_state.capture()
+    product_projections = _ManifestProductProjectionOwner.create(
+        tmp_path / "manifest-product-projections"
+    )
+    product_projection_before = product_projections.capture()
+
+    dependency_root = tmp_path / "adoption-dependency-store"
+    plugin_authority = tmp_path / "adoption-plugin-authority"
+    plugin_root = plugin_authority / "plugin-revision-store"
+    dependency_root.mkdir(mode=0o700)
+    plugin_authority.mkdir(mode=0o700)
+    plugin_root.mkdir(mode=0o700)
+    fence_journal = PackageEpochFenceJournal(tmp_path / "manifest-adoption-epoch.jsonl")
+    fence = fence_journal.publish(
+        PackageEpochFenceRequestV1.create(
+            store_id=store_id,
+            prior_fence=None,
+            legacy_root_identity=legacy_root_identity,
+            fenced_root_identity=(
+                fenced_root_identity or _manifest_directory_identity(plugin_root)
+            ),
+            namespace_id=sha256(b"manifest-adoption-current-namespace").hexdigest(),
+            minimum_runtime_version="2.0.0",
+            minimum_runtime_protocol_epoch=2,
+            quiescence_receipt_id=sha256(b"manifest-adoption-quiescence").hexdigest(),
+            snapshot_receipt_id=sha256(b"manifest-adoption-snapshot").hexdigest(),
+            root_switch_receipt_id=sha256(b"manifest-adoption-root-switch").hexdigest(),
+        )
+    )
+    adoption_request = PackageLegacyAdoptionRequestV1.create(
+        current_fence=fence,
+        legacy_state=legacy_evidence,
+        operation_id=classified.operation_id,
+        transaction_request_fingerprint=classified.request_fingerprint,
+        expected_classification_fingerprint=(classified.classification.evidence_ref),
+        expected_attempt_epoch=classified.attempt_epoch,
+        product_id="coding",
+        scope_id="workspace:manifest",
+        installation_id=adoption_installation_id,
+        plugin_id="acme.plugin",
+    )
+    execution = PackageClosureExecutionRequestV2(
+        artifact=_artifact_execution(classified, secret=secret),
+        resolution_environment=environment,
+        budgets=PackageClosureBudgetV1(),
+    )
+
+    retention = _TransactionPinRetentionOwner()
+    pin_journal = PackageTransactionPinJournal(
+        tmp_path / "manifest-adoption-transaction-pins.jsonl"
+    )
+    pin_owner = PackageTransactionPinLifecycleOwner(
+        kernel=kernel,
+        closure_plans=resolution_journal,
+        retention=(
+            PackageJournaledTransactionRetentionOwner(journal=pin_journal)
+            if journaled_transaction_retention
+            else retention
+        ),
+        pin_journal=pin_journal,
+    )
+    dependency_settlements = PackageStoreSettlementJournal(
+        tmp_path / "manifest-adoption-dependency-settlements.jsonl"
+    )
+    root_settlements = PackageStoreSettlementJournal(
+        tmp_path / "manifest-adoption-root-settlements.jsonl"
+    )
+    root_staging = _ManifestNativeRootStagingOwner(
+        PosixPackagePluginRootMaterializationStore(
+            plugin_root,
+            store_identity="manifest-plugin-revision-store",
+            package_store_id=store_id,
+            settlement_journal=root_settlements,
+        )
+    )
+    root_targets = _ManifestRootTargetAuthority()
+    staging_root_targets = (
+        PackageProductRootTargetAuthority(
+            product_id="coding",
+            installation_scope="workspace",
+            authority_id="manifest-product-root-target",
+            authority_revision="manifest-product-root-target:1",
+        )
+        if product_root_target
+        else root_targets
+    )
+    staging_journal = PackageArtifactStagingJournal(
+        tmp_path / "manifest-adoption-staging.jsonl"
+    )
+    committed_sets = PackageCommittedSetJournal(
+        tmp_path / "manifest-adoption-committed-sets.jsonl"
+    )
+    staging_owner = PackageStagingSetLifecycleOwner(
+        kernel=kernel,
+        classification_recheck=(
+            staging_classification_recheck
+            or classification_authority
+            or _StableClassificationRecheck()
+        ),
+        closure_plans=resolution_journal,
+        pin_journal=pin_journal,
+        root_targets=staging_root_targets,
+        dependency_staging=PosixPackageDependencyMaterializationStore(
+            dependency_root,
+            store_identity="manifest-dependency-store",
+            settlement_journal=dependency_settlements,
+        ),
+        root_staging=root_staging,
+        staging_journal=staging_journal,
+        committed_sets=committed_sets,
+    )
+    durable_commit = PackageCommitLifecycleOwner(
+        kernel=kernel,
+        committed_sets=committed_sets,
+        pin_journal=pin_journal,
+    )
+    commit: PackageCommitLifecycleOwner | _ManifestCrashAfterCommittedCommitOwner = (
+        _ManifestCrashAfterCommittedCommitOwner(durable_commit)
+        if crash_after_committed
+        else durable_commit
+    )
+    transaction = PackageLegacyAdoptionTransactionAdapter(
+        kernel=kernel,
+        execution=execution,
+        recovery_identity="manifest-legacy-adoption-recovery",
+        closure=closure_owner,
+        pins=pin_owner,
+        staging=staging_owner,
+        commit=commit,
+    )
+    fence_reader = _ManifestAdoptionFenceReader(fence_journal)
+    coordination = _ManifestAdoptionCoordination()
+    owner = PackageLegacyAdoptionOwner(
+        store_id=store_id,
+        fences=fence_reader,
+        legacy_state=legacy_state,
+        transaction=transaction,
+        coordination=coordination,
+    )
+    return _ManifestNativeAdoptionFixture(
+        owner=owner,
+        request=adoption_request,
+        execution=execution,
+        kernel=kernel,
+        lifecycle_journal=lifecycle_journal,
+        evidence_journal=evidence_journal,
+        resolution_journal=resolution_journal,
+        pin_journal=pin_journal,
+        staging_journal=staging_journal,
+        committed_sets=committed_sets,
+        fence_journal=fence_journal,
+        fence_reader=fence_reader,
+        legacy_state=legacy_state,
+        source_authority=source_authority,
+        quarantine=quarantine,
+        resolver=resolver,
+        retention=retention,
+        root_targets=root_targets,
+        root_staging=root_staging,
+        root_settlements=root_settlements,
+        current_root=plugin_root,
+        product_files=tuple(product_files),
+        product_projections=product_projections,
+        product_projection_before=product_projection_before,
+        coordination=coordination,
+        commit=commit,
+        closure_owner=closure_owner,
+        pin_owner=pin_owner,
+        staging_owner=staging_owner,
+        secret=secret,
+    )
+
+
+def _restart_manifest_native_adoption_fixture(
+    fixture: _ManifestNativeAdoptionFixture,
+) -> _ManifestNativeAdoptionFixture:
+    """Rebuild the complete Package owner graph over durable local evidence."""
+
+    root = fixture.lifecycle_journal.path.parent
+    lifecycle_journal = PackageLifecycleJournal(fixture.lifecycle_journal.path)
+    kernel = PackageLifecycleOwner(
+        journal=lifecycle_journal,
+        classification_authority=_Authority(_facts("explicit_plugin_intent")),
+        enabled=True,
+    )
+    quarantine = PackageQuarantineStore(fixture.quarantine.root)
+    evidence_journal = PackageArtifactEvidenceJournal(fixture.evidence_journal.path)
+    cleanup_journal = PackageQuarantineCleanupJournal(
+        root / "package-quarantine-cleanup.jsonl"
+    )
+    cleanup_owner = PackageQuarantineCleanupOwner(
+        journal=cleanup_journal,
+        store=quarantine,
+    )
+    artifact_owner = PackageArtifactLifecycleOwner(
+        kernel=kernel,
+        classification_recheck=_StableClassificationRecheck(),
+        acquisition_owner=PackageAcquisitionOwner(
+            source_authority=fixture.source_authority,
+            quarantine_store=quarantine,
+            clock=fixture.source_authority.clock,
+        ),
+        evidence_journal=evidence_journal,
+        cleanup_owner=cleanup_owner,
+        wheel_verifier=PackageWheelVerifier(),
+        acquisition_budgets=PackageAcquisitionBudgetV1(
+            max_transport_bytes=256 * 1024,
+            max_requests=1,
+            max_redirects=1,
+            max_wall_time_ms=1000,
+        ),
+        inspection_budgets=PackageInspectionBudgetV1(),
+        supported_tags=frozenset({"py3-none-any"}),
+    )
+    resolution_journal = PackageClosureResolutionJournal(
+        fixture.resolution_journal.path
+    )
+    recursive_owner = PackageRecursiveClosureOwner(
+        resolver=fixture.resolver,
+        acquisition_owner=artifact_owner._acquisition_owner,
+        evidence_journal=evidence_journal,
+        wheel_verifier=artifact_owner._wheel_verifier,
+        closure_verifier=PackageClosureVerifier(),
+        acquisition_budgets=artifact_owner._acquisition_budgets,
+        inspection_budgets=artifact_owner._inspection_budgets,
+        cleanup_owner=artifact_owner._cleanup_owner,
+        selection_journal=resolution_journal,
+    )
+    closure_owner = PackageClosureLifecycleOwner(
+        kernel=kernel,
+        artifact_owner=artifact_owner,
+        closure_builder=recursive_owner,
+        resolution_journal=resolution_journal,
+    )
+    retention = _TransactionPinRetentionOwner(fixture.retention.state)
+    pin_journal = PackageTransactionPinJournal(fixture.pin_journal.path)
+    pin_owner = PackageTransactionPinLifecycleOwner(
+        kernel=kernel,
+        closure_plans=resolution_journal,
+        retention=retention,
+        pin_journal=pin_journal,
+    )
+    root_settlements = PackageStoreSettlementJournal(fixture.root_settlements.path)
+    dependency_settlements = PackageStoreSettlementJournal(
+        root / "manifest-adoption-dependency-settlements.jsonl"
+    )
+    root_staging = _ManifestNativeRootStagingOwner(
+        PosixPackagePluginRootMaterializationStore(
+            fixture.current_root,
+            store_identity="manifest-plugin-revision-store",
+            package_store_id=fixture.request.store_id,
+            settlement_journal=root_settlements,
+        ),
+        state=fixture.root_staging.state,
+    )
+    root_targets = _ManifestRootTargetAuthority(fixture.root_targets.state)
+    staging_journal = PackageArtifactStagingJournal(fixture.staging_journal.path)
+    committed_sets = PackageCommittedSetJournal(fixture.committed_sets.path)
+    staging_owner = PackageStagingSetLifecycleOwner(
+        kernel=kernel,
+        classification_recheck=_StableClassificationRecheck(),
+        closure_plans=resolution_journal,
+        pin_journal=pin_journal,
+        root_targets=root_targets,
+        dependency_staging=PosixPackageDependencyMaterializationStore(
+            root / "adoption-dependency-store",
+            store_identity="manifest-dependency-store",
+            settlement_journal=dependency_settlements,
+        ),
+        root_staging=root_staging,
+        staging_journal=staging_journal,
+        committed_sets=committed_sets,
+    )
+    commit = PackageCommitLifecycleOwner(
+        kernel=kernel,
+        committed_sets=committed_sets,
+        pin_journal=pin_journal,
+    )
+    transaction = PackageLegacyAdoptionTransactionAdapter(
+        kernel=kernel,
+        execution=fixture.execution,
+        recovery_identity="manifest-legacy-adoption-recovery",
+        closure=closure_owner,
+        pins=pin_owner,
+        staging=staging_owner,
+        commit=commit,
+    )
+    fence_journal = PackageEpochFenceJournal(fixture.fence_journal.path)
+    fence_reader = _ManifestAdoptionFenceReader(fence_journal)
+    legacy_state = _ManifestAdoptionLegacyStateOwner(
+        root=fixture.legacy_state.root,
+        store_id=fixture.legacy_state.store_id,
+        legacy_root_identity=fixture.legacy_state.legacy_root_identity,
+    )
+    coordination = _ManifestAdoptionCoordination()
+    owner = PackageLegacyAdoptionOwner(
+        store_id=fixture.request.store_id,
+        fences=fence_reader,
+        legacy_state=legacy_state,
+        transaction=transaction,
+        coordination=coordination,
+    )
+    return _ManifestNativeAdoptionFixture(
+        owner=owner,
+        request=fixture.request,
+        execution=fixture.execution,
+        kernel=kernel,
+        lifecycle_journal=lifecycle_journal,
+        evidence_journal=evidence_journal,
+        resolution_journal=resolution_journal,
+        pin_journal=pin_journal,
+        staging_journal=staging_journal,
+        committed_sets=committed_sets,
+        fence_journal=fence_journal,
+        fence_reader=fence_reader,
+        legacy_state=legacy_state,
+        source_authority=fixture.source_authority,
+        quarantine=quarantine,
+        resolver=fixture.resolver,
+        retention=retention,
+        root_targets=root_targets,
+        root_staging=root_staging,
+        root_settlements=root_settlements,
+        current_root=fixture.current_root,
+        product_files=fixture.product_files,
+        product_projections=_ManifestProductProjectionOwner(
+            paths=fixture.product_projections.paths
+        ),
+        product_projection_before=fixture.product_projection_before,
+        coordination=coordination,
+        commit=commit,
+        closure_owner=closure_owner,
+        pin_owner=pin_owner,
+        staging_owner=staging_owner,
+        secret=fixture.secret,
+    )
+
+
+def test_product_root_target_requires_exact_classification(tmp_path: Path) -> None:
+    owner, _journal = _owner(tmp_path, facts=_facts("explicit_plugin_intent"))
+    status = owner.submit(_request())
+    request = owner.journal.request(status.operation_id)
+    classification = status.classification
+    assert request is not None and classification is not None
+    targets = PackageProductRootTargetAuthority(
+        product_id="coding",
+        installation_scope="workspace",
+        authority_id="manifest-product-root-target",
+        authority_revision="manifest-product-root-target:1",
+    )
+
+    target = targets.issue_target(request, classification)
+    assert targets.issue_target(request, classification) == target
+    assert target.plugin_id == "acme.plugin"
+    assert target.installation_id.startswith("installation:")
+    with pytest.raises(ValueError, match="classification"):
+        targets.issue_target(
+            request,
+            replace(classification, request_fingerprint="0" * 64),
+        )
+    with pytest.raises(ValueError, match="Product"):
+        PackageProductRootTargetAuthority(
+            product_id="other",
+            installation_scope="workspace",
+            authority_id="manifest-product-root-target",
+            authority_revision="manifest-product-root-target:1",
+        ).issue_target(request, classification)
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ("cli", "rpc", "session", "startup", "operations")
+)
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_transaction_uses_real_store_and_durable_owner(
+    tmp_path: Path,
+    entrypoint: PackageProductEntrypoint,
+) -> None:
+    admission = _manifest_product_admission()
+    secret = "manifest-product-transaction-secret"
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source=(
+                f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                f"?token={secret}#{secret}"
+            ),
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        secret=secret,
+        product_ingress=ingress,
+        product_root_target=True,
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(),
+            budgets=PackageClosureBudgetV1(),
+        ),
+        recovery_identity="manifest-product-transaction-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel,
+            transaction=transaction,
+        )
+    )
+    route = PackageProductRouteRequestV1(
+        entrypoint=entrypoint, ingress=ingress, admission=admission
+    )
+
+    committed = router.route(route)
+    before = fixture.lifecycle_journal.records()
+    assert (committed.phase, committed.disposition) == ("committed", "committed")
+    assert fixture.root_settlements.records()
+    assert fixture.committed_sets.records()
+    assert fixture.source_authority.authorize_calls == 1
+    durable_request = fixture.kernel.journal.request(committed.operation_id)
+    committed_set = fixture.committed_sets.current(committed.operation_id)
+    assert durable_request is not None and committed.classification is not None
+    assert committed_set is not None
+    expected_target = PackageProductRootTargetAuthority(
+        product_id="coding",
+        installation_scope="workspace",
+        authority_id="manifest-product-root-target",
+        authority_revision="manifest-product-root-target:1",
+    ).issue_target(durable_request, committed.classification)
+    assert (
+        committed_set.committed_set.installation_id == expected_target.installation_id
+    )
+    desired = product.desired.snapshot()
+    assert desired.inventory_revision == 1
+    assert desired.installations[0].selection.desired_state == "installed_disabled"
+    assert len(product.bindings.records()) == 1
+    assert product.journal.records()[-1].receipt is not None
+    assert product.journal.records()[-1].receipt.state == "settled"
+    handoff_receipt = product.journal.records()[-1].receipt
+    assert handoff_receipt is not None
+    admission_request = handoff_receipt.request.admission_request
+    forged_admission = PackageCommitAdmissionRequestV1.create(
+        operation_id=admission_request.operation_id,
+        request_fingerprint=admission_request.request_fingerprint,
+        product_id=admission_request.product_id,
+        scope_id="workspace:other",
+        installation_id=admission_request.installation_id,
+        plugin_id=admission_request.plugin_id,
+        claimed_root_ref=admission_request.claimed_root_ref,
+        committed_set_id=admission_request.committed_set_id,
+        closure_lock_digest=admission_request.closure_lock_digest,
+        publication_receipt=admission_request.publication_receipt,
+    )
+    forged_desired = PackageDesiredStateCommitRequestV1.create(
+        forged_admission,
+        command_id=handoff_receipt.request.desired_request.command_id,
+        command_fingerprint=(
+            handoff_receipt.request.desired_request.command_fingerprint
+        ),
+        expected_inventory_revision=(
+            handoff_receipt.request.desired_request.expected_inventory_revision
+        ),
+    )
+    with pytest.raises(ValueError, match="committed set"):
+        product.revisions.project(forged_desired)
+    handoff_before = product.journal.records()
+    recovered = PackageCommittedProductHandoffRecovery(
+        product_id="coding",
+        kernel=fixture.kernel,
+        journal=product.journal,
+        finalizer=product.finalizer,
+    ).recover(admission)
+    assert recovered == ()
+    assert router.route(route) == committed
+    assert fixture.lifecycle_journal.records() == before
+    assert fixture.source_authority.authorize_calls == 1
+    assert product.desired.snapshot() == desired
+    assert product.journal.records() == handoff_before
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_transaction_uses_pinned_local_source_and_real_store(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir(mode=0o700)
+    source = source_root / WHEEL_FILENAME
+    payload = _wheel_bytes()
+    source.write_bytes(payload)
+    admission = _manifest_product_admission()
+    policy = PackageProductLocalWheelPolicy(
+        product_id="coding",
+        project_scope_id="workspace:manifest",
+        source_root=source_root,
+        bindings=(
+            PackageProductLocalWheelBindingV1(
+                source_identity=str(source),
+                requested_package="acme==1.0",
+                plugin_id="acme.plugin",
+                artifact_digest=sha256(payload).hexdigest(),
+            ),
+        ),
+        policy_revision="package-policy:1",
+        quota_profile_revision="quota:1",
+        resolution_environment_fingerprint=_closure_environment().fingerprint,
+        authority_id="coding-local-source:manifest",
+    )
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        policy.create(
+            PackageProductLifecycleIntentV1(
+                operation_id="manifest-operation",
+                action="install",
+                source=str(source),
+                scope="project",
+            )
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    local_source = _PinnedLocalSourceAuthority(policy.source_authority())
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        secret="unused-local-source-secret",
+        product_ingress=ingress,
+        product_root_target=True,
+        configured_source_authority=local_source,
+        journaled_transaction_retention=True,
+        classification_authority=policy,
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(),
+            budgets=PackageClosureBudgetV1(),
+        ),
+        recovery_identity="manifest-local-product-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel, transaction=transaction
+        )
+    )
+
+    committed = router.route(
+        PackageProductRouteRequestV1(
+            entrypoint="cli", ingress=ingress, admission=admission
+        )
+    )
+
+    assert (committed.phase, committed.disposition) == ("committed", "committed")
+    assert committed.classification is not None
+    assert (
+        committed.classification.basis_facts.facts[0].owner_revision
+        == policy.authority_revision
+    )
+    assert local_source.authorize_calls == 1
+    assert fixture.retention.physical_acquisitions == 0
+    assert fixture.root_settlements.records()
+    assert fixture.committed_sets.current(committed.operation_id) is not None
+    assert tuple(record.receipt.state for record in fixture.pin_journal.records()) == (
+        "acquired",
+        "released",
+    )
+    assert product.desired.snapshot().inventory_revision == 1
+    source_evidence = fixture.evidence_journal.find(
+        operation_id=committed.operation_id,
+        attempt_epoch=committed.attempt_epoch,
+        node_id="root",
+        kind="authenticated_source",
+    )
+    assert source_evidence is not None
+    assert isinstance(source_evidence.evidence, PackageAuthenticatedSourceEvidenceV1)
+    assert source_evidence.evidence.envelope.origin_kind == "local"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+@pytest.mark.parametrize(
+    ("dependency_tampered", "crash_after_dependency"),
+    ((False, False), (True, False), (False, True)),
+)
+def test_product_transaction_commits_configured_local_dependency(
+    tmp_path: Path,
+    dependency_tampered: bool,
+    crash_after_dependency: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir(mode=0o700)
+    root_source = source_root / WHEEL_FILENAME
+    dependency_source = source_root / "dependency-2.0-py3-none-any.whl"
+    root_payload = _package_wheel_bytes(
+        "acme-plugin", "1.0", requires_dist=("dependency==2.0",)
+    )
+    dependency_payload = _package_wheel_bytes("dependency", "2.0")
+    root_source.write_bytes(root_payload)
+    dependency_source.write_bytes(dependency_payload)
+    environment = _closure_environment()
+    policy = PackageProductLocalWheelPolicy(
+        product_id="coding",
+        project_scope_id="workspace:manifest",
+        source_root=source_root,
+        bindings=(
+            PackageProductLocalWheelBindingV1(
+                source_identity=str(root_source),
+                requested_package="acme-plugin==1.0",
+                plugin_id="acme.plugin",
+                artifact_digest=sha256(root_payload).hexdigest(),
+            ),
+        ),
+        dependencies=(
+            PackageProductLocalWheelDependencyV1(
+                source_identity=str(dependency_source),
+                project_name="dependency",
+                version="2.0",
+                artifact_digest=sha256(dependency_payload).hexdigest(),
+            ),
+        ),
+        policy_revision="package-policy:1",
+        quota_profile_revision="quota:1",
+        resolution_environment_fingerprint=environment.fingerprint,
+        authority_id="coding-local-source:manifest",
+    )
+    admission = _manifest_product_admission()
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        policy.create(
+            PackageProductLifecycleIntentV1(
+                operation_id="manifest-operation",
+                action="install",
+                source=str(root_source),
+                scope="project",
+            )
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    local_source = _PinnedLocalSourceAuthority(policy.source_authority())
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        product_ingress=ingress,
+        product_root_target=True,
+        configured_source_authority=local_source,
+        journaled_transaction_retention=True,
+        classification_authority=policy,
+        configured_resolver=policy,
+    )
+    staging_bindings = PackageProductStagingAdoptionBindingJournal(
+        tmp_path / "product-staging-admissions.jsonl"
+    )
+    original_bindings = PackageProductAdmissionBindingJournal(
+        tmp_path / "product-original-admissions.jsonl"
+    )
+    product = _native_product_handoff(
+        fixture, tmp_path, staging_bindings=staging_bindings
+    )
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=environment, budgets=PackageClosureBudgetV1()
+        ),
+        recovery_identity="manifest-local-dependency-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel, transaction=transaction
+        ),
+        admission_binding=original_bindings,
+    )
+    if dependency_tampered:
+        dependency_source.write_bytes(b"changed-after-Product-approval")
+
+    if crash_after_dependency:
+        original_append = PackageArtifactStagingJournal.append
+
+        def fail_after_dependency(
+            journal: PackageArtifactStagingJournal,
+            receipt: PackageArtifactStagingReceiptV1,
+        ) -> PackageArtifactStagingReceiptV1:
+            persisted = original_append(journal, receipt)
+            if receipt.staging_request.plan_node.role == "dependency":
+                raise RuntimeError("crash after dependency staging receipt")
+            return persisted
+
+        monkeypatch.setattr(
+            PackageArtifactStagingJournal, "append", fail_after_dependency
+        )
+        try:
+            with pytest.raises(
+                RuntimeError, match="crash after dependency staging receipt"
+            ):
+                router.route(
+                    PackageProductRouteRequestV1(
+                        entrypoint="cli", ingress=ingress, admission=admission
+                    )
+                )
+        finally:
+            monkeypatch.setattr(
+                PackageArtifactStagingJournal, "append", original_append
+            )
+        checkpoint = fixture.staging_owner.inspect_checkpoint(ingress.operation_id)
+        assert checkpoint.status.phase == "transaction_pinned"
+        assert checkpoint.missing_node_ids == ("root",)
+        assert len(checkpoint.receipts) == 1
+        assert checkpoint.receipts[0].staging_request.plan_node.role == "dependency"
+        dependency_settlements = PackageStoreSettlementJournal(
+            tmp_path / "manifest-adoption-dependency-settlements.jsonl"
+        )
+        (settled_dependency,) = dependency_settlements.records()
+        assert settled_dependency.receipt == checkpoint.receipts[0]
+        assert fixture.root_settlements.records() == ()
+        new_admission = _manifest_product_admission(runtime_id="runtime:recovered")
+        new_lease = PackageEpochRuntimeLeaseV1.create(
+            runtime_id=new_admission.request.runtime_id,
+            runtime_epoch=new_admission.request.runtime_epoch,
+            store_root_identity=new_admission.request.store_root_identity,
+            registration_receipt_id="7" * 64,
+        )
+        current_snapshot = PackageEpochLeaseSnapshotV1.create(
+            store_id=new_admission.request.store_id,
+            owner_revision=1,
+            active_leases=(new_lease,),
+        )
+
+        @dataclass
+        class _Snapshots:
+            value: PackageEpochLeaseSnapshotV1
+
+            def snapshot(self, *, store_id: str) -> PackageEpochLeaseSnapshotV1:
+                assert store_id == self.value.store_id
+                return self.value
+
+        snapshots = _Snapshots(current_snapshot)
+        source_reader = PackageProductRebindSourceReader(
+            policy=policy,
+            lifecycle=fixture.lifecycle_journal,
+            resolution=fixture.resolution_journal,
+        )
+        lease_reader = PackageProductRebindLeaseReader(
+            lifecycle=fixture.lifecycle_journal,
+            original_bindings=original_bindings,
+            staging_bindings=staging_bindings,
+            snapshots=snapshots,
+            current_admission_request=new_admission.request,
+        )
+        adoption = PackageProductStagingAdoptionOwner(
+            lifecycle=fixture.lifecycle_journal,
+            source=source_reader,
+            lease=lease_reader,
+            checkpoint=fixture.staging_owner,
+            proposals=staging_bindings,
+        )
+        old_lease = PackageEpochRuntimeLeaseV1.create(
+            runtime_id=admission.request.runtime_id,
+            runtime_epoch=admission.request.runtime_epoch,
+            store_root_identity=admission.request.store_root_identity,
+            registration_receipt_id="7" * 64,
+        )
+        snapshots.value = PackageEpochLeaseSnapshotV1.create(
+            store_id=new_admission.request.store_id,
+            owner_revision=2,
+            active_leases=(old_lease, new_lease),
+        )
+        with pytest.raises(PackageProductRebindLeaseReadError) as old_live:
+            adoption.prepare(
+                ingress.operation_id,
+                max_bytes=2 * 1024 * 1024,
+                admission=new_admission,
+            )
+        assert old_live.value.code == "package_rebind_old_lease_active"
+        assert not staging_bindings.path.exists()
+        snapshots.value = current_snapshot
+        dependency_source.write_bytes(b"changed-after-staging")
+        try:
+            with pytest.raises(PackageProductRebindSourceError) as drift:
+                adoption.prepare(
+                    ingress.operation_id,
+                    max_bytes=2 * 1024 * 1024,
+                    admission=new_admission,
+                )
+            assert drift.value.code == "package_source_digest_mismatch"
+            assert not staging_bindings.path.exists()
+        finally:
+            dependency_source.write_bytes(dependency_payload)
+        selected = adoption.prepare(
+            ingress.operation_id,
+            max_bytes=2 * 1024 * 1024,
+            admission=new_admission,
+        )
+        assert selected.decision.staging_checkpoint_id == checkpoint.checkpoint_id
+        assert (
+            adoption.prepare(
+                ingress.operation_id,
+                max_bytes=2 * 1024 * 1024,
+                admission=new_admission,
+            )
+            == selected
+        )
+        _record, current, route = adoption.claim(
+            ingress.operation_id,
+            max_bytes=2 * 1024 * 1024,
+            admission=new_admission,
+        )
+        assert route.missing_node_ids == ("root",)
+        source_calls_before_resume = local_source.authorize_calls
+        resumed_transaction = PackageProductLifecycleTransaction(
+            kernel=fixture.kernel,
+            execution=PackageProductWheelExecutionFactory(
+                environment=environment, budgets=PackageClosureBudgetV1()
+            ),
+            recovery_identity="manifest-local-dependency-recovery",
+            closure=fixture.closure_owner,
+            pins=fixture.pin_owner,
+            staging=fixture.staging_owner,
+            commit=fixture.commit,
+            handoff=product.finalizer,
+            staging_execution_authority=adoption.authorize,
+        )
+        resumed_router = PackageProductLifecycleRouter(
+            execution=PackageProductLifecycleExecutionBinding(
+                owner=fixture.kernel, transaction=resumed_transaction
+            )
+        )
+        try:
+            committed = resumed_router.route_staging_adopted(route, current=current)
+        finally:
+            adoption.revoke(route, current)
+        assert (committed.phase, committed.disposition) == (
+            "committed",
+            "committed",
+        )
+        assert local_source.authorize_calls == source_calls_before_resume
+        assert dependency_settlements.records() == (settled_dependency,)
+        assert len(fixture.root_settlements.records()) == 1
+        assert len(fixture.staging_journal.receipts(ingress.operation_id)) == 2
+        assert product.desired.snapshot().inventory_revision == 1
+        return
+
+    committed = router.route(
+        PackageProductRouteRequestV1(
+            entrypoint="cli", ingress=ingress, admission=admission
+        )
+    )
+
+    if dependency_tampered:
+        assert committed.disposition == "rejected"
+        assert committed.failure is not None
+        assert committed.failure.code == "package_closure_artifact_invalid"
+        assert fixture.committed_sets.records() == ()
+        assert product.desired.snapshot().inventory_revision == 0
+        return
+    assert (committed.phase, committed.disposition) == ("committed", "committed")
+    committed_set = fixture.committed_sets.current(committed.operation_id)
+    assert committed_set is not None
+    assert tuple(
+        ref.artifact_digest for ref in committed_set.committed_set.dependency_refs
+    ) == (sha256(dependency_payload).hexdigest(),)
+    assert local_source.authorize_calls == 2
+    assert fixture.resolution_journal.records()
+    assert tuple(record.receipt.state for record in fixture.pin_journal.records()) == (
+        "acquired",
+        "released",
+    )
+    assert product.desired.snapshot().inventory_revision == 1
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+@pytest.mark.parametrize("with_dependency", (False, True))
+@pytest.mark.parametrize(
+    "entrypoint",
+    (
+        "cli",
+        "session",
+        "cli_transport",
+        "rpc_transport",
+        "startup",
+        "gc",
+        "gc_crash",
+        "gc_tamper",
+        "gc_collision",
+        "gc_invalid_id",
+        "gc_prior_result",
+        "gc_command",
+        "gc_command_stale",
+        "gc_command_unsealed",
+    ),
+)
+def test_posix_local_wheel_product_composition_uses_live_epoch_and_owners(
+    tmp_path: Path,
+    with_dependency: bool,
+    entrypoint: str,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=with_dependency, entrypoint=entrypoint
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_staging_recovery_with_guarded_dependency_runtime(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="staging_recovery"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_dependency_gc_replays_after_store_delete(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="gc_dependency"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_dependency_gc_records_terminal_store_failure(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="gc_dependency_failure"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_dependency_gc_repair_requires_new_review_after_collision(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="gc_dependency_repair_collision"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_dependency_wheel_update_requires_explicit_admission(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="gc_dependency_versions"
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux rooted runtime")
+def test_posix_product_gc_keeps_shared_dependency_until_both_roots_delete(
+    tmp_path: Path,
+) -> None:
+    _exercise_posix_local_wheel_product_composition(
+        tmp_path, with_dependency=True, entrypoint="gc_dependency_shared"
+    )
+
+
+def _exercise_posix_local_wheel_product_composition(
+    tmp_path: Path,
+    *,
+    with_dependency: bool,
+    entrypoint: str,
+) -> None:
+    from loushang.ai.model import Capabilities, Model
+    from loushang.coding._base_plugin import (
+        CodingBasePluginAssemblyError,
+        coding_base_plugin_root,
+        prepare_coding_base_product_plan,
+    )
+    from loushang.coding._base_product_composition import (
+        compile_coding_base_product_selection,
+    )
+    from loushang.coding._plugin_lifecycle import (
+        resolve_ephemeral_coding_plugin_lifecycle_state_layout,
+    )
+    from loushang.coding._product_capability_plugin_composition import (
+        prepare_coding_builtin_product_composition,
+        prepare_coding_product_capability_plugin_composition,
+    )
+    from loushang.coding._resource_catalog_shadow import (
+        CODING_READ_ONLY_AGENT_RESOURCE_CATALOG_SOURCE_POLICY,
+        CodingResourceCatalogAdmissionError,
+    )
+    from loushang.coding.arch._provider_api import CodingArchPluginConfigV1
+    from loushang.coding.bootstrap import (
+        create_agent_session,
+        create_agent_session_runtime,
+        create_services,
+    )
+    from loushang.coding.composition_sets import resolve_coding_composition_set
+    from loushang.coding.control import ControlConfig, SettingsManager
+    from loushang.coding.lsp._provider_api import CodingLspPluginConfigV1
+    from loushang.coding.package_builtin_wheel import (
+        CODING_BASE_PRODUCT_WHEEL_FILENAME,
+        build_coding_base_product_wheel,
+        coding_base_product_local_wheel_policy,
+        prepare_posix_coding_base_product_wheel,
+        prepare_posix_coding_capability_product_wheels,
+    )
+    from loushang.coding.package_epoch_layout import resolve_coding_package_epoch_layout
+    from loushang.coding.package_pre_b_snapshot import (
+        cutover_coding_package_store_from_legacy,
+        reopen_coding_package_cutover,
+    )
+    from loushang.coding.package_product_revisions import (
+        open_coding_product_builtin_resolution,
+        open_coding_product_capability_resolution,
+    )
+    from loushang.coding.package_product_runtime import (
+        open_coding_base_product_runtime_owner,
+        open_coding_builtin_product_runtime_owner,
+        open_coding_fenced_product_application_owner,
+        open_coding_package_product_state,
+    )
+    from loushang.coding.plugin_dependency_grants import (
+        coding_plugin_distribution_evidence_resolver,
+    )
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.approval.plugin_execution import (
+        PluginExecutionDecisionJournal,
+    )
+    from loushang.harness.cli.package_lifecycle import (
+        PackageLifecycleError,
+        PackageLifecycleRequest,
+        run_package_lifecycle,
+    )
+    from loushang.harness.host.rpc.commands.packages import RpcPackageCommands
+    from loushang.harness.host.rpc.output import RpcOutput
+    from loushang.harness.package_product.product_runtime import (
+        PackageProductRuntimeBindingV1,
+        PackageProductRuntimeRequestV1,
+    )
+    from loushang.harness.resources.packages.product_epoch_guard import (
+        PackageProductPosixFencedRuntimeOwner,
+        PackageProductRuntimeLease,
+        register_package_product_runtime_lease,
+    )
+    from loushang.harness.resources.packages.product_pre_b_snapshot import (
+        reopen_posix_product_cutover,
+    )
+    from loushang.harness.resources.packages.source import PackageSourceConfig
+    from loushang.harness.resources.plugins.python_symbols import (
+        load_verified_plugin_python_module,
+    )
+    from loushang.harness.resources.plugins.revisions import PluginRevisionError
+    from loushang.harness.resources.plugins.selection import PluginContributionRef
+    from loushang.harness.session.bootstrap_configuration import (
+        PackageProductStartupSourceError,
+    )
+    from loushang.harness.session.product_composition_assembly import (
+        ProductCompositionAssemblyError,
+        _assemble_product_contribution_candidates,
+    )
+
+    source_root = tmp_path / "sources"
+    source_root.mkdir(mode=0o700)
+    checked_in_base = entrypoint == "session" and not with_dependency
+    base_files: dict[str, bytes] = {}
+    if checked_in_base:
+        base_root = coding_base_plugin_root()
+        base_files = {
+            f"coding_base/{path.relative_to(base_root).as_posix()}": path.read_bytes()
+            for path in base_root.rglob("*")
+            if path.is_file()
+            and "__pycache__" not in path.parts
+            and path.suffix != ".pyc"
+        }
+    source = source_root / (
+        CODING_BASE_PRODUCT_WHEEL_FILENAME if checked_in_base else WHEEL_FILENAME
+    )
+    if checked_in_base:
+        artifact = prepare_posix_coding_base_product_wheel(source_root)
+        assert artifact.path == source
+        assert artifact == prepare_posix_coding_base_product_wheel(source_root)
+        payload = source.read_bytes()
+        assert payload == build_coding_base_product_wheel()
+        assert artifact.artifact_digest == sha256(payload).hexdigest()
+    else:
+        payload = _package_wheel_bytes(
+            "acme-plugin",
+            "1.0",
+            requires_dist=("dependency==2.0",) if with_dependency else (),
+        )
+        source.write_bytes(payload)
+    dependency_source = source_root / "dependency-2.0-py3-none-any.whl"
+    dependency_payload = _package_wheel_bytes("dependency", "2.0")
+    if with_dependency:
+        dependency_source.write_bytes(dependency_payload)
+    versioned_source = source_root / "acme_plugin-2.0-py3-none-any.whl"
+    versioned_payload = _package_wheel_bytes(
+        "acme-plugin", "2.0", requires_dist=("dependency==2.0",)
+    )
+    if entrypoint == "gc_dependency_versions":
+        versioned_source.write_bytes(versioned_payload)
+    shared_source = source_root / "other_plugin-1.0-py3-none-any.whl"
+    shared_payload = _package_wheel_bytes(
+        "other-plugin", "1.0", requires_dist=("dependency==2.0",)
+    )
+    if entrypoint == "gc_dependency_shared":
+        shared_source.write_bytes(shared_payload)
+    environment = _closure_environment()
+    if checked_in_base:
+        policy = coding_base_product_local_wheel_policy(
+            artifact,
+            project_scope_id="workspace:manifest",
+            resolution_environment_fingerprint=environment.fingerprint,
+            policy_revision="package-policy:1",
+            quota_profile_revision="quota:1",
+            authority_id="coding-local-source:runtime",
+        )
+    else:
+        configured_bindings = (
+            PackageProductLocalWheelBindingV1(
+                source_identity=str(source),
+                requested_package="acme-plugin==1.0",
+                plugin_id="acme.plugin",
+                artifact_digest=sha256(payload).hexdigest(),
+            ),
+        )
+        if entrypoint == "gc_dependency_versions":
+            configured_bindings += (
+                PackageProductLocalWheelBindingV1(
+                    source_identity=str(versioned_source),
+                    requested_package="acme-plugin==2.0",
+                    plugin_id="acme.plugin",
+                    artifact_digest=sha256(versioned_payload).hexdigest(),
+                ),
+            )
+        if entrypoint == "gc_dependency_shared":
+            configured_bindings += (
+                PackageProductLocalWheelBindingV1(
+                    source_identity=str(shared_source),
+                    requested_package="other-plugin==1.0",
+                    plugin_id="other.plugin",
+                    artifact_digest=sha256(shared_payload).hexdigest(),
+                ),
+            )
+        policy = PackageProductLocalWheelPolicy(
+            product_id="coding",
+            project_scope_id="workspace:manifest",
+            source_root=source_root,
+            bindings=configured_bindings,
+            dependencies=(
+                PackageProductLocalWheelDependencyV1(
+                    source_identity=str(dependency_source),
+                    project_name="dependency",
+                    version="2.0",
+                    artifact_digest=sha256(dependency_payload).hexdigest(),
+                ),
+            )
+            if with_dependency
+            else (),
+            policy_revision="package-policy:1",
+            quota_profile_revision="quota:1",
+            resolution_environment_fingerprint=environment.fingerprint,
+            authority_id="coding-local-source:runtime",
+        )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    legacy_base = tmp_path / "legacy-coding"
+    legacy_layout = resolve_ephemeral_coding_plugin_lifecycle_state_layout(
+        legacy_base, cwd=workspace
+    )
+    epoch_layout = resolve_coding_package_epoch_layout(legacy_layout)
+    control_root = epoch_layout.control_root
+    authority = epoch_layout.authority_root
+    legacy_root = epoch_layout.legacy_root
+    epochs_root = epoch_layout.epochs_root
+    snapshot_root = epoch_layout.snapshot_root
+    for directory in (
+        legacy_base,
+        authority,
+        legacy_layout.root.parent,
+        legacy_layout.root,
+        legacy_root,
+        epochs_root,
+        control_root,
+        snapshot_root,
+    ):
+        directory.mkdir(mode=0o700)
+    assert legacy_root == legacy_layout.package_root
+    (legacy_root / "installed").mkdir(mode=0o700)
+    (legacy_root / "installed" / "state.json").write_bytes(b'{"legacy":1}\n')
+    (legacy_root / "plugin-revisions").mkdir(mode=0o700)
+    (legacy_root / "package-lock.json").write_bytes(
+        b'{"version":4,"packages":[],"pluginBindings":[],"pluginBindingHeads":[]}\n'
+    )
+    (legacy_root / "package-lock.json.lock").write_bytes(b"")
+    (legacy_layout.root / "desired-state.jsonl").write_bytes(b"")
+    (legacy_layout.root / "enablement-migration.jsonl").write_bytes(b"")
+    (legacy_layout.root / "instance-runtime.jsonl").write_bytes(b"")
+    (legacy_layout.root / "process-startups").mkdir(mode=0o700)
+    (legacy_layout.root / "session-owners").mkdir(mode=0o700)
+    store_id = epoch_layout.store_id
+    fences = PackageEpochFenceJournal(control_root / "epoch.jsonl")
+    source_root = tmp_path / "pre-b-domains"
+    source_root.mkdir(mode=0o700)
+    global_settings = tmp_path / "global-settings" / "settings.json"
+    global_settings.parent.mkdir(mode=0o700)
+    global_settings.write_text(
+        json.dumps({"plugin_sources": [str(workspace / "legacy-plugin")]}),
+        encoding="utf-8",
+    )
+    project_settings = workspace / ".loushang" / "settings.json"
+    project_settings.parent.mkdir(mode=0o700)
+    project_settings.write_text(
+        json.dumps({"package_roots": [str(legacy_root)]}), encoding="utf-8"
+    )
+    settings_manager = SettingsManager(
+        global_settings_path=global_settings,
+        project_settings_path=project_settings,
+    )
+    pre_fence = PackagePosixPreFenceRegistrationOwner(
+        authority, store_id=store_id, fences=fences
+    )
+
+    def attempt_cutover(namespace_id: str = "2" * 64):
+        return cutover_coding_package_store_from_legacy(
+            legacy_layout,
+            settings_manager,
+            projection_parent=source_root,
+            namespace_id=namespace_id,
+            minimum_runtime_version="2.0.0",
+            minimum_runtime_protocol_epoch=2,
+        )
+
+    if entrypoint == "session" and not with_dependency:
+        with pytest.raises(PackagePosixEpochCutoverError) as missing_fence:
+            reopen_coding_package_cutover(legacy_layout)
+        assert missing_fence.value.code == "package_epoch_fence_stale"
+        live_old_runtime = pre_fence.register(startup_id="legacy:live")
+        try:
+            denied = attempt_cutover().attempt.result
+            assert denied.disposition == "rejected"
+            assert denied.code == "package_runtime_epoch_unsupported"
+            assert denied.failure is not None
+            assert denied.failure.barrier == "pre_fence"
+            assert fences.current(store_id) is None
+            assert not tuple(snapshot_root.glob("*.evidence.json"))
+        finally:
+            live_old_runtime.release()
+    cutover_binding = attempt_cutover()
+    assert not (control_root / "product-state").exists()
+    cutover_attempt = cutover_binding.attempt
+    snapshots = cutover_binding.snapshots
+    cutover_request = cutover_attempt.request
+    cutover_result = cutover_attempt.result
+    assert cutover_result.disposition == "fenced"
+    if entrypoint == "session" and not with_dependency:
+        assert attempt_cutover().attempt == cutover_attempt
+        with pytest.raises(PackagePosixEpochCutoverError) as stale_cutover:
+            attempt_cutover("3" * 64)
+        assert stale_cutover.value.code == "package_epoch_fence_stale"
+    fence = cutover_result.fence
+    assert fence is not None
+    assert fences.current(store_id) == fence
+    if entrypoint == "session" and not with_dependency:
+        hidden_store = tmp_path / "hidden-legacy-package-root"
+        hidden_lifecycle = tmp_path / "hidden-legacy-lifecycle-root"
+        legacy_root.rename(hidden_store)
+        legacy_layout.root.rename(hidden_lifecycle)
+        try:
+            assert reopen_coding_package_cutover(legacy_layout) == cutover_result
+        finally:
+            hidden_lifecycle.rename(legacy_layout.root)
+            hidden_store.rename(legacy_root)
+        aliased_control = tmp_path / "aliased-package-control"
+        aliased_control.symlink_to(control_root, target_is_directory=True)
+        with pytest.raises(ValueError, match="not canonical"):
+            reopen_posix_product_cutover(
+                authority_root=authority,
+                control_root=aliased_control,
+                store_id=store_id,
+                epochs_root_name=epoch_layout.epochs_root_name,
+            )
+        selected_root = epoch_layout.epoch_root(cutover_request.namespace_id)
+        hidden_selected = tmp_path / "hidden-selected-package-root"
+        selected_root.rename(hidden_selected)
+        selected_root.mkdir(mode=0o700)
+        try:
+            with pytest.raises(PackagePosixEpochCutoverError) as changed_root:
+                reopen_coding_package_cutover(legacy_layout)
+            assert changed_root.value.code == "package_epoch_cutover_identity_changed"
+        finally:
+            selected_root.rmdir()
+            hidden_selected.rename(selected_root)
+    with pytest.raises(PackagePosixPreFenceRegistrationError) as old_launch:
+        pre_fence.register(startup_id="legacy:after-cutover")
+    assert old_launch.value.code == "package_runtime_epoch_unsupported"
+    if checked_in_base:
+        from loushang.harness.policy import PolicyDecision
+        from loushang.harness.resources.packages.materializer import PackageMaterializer
+        from loushang.harness.resources.plugins.manifest import PluginManifestParser
+        from loushang.harness.resources.plugins.revisions import PluginRevisionStore
+
+        old_package = PluginManifestParser().parse(coding_base_plugin_root())
+        with pytest.raises(PluginRevisionError) as direct_publish:
+            PluginRevisionStore(legacy_layout.plugin_revision_root).publish(old_package)
+        assert direct_publish.value.code == "plugin_revision_epoch_fenced"
+        legacy_materializer = PackageMaterializer(
+            install_root=legacy_layout.package_install_root,
+            lockfile_path=legacy_layout.package_lockfile,
+            plugin_revision_root=legacy_layout.plugin_revision_root,
+        )
+        with pytest.raises(PluginRevisionError) as direct_materialize:
+            legacy_materializer.publish_plugin_packages((old_package,))
+        assert direct_materialize.value.code == "plugin_revision_epoch_fenced"
+        before_direct_prepare = legacy_layout.package_lockfile.read_bytes()
+        with pytest.raises(PluginRevisionError) as direct_prepare:
+            legacy_materializer.prepare_remote_source(
+                "https://packages.example.test/legacy-plugin.git"
+            )
+        assert direct_prepare.value.code == "plugin_revision_epoch_fenced"
+        assert legacy_layout.package_lockfile.read_bytes() == before_direct_prepare
+
+        class AllowLegacySource:
+            def evaluate_package_source(self, _source: str | Path) -> PolicyDecision:
+                return PolicyDecision.allow()
+
+        backend_calls = []
+
+        def direct_backend(record):
+            backend_calls.append(record.source)
+            record.target_path.mkdir(parents=True)
+            (record.target_path / "bypass.txt").write_bytes(b"legacy write")
+            return record.with_lifecycle("installed")
+
+        direct_backend_materializer = PackageMaterializer(
+            install_root=legacy_layout.package_install_root,
+            lockfile_path=legacy_layout.package_lockfile,
+            plugin_revision_root=legacy_layout.plugin_revision_root,
+            backend=direct_backend,
+            security_policy=AllowLegacySource(),
+        )
+        with pytest.raises(PluginRevisionError) as direct_backend_write:
+            direct_backend_materializer.materialize_temporary_remote_source_sync(
+                "https://packages.example.test/legacy-plugin.git"
+            )
+        assert direct_backend_write.value.code == "plugin_revision_epoch_fenced"
+        assert backend_calls == []
+    snapshot_evidence = snapshots.snapshot(fence.request.snapshot_receipt_id)
+    assert snapshot_evidence is not None
+    assert snapshot_evidence.snapshot.receipt_id == fence.request.snapshot_receipt_id
+    assert (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "store_bytes"
+        / "installed"
+        / "state.json"
+    ).read_bytes() == b'{"legacy":1}\n'
+    for domain in ("binding_history", "lock_history"):
+        assert (
+            snapshot_root
+            / snapshot_evidence.snapshot.snapshot_id
+            / "payload"
+            / domain
+            / "package-lock.json"
+        ).read_bytes() == (
+            b'{"version":4,"packages":[],"pluginBindings":[],"pluginBindingHeads":[]}\n'
+        )
+    assert (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "lock_history"
+        / "package-lock.json.lock"
+    ).read_bytes() == b""
+    for domain, name in (
+        ("desired_state", "desired-state.jsonl"),
+        ("enablement_state", "enablement-migration.jsonl"),
+        ("instance_state", "instance-runtime.jsonl"),
+    ):
+        assert (
+            snapshot_root
+            / snapshot_evidence.snapshot.snapshot_id
+            / "payload"
+            / domain
+            / name
+        ).read_bytes() == b""
+    assert (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "instance_state"
+        / "process-startups"
+    ).is_dir()
+    assert (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "fence_record"
+        / "epoch.jsonl.lock"
+    ).is_file()
+    assert not (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "fence_record"
+        / "epoch.jsonl"
+    ).exists()
+    assert (control_root / "epoch.jsonl").is_file()
+    assert (
+        snapshot_root
+        / snapshot_evidence.snapshot.snapshot_id
+        / "payload"
+        / "legacy_root_pointer"
+        / "legacy-root-pointer.json"
+    ).read_bytes() == canonical_json_bytes(
+        {
+            "legacyRootIdentity": cutover_request.expected_legacy_root_identity,
+            "legacyRootName": epoch_layout.legacy_root_name,
+            "recordVersion": 1,
+            "storeId": store_id,
+        }
+    )
+    assert not tuple(source_root.iterdir())
+    projected_sources = json.loads(
+        (
+            snapshot_root
+            / snapshot_evidence.snapshot.snapshot_id
+            / "payload"
+            / "source_configuration"
+            / "coding-source-configuration.json"
+        ).read_bytes()
+    )
+    assert projected_sources["scopes"]["global"]["sourcePatch"] == {
+        "plugin_sources": [str(workspace / "legacy-plugin")]
+    }
+    assert projected_sources["scopes"]["project"]["sourcePatch"] == {
+        "package_roots": [str(legacy_root)]
+    }
+
+    def pre_b_tree() -> tuple[tuple[str, str, bytes | None], ...]:
+        return tuple(
+            (
+                label,
+                path.relative_to(root).as_posix(),
+                None if path.is_dir() else path.read_bytes(),
+            )
+            for label, root in (
+                ("package", legacy_root),
+                ("lifecycle", legacy_layout.root),
+            )
+            for path in sorted(root.rglob("*"))
+        )
+
+    frozen_pre_b_tree = pre_b_tree()
+    plugin_root = epoch_layout.epoch_root(cutover_request.namespace_id)
+    epoch_runtime = PackageProductPosixFencedRuntimeOwner.open(
+        authority_root=authority,
+        control_root=control_root,
+        store_id=store_id,
+        epochs_root_name=epoch_layout.epochs_root_name,
+    )
+    application_owner = None
+    try:
+        registry = epoch_runtime.registry
+        assert epoch_runtime.cutover_result == cutover_result
+        if entrypoint == "session" and not with_dependency:
+            foreign_layout = resolve_ephemeral_coding_plugin_lifecycle_state_layout(
+                legacy_base, cwd=tmp_path / "foreign-product-workspace"
+            )
+            with pytest.raises(ValueError, match="workspace authority changed"):
+                open_coding_package_product_state(foreign_layout, epoch_runtime)
+            unsafe_state_root = control_root / "product-state"
+            unsafe_state_root.mkdir(mode=0o700)
+            unsafe_state_root.chmod(0o770)
+            try:
+                with pytest.raises(ValueError, match="state root is unsafe"):
+                    open_coding_package_product_state(legacy_layout, epoch_runtime)
+            finally:
+                unsafe_state_root.rmdir()
+            prior_umask = os.umask(0o777)
+            try:
+                assert epoch_runtime.prepare_product_state_root() == unsafe_state_root
+            finally:
+                os.umask(prior_umask)
+        product_state = open_coding_package_product_state(legacy_layout, epoch_runtime)
+        state_root = product_state.state_root
+        gate = product_state.gc_gate
+        desired = product_state.desired_state
+        management = product_state.management
+        bindings = product_state.gc_bindings
+        assert state_root == control_root / "product-state"
+        assert stat.S_IMODE(state_root.stat().st_mode) == 0o700
+        assert (legacy_layout.root / "desired-state.jsonl").read_bytes() == b""
+        if entrypoint == "session" and not with_dependency:
+            unsafe_source_root = control_root / "product-sources"
+            unsafe_source_root.mkdir(mode=0o700)
+            unsafe_source_root.chmod(0o770)
+            try:
+                with pytest.raises(ValueError, match="Source root is unsafe"):
+                    epoch_runtime.prepare_product_source_root()
+            finally:
+                unsafe_source_root.rmdir()
+            prior_umask = os.umask(0o777)
+            try:
+                product_source_root = epoch_runtime.prepare_product_source_root()
+            finally:
+                os.umask(prior_umask)
+            assert product_source_root == unsafe_source_root
+            assert stat.S_IMODE(product_source_root.stat().st_mode) == 0o700
+            assert epoch_runtime.prepare_product_source_root() == product_source_root
+            product_artifact = prepare_posix_coding_base_product_wheel(
+                product_source_root
+            )
+            assert product_artifact.artifact_digest == artifact.artifact_digest
+            foreign_workspace = tmp_path / "foreign-product-owner-workspace"
+            foreign_workspace.mkdir(mode=0o700)
+            with pytest.raises(ValueError, match="workspace scope changed"):
+                open_coding_base_product_runtime_owner(
+                    legacy_layout,
+                    epoch_runtime,
+                    product_state,
+                    workspace=foreign_workspace,
+                    runtime_version="2.0.0",
+                    runtime_protocol_epoch=2,
+                )
+            with pytest.raises(ValueError, match="state authority changed"):
+                open_coding_base_product_runtime_owner(
+                    legacy_layout,
+                    epoch_runtime,
+                    replace(product_state, state_root=product_source_root),
+                    workspace=workspace,
+                    runtime_version="2.0.0",
+                    runtime_protocol_epoch=2,
+                )
+            with pytest.raises(ValueError, match="state authority changed"):
+                open_coding_base_product_runtime_owner(
+                    legacy_layout,
+                    epoch_runtime,
+                    replace(
+                        product_state,
+                        desired_state=PluginDesiredStateLedger(
+                            legacy_layout.desired_state, gc_gate=gate
+                        ),
+                    ),
+                    workspace=workspace,
+                    runtime_version="2.0.0",
+                    runtime_protocol_epoch=2,
+                )
+            product_runtime_owner = open_coding_base_product_runtime_owner(
+                legacy_layout,
+                epoch_runtime,
+                product_state,
+                workspace=workspace,
+                runtime_version="2.0.0",
+                runtime_protocol_epoch=2,
+            )
+            assert (
+                product_runtime_owner.product_owner.policy.source_root
+                == product_source_root
+            )
+            policy = product_runtime_owner.product_owner.policy
+            environment = product_runtime_owner.product_owner.environment
+            source = product_artifact.path
+            restore_root = tmp_path / "isolated-offline-restore"
+            restore_root.mkdir(mode=0o700)
+            activation_root = tmp_path / "isolated-legacy-activation"
+            activation_root.mkdir(mode=0o700)
+            b_marker = plugin_root / "epoch-b.json"
+            b_marker.write_bytes(b'{"epoch":"B"}\n')
+            materializer = PackagePosixOfflineRestoreMaterializer(
+                snapshot_root,
+                restore_root,
+                current_b_authority_root=plugin_root,
+                store_id=store_id,
+            )
+            restore_request = PackageOfflineRestoreRequestV1.create(
+                current_fence=fence,
+                genesis_fence=fence,
+                snapshot_evidence=snapshot_evidence,
+                restore_namespace_id=sha256(b"real-coding-pre-b-restore").hexdigest(),
+                legacy_runtime_version="1.9.0",
+            )
+            coordination = PackagePosixEpochCutoverCoordination(
+                leases=registry,
+                pre_fence=pre_fence,
+            )
+            script = f"""
+import os
+import pathlib
+import time
+
+if pathlib.Path("store_bytes/installed/state.json").read_bytes() != b'{{"legacy":1}}\\n':
+    raise SystemExit(41)
+try:
+    pathlib.Path({str(plugin_root)!r}, "epoch-b.json").read_bytes()
+except OSError:
+    pass
+else:
+    raise SystemExit(42)
+descriptor = int(os.environ.pop("LOUSHANG_LEGACY_RUNTIME_READY_FD"))
+token = os.environ.pop("LOUSHANG_LEGACY_RUNTIME_READY_TOKEN")
+os.write(descriptor, f"ready:{{token}}\\n".encode())
+os.close(descriptor)
+while True:
+    time.sleep(60)
+"""
+            activation = PackageLinuxLegacyRuntimeActivationOwner(
+                restore_root,
+                activation_root,
+                current_b_authority_root=plugin_root,
+                store_id=store_id,
+                legacy_runtime_version=restore_request.legacy_runtime_version,
+                command=("/usr/bin/python3", "-I", "-S", "-c", script),
+            )
+            restore_owner = PackageOfflineRestoreOwner(
+                store_id=store_id,
+                epoch_journal=fences,
+                coordination=coordination,
+                snapshots=snapshots,
+                materialization=materializer,
+                activation=activation,
+            )
+            fence_bytes = (control_root / "epoch.jsonl").read_bytes()
+            restored = None
+            try:
+                restored = restore_owner.restore(restore_request)
+                assert restored == restore_owner.restore(restore_request)
+                assert restored.disposition == "restored"
+                assert restored.materialization is not None
+                assert restored.activation is not None
+                assert restored.materialization.legacy_snapshot_exact
+                assert restored.materialization.b_namespace_unreachable
+                assert restored.activation.exclusive_old_runtime
+                assert b_marker.read_bytes() == b'{"epoch":"B"}\n'
+                restored_payload = (
+                    restore_root / restore_request.restore_namespace_id / "payload"
+                )
+                assert (
+                    restored_payload / "store_bytes" / "installed" / "state.json"
+                ).read_bytes() == b'{"legacy":1}\n'
+                assert (
+                    restored_payload
+                    / "source_configuration"
+                    / "coding-source-configuration.json"
+                ).read_bytes() == (
+                    snapshot_root
+                    / snapshot_evidence.snapshot.snapshot_id
+                    / "payload"
+                    / "source_configuration"
+                    / "coding-source-configuration.json"
+                ).read_bytes()
+            finally:
+                if restored is not None and restored.activation is not None:
+                    activation.deactivate(restored.activation)
+                if restored is not None and restored.materialization is not None:
+                    materializer.discard(restored.materialization)
+                b_marker.unlink()
+            assert not (restore_root / restore_request.restore_namespace_id).exists()
+            assert not (activation_root / "active-runtime.json").exists()
+            assert (control_root / "epoch.jsonl").read_bytes() == fence_bytes
+            assert fences.current(store_id) == fence
+        if entrypoint == "session" and not with_dependency:
+            with pytest.raises(ValueError, match="runtime version"):
+                register_package_product_runtime_lease(
+                    registry,
+                    fence=fence,
+                    runtime_id="runtime:product",
+                    runtime_version="",
+                    runtime_protocol_epoch=2,
+                )
+        runtime_lease = register_package_product_runtime_lease(
+            registry,
+            fence=fence,
+            runtime_id="runtime:product",
+            runtime_version="2.0.0",
+            runtime_protocol_epoch=2,
+        )
+        runtime_lease_released = False
+        root_store_identity = (
+            product_runtime_owner.product_owner.root_store_identity
+            if checked_in_base
+            else "product-runtime-root-store"
+        )
+        dependency_store_identity = (
+            product_runtime_owner.product_owner.dependency_store_identity
+            if checked_in_base
+            else "product-runtime-dependency-store"
+        )
+        if entrypoint == "session" and not with_dependency:
+            with pytest.raises(RuntimeError, match="leases remain active"):
+                epoch_runtime.close()
+        session = None
+        try:
+            admission_request = runtime_lease.admission_request
+
+            def compose(
+                selected_desired: PluginDesiredStateLedger = desired,
+            ):
+                return compose_posix_local_wheel_product(
+                    state_root=state_root,
+                    plugin_store_root=plugin_root,
+                    policy=policy,
+                    environment=environment,
+                    acquisition_budgets=PackageAcquisitionBudgetV1(
+                        max_transport_bytes=256 * 1024,
+                        max_requests=1,
+                        max_redirects=0,
+                        max_wall_time_ms=1000,
+                    ),
+                    inspection_budgets=PackageInspectionBudgetV1(),
+                    closure_budgets=PackageClosureBudgetV1(),
+                    root_store_identity=root_store_identity,
+                    dependency_store_identity=dependency_store_identity,
+                    registry=registry,
+                    admission_request=admission_request,
+                    management=management,
+                    desired_state=selected_desired,
+                    gc_bindings=bindings,
+                    gc_gate=gate,
+                    actor_id="product-runtime",
+                    desired_policy_revision="product-policy:1",
+                    recovery_identity="product-runtime-recovery",
+                )
+
+            if entrypoint == "staging_recovery":
+                operation_id = "operation:guarded-dependency-staging"
+
+                def open_session_runtime(
+                    lease: PackageProductRuntimeLease, *, session_label: str
+                ):
+                    session_manager = asyncio.run(
+                        SessionManager.new(
+                            session_dir=tmp_path / f"sessions-{session_label}",
+                            cwd=str(workspace),
+                            persist=False,
+                        )
+                    )
+                    session_id = session_manager.get_header().conversation_id
+                    factory = PosixLocalWheelProductRuntimeFactory(
+                        expected_session_id=session_id,
+                        expected_cwd=workspace,
+                        state_root=state_root,
+                        plugin_store_root=plugin_root,
+                        policy=policy,
+                        environment=environment,
+                        acquisition_budgets=PackageAcquisitionBudgetV1(
+                            max_transport_bytes=256 * 1024,
+                            max_requests=1,
+                            max_redirects=0,
+                            max_wall_time_ms=1000,
+                        ),
+                        inspection_budgets=PackageInspectionBudgetV1(),
+                        closure_budgets=PackageClosureBudgetV1(),
+                        root_store_identity=root_store_identity,
+                        dependency_store_identity=dependency_store_identity,
+                        runtime_lease=lease,
+                        cutover_result=cutover_result,
+                        management=management,
+                        desired_state=desired,
+                        gc_bindings=bindings,
+                        gc_gate=gate,
+                        actor_id="product-runtime",
+                        desired_policy_revision="product-policy:1",
+                        recovery_identity="product-runtime-recovery",
+                        epoch_runtime=epoch_runtime,
+                    )
+                    created: list[PackageProductRuntimeBindingV1] = []
+
+                    class ProductFactory:
+                        def create(
+                            self, request: PackageProductRuntimeRequestV1
+                        ) -> PackageProductRuntimeBindingV1:
+                            binding = factory.create(request)
+                            created.append(binding)
+                            return binding
+
+                    product_session = create_agent_session(
+                        session_manager=session_manager,
+                        model=Model(
+                            id="plc9b-dependency-recovery",
+                            name="PLC9B Dependency Recovery",
+                            provider="test",
+                            endpoint="anthropic-messages",
+                            capabilities=Capabilities(
+                                reasoning=True,
+                                input=("text",),
+                                context_window=128000,
+                                max_tokens=4096,
+                            ),
+                        ),
+                        services=create_services(
+                            settings_manager=SettingsManager(ControlConfig())
+                        ),
+                        package_product_runtime_factory=ProductFactory(),
+                        composition_set="coding-minimal",
+                        resource_catalog_source_policy=(
+                            CODING_READ_ONLY_AGENT_RESOURCE_CATALOG_SOURCE_POLICY
+                        ),
+                    )
+                    assert len(created) == 1
+                    assert (
+                        product_session._package_controller.get_package_materializer()
+                        is None
+                    )
+                    return product_session, created[0]
+
+                first_session, runtime = open_session_runtime(
+                    runtime_lease, session_label="dependency-first"
+                )
+                runtime.activate()
+                original_append = PackageArtifactStagingJournal.append
+
+                def crash_after_dependency(
+                    journal: PackageArtifactStagingJournal,
+                    receipt: PackageArtifactStagingReceiptV1,
+                ) -> PackageArtifactStagingReceiptV1:
+                    persisted = original_append(journal, receipt)
+                    if receipt.staging_request.plan_node.role == "dependency":
+                        raise RuntimeError("crash after guarded dependency receipt")
+                    return persisted
+
+                with patch.object(
+                    PackageArtifactStagingJournal, "append", crash_after_dependency
+                ):
+                    with pytest.raises(
+                        RuntimeError, match="crash after guarded dependency receipt"
+                    ):
+                        runtime.lifecycle.route(
+                            PackageProductLifecycleIntentV1(
+                                operation_id=operation_id,
+                                action="install",
+                                source=str(source),
+                                scope="project",
+                            ),
+                            entrypoint="cli",
+                        )
+                original_status = PackageLifecycleJournal(
+                    state_root / "lifecycle.jsonl"
+                ).status(operation_id)
+                assert original_status is not None
+                assert original_status.phase == "transaction_pinned"
+                dependency_settlements = PackageStoreSettlementJournal(
+                    state_root / "dependency-settlements.jsonl"
+                )
+                (settled_dependency,) = dependency_settlements.records()
+                assert (
+                    PackageStoreSettlementJournal(
+                        state_root / "root-settlements.jsonl"
+                    ).records()
+                    == ()
+                )
+                recovered_lease = register_package_product_runtime_lease(
+                    registry,
+                    fence=fence,
+                    runtime_id="runtime:dependency-recovery",
+                    runtime_version="2.0.0",
+                    runtime_protocol_epoch=2,
+                )
+                try:
+                    recovered_session, recovered = open_session_runtime(
+                        recovered_lease, session_label="dependency-recovered"
+                    )
+                    recovered.activate()
+                    checkpoint = asyncio.run(
+                        recovered.inspect_staging_checkpoint(operation_id)
+                    )
+                    assert checkpoint.missing_node_ids == ("root",)
+                    assert len(checkpoint.receipts) == 1
+                    assert checkpoint.receipts[0] == settled_dependency.receipt
+                    with pytest.raises(PackageProductRebindLeaseReadError) as old_live:
+                        recovered.prepare_staging_adoption(
+                            operation_id, max_bytes=256 * 1024
+                        )
+                    assert old_live.value.code == "package_rebind_old_lease_active"
+                    assert not (state_root / "staging-admissions.jsonl").exists()
+                    asyncio.run(first_session.dispose())
+                    recovered.lifecycle.activate()
+                    dependency_tree = (
+                        state_root
+                        / "dependency-store"
+                        / f"artifact-{settled_dependency.receipt.stable_ref.ref_id}"
+                    )
+                    dependency_file = next(
+                        path for path in dependency_tree.rglob("*") if path.is_file()
+                    )
+                    original_dependency_file = dependency_file.read_bytes()
+                    dependency_file.write_bytes(b"tampered staged dependency")
+                    try:
+                        with pytest.raises(PackagePhysicalStagingError) as tampered:
+                            asyncio.run(
+                                recovered.inspect_staging_checkpoint(operation_id)
+                            )
+                        assert tampered.value.code == "package_publication_collision"
+                        assert not (state_root / "staging-admissions.jsonl").exists()
+                    finally:
+                        dependency_file.write_bytes(original_dependency_file)
+                    recovered.lifecycle.activate()
+                    dependency_source.write_bytes(b"changed dependency Source")
+                    try:
+                        with pytest.raises(PackageProductRebindSourceError) as drift:
+                            recovered.prepare_staging_adoption(
+                                operation_id, max_bytes=256 * 1024
+                            )
+                        assert drift.value.code == "package_source_digest_mismatch"
+                        assert not (state_root / "staging-admissions.jsonl").exists()
+                    finally:
+                        dependency_source.write_bytes(dependency_payload)
+                    recovered.lifecycle.activate()
+                    selected = recovered.prepare_staging_adoption(
+                        operation_id, max_bytes=256 * 1024
+                    )
+                    assert selected.decision.staging_checkpoint_id == (
+                        checkpoint.checkpoint_id
+                    )
+                    committed = recovered.execute_staging_adoption(
+                        operation_id, max_bytes=256 * 1024
+                    )
+                    assert (committed.phase, committed.disposition) == (
+                        "committed",
+                        "committed",
+                    )
+                    assert dependency_settlements.records() == (settled_dependency,)
+                    assert (
+                        len(
+                            PackageStoreSettlementJournal(
+                                state_root / "root-settlements.jsonl"
+                            ).records()
+                        )
+                        == 1
+                    )
+                    assert desired.snapshot().inventory_revision == 1
+                    asyncio.run(recovered_session.dispose())
+                finally:
+                    recovered_lease.release()
+                assert pre_b_tree() == frozen_pre_b_tree
+                return
+
+            committed_operation_id = "operation:product-runtime"
+            if entrypoint in {
+                "session",
+                "cli_transport",
+                "rpc_transport",
+                "gc",
+                "gc_crash",
+                "gc_tamper",
+                "gc_collision",
+                "gc_invalid_id",
+                "gc_prior_result",
+                "gc_command",
+                "gc_command_stale",
+                "gc_command_unsealed",
+                "gc_dependency",
+                "gc_dependency_failure",
+                "gc_dependency_repair_collision",
+            }:
+                from loushang.harness.package_product.product_runtime import (
+                    PackageProductRuntimeRequestV1,
+                )
+
+                session_manager = asyncio.run(
+                    SessionManager.new(
+                        session_dir=tmp_path / "sessions",
+                        cwd=str(workspace),
+                        persist=False,
+                    )
+                )
+                factory = PosixLocalWheelProductRuntimeFactory(
+                    expected_session_id=(session_manager.get_header().conversation_id),
+                    expected_cwd=workspace,
+                    state_root=state_root,
+                    plugin_store_root=plugin_root,
+                    policy=policy,
+                    environment=environment,
+                    acquisition_budgets=PackageAcquisitionBudgetV1(
+                        max_transport_bytes=256 * 1024,
+                        max_requests=1,
+                        max_redirects=0,
+                        max_wall_time_ms=1000,
+                    ),
+                    inspection_budgets=PackageInspectionBudgetV1(),
+                    closure_budgets=PackageClosureBudgetV1(),
+                    root_store_identity=root_store_identity,
+                    dependency_store_identity=dependency_store_identity,
+                    runtime_lease=runtime_lease,
+                    cutover_result=cutover_result,
+                    management=management,
+                    desired_state=desired,
+                    gc_bindings=bindings,
+                    gc_gate=gate,
+                    actor_id="product-runtime",
+                    desired_policy_revision="product-policy:1",
+                    recovery_identity="product-runtime-recovery",
+                )
+                with pytest.raises(ValueError, match="completed POSIX cutover"):
+                    replace(factory, cutover_result=None)  # type: ignore[arg-type]
+                for rejected_request in (
+                    PackageProductRuntimeRequestV1(
+                        product_id="other",
+                        session_id=session_manager.get_header().conversation_id,
+                        cwd=str(workspace),
+                    ),
+                    PackageProductRuntimeRequestV1(
+                        product_id="coding",
+                        session_id="foreign-session",
+                        cwd=str(workspace),
+                    ),
+                    PackageProductRuntimeRequestV1(
+                        product_id="coding",
+                        session_id=session_manager.get_header().conversation_id,
+                        cwd=str(source_root),
+                    ),
+                ):
+                    with pytest.raises(ValueError, match="identity changed"):
+                        factory.create(rejected_request)
+                moved_workspace = tmp_path / "moved-workspace"
+                workspace.rename(moved_workspace)
+                workspace.mkdir(mode=0o700)
+                try:
+                    with pytest.raises(ValueError, match="identity changed"):
+                        factory.create(
+                            PackageProductRuntimeRequestV1(
+                                product_id="coding",
+                                session_id=(
+                                    session_manager.get_header().conversation_id
+                                ),
+                                cwd=str(workspace),
+                            )
+                        )
+                finally:
+                    workspace.rmdir()
+                    moved_workspace.rename(workspace)
+                assert not (state_root / "lifecycle.jsonl").exists()
+                created = []
+
+                class ProductFactory:
+                    def create(self, request):
+                        binding = factory.create(request)
+                        created.append(binding)
+                        return binding
+
+                session = create_agent_session(
+                    session_manager=session_manager,
+                    model=Model(
+                        id="plc9b-test",
+                        name="PLC9B",
+                        provider="test",
+                        endpoint="anthropic-messages",
+                        capabilities=Capabilities(
+                            reasoning=True,
+                            input=("text",),
+                            context_window=128000,
+                            max_tokens=4096,
+                        ),
+                    ),
+                    services=create_services(
+                        settings_manager=SettingsManager(ControlConfig())
+                    ),
+                    package_product_runtime_factory=ProductFactory(),
+                    composition_set="coding-minimal",
+                    resource_catalog_source_policy=(
+                        CODING_READ_ONLY_AGENT_RESOURCE_CATALOG_SOURCE_POLICY
+                    ),
+                )
+                assert len(created) == 1
+                runtime = created[0]
+                if entrypoint == "session" and not with_dependency:
+                    with pytest.raises(ValueError, match="already used"):
+                        factory.create(
+                            PackageProductRuntimeRequestV1(
+                                product_id="coding",
+                                session_id=session_manager.get_header().conversation_id,
+                                cwd=str(workspace),
+                            )
+                        )
+                    factory.dispose_unbound_runtime()
+                    assert registry.snapshot(store_id=store_id).active_leases
+                activation = runtime.lifecycle
+                assert session._package_controller.get_package_materializer() is None
+                transport_journal = PackageLifecycleJournal(
+                    state_root / "lifecycle.jsonl"
+                )
+                refusal_codes = {
+                    "materialize": "package_route_unavailable",
+                    "update": "package_route_unavailable",
+                    "remove": "package_target_classification_indeterminate",
+                    "uninstall": "package_target_classification_indeterminate",
+                }
+
+                def assert_product_refusal(action: str, prior_count: int) -> None:
+                    new_records = transport_journal.records()[prior_count:]
+                    assert any(
+                        record.request.action == action
+                        and record.status.failure is not None
+                        and record.status.failure.code == refusal_codes[action]
+                        for record in new_records
+                    ), [
+                        (
+                            record.request.action,
+                            record.status.failure.code
+                            if record.status.failure is not None
+                            else None,
+                        )
+                        for record in new_records
+                    ]
+
+                if entrypoint == "cli_transport":
+                    cli_result = asyncio.run(
+                        run_package_lifecycle(
+                            session,
+                            PackageLifecycleRequest(
+                                install=(str(source),), scope="project"
+                            ),
+                        )
+                    )
+                    outcome = cli_result.outputs[0]["record"]
+                    assert isinstance(outcome, dict)
+                    committed_operation_id = str(outcome["operationId"])
+                    for action in ("materialize", "update", "remove", "uninstall"):
+                        prior_count = len(transport_journal.records())
+                        with pytest.raises(
+                            PackageLifecycleError, match=refusal_codes[action]
+                        ):
+                            asyncio.run(
+                                run_package_lifecycle(
+                                    session,
+                                    PackageLifecycleRequest(
+                                        **{action: (str(source),)}, scope="project"
+                                    ),
+                                )
+                            )
+                        assert_product_refusal(action, prior_count)
+                elif entrypoint == "rpc_transport":
+                    rpc_output = io.StringIO()
+                    rpc = RpcPackageCommands(
+                        runtime=object(),
+                        get_session=lambda: session,
+                        output=RpcOutput(rpc_output),
+                    )
+                    asyncio.run(
+                        dict(rpc.bindings())["install_package"](
+                            "request:product-runtime",
+                            {"source": str(source), "scope": "project"},
+                        )
+                    )
+                    response = json.loads(rpc_output.getvalue())
+                    assert response["success"] is True
+                    outcome = response["data"]["record"]
+                    committed_operation_id = str(outcome["operationId"])
+                    for command in (
+                        "materialize_package",
+                        "update_package",
+                        "remove_package",
+                        "uninstall_package",
+                    ):
+                        prior_count = len(transport_journal.records())
+                        asyncio.run(
+                            dict(rpc.bindings())[command](
+                                f"request:product-runtime:{command}",
+                                {"source": str(source), "scope": "project"},
+                            )
+                        )
+                        refusal = json.loads(rpc_output.getvalue().splitlines()[-1])
+                        assert refusal["command"] == command
+                        assert refusal["success"] is False
+                        assert_product_refusal(
+                            command.removesuffix("_package"), prior_count
+                        )
+                elif entrypoint == "session":
+                    outcome = asyncio.run(
+                        session.install_package(str(source), scope="project")
+                    )
+                    committed_operation_id = str(outcome["operationId"])
+                else:
+                    outcome = asyncio.run(
+                        session.execute_package_lifecycle(
+                            "install",
+                            str(source),
+                            entrypoint="session",
+                            operation_id="operation:product-runtime",
+                            scope="project",
+                        )
+                    )
+                assert outcome["lifecycle"] == "installed"
+                assert outcome["path"] == ""
+                if entrypoint == "session":
+                    rejected = (
+                        asyncio.run(session.materialize_package(str(source))),
+                        asyncio.run(session.update_package(str(source))),
+                        session.remove_package(str(source)),
+                        asyncio.run(
+                            session.uninstall_package_async(
+                                str(source), scope="project"
+                            )
+                        ),
+                    )
+                    assert all(item["lifecycle"] == "failed" for item in rejected)
+                    assert all(item["path"] == "" for item in rejected)
+                    legacy_refresh_checks = []
+
+                    def legacy_refresh_available() -> bool:
+                        legacy_refresh_checks.append(True)
+                        return False
+
+                    session._package_controller.supports_synchronous_refresh = (
+                        legacy_refresh_available
+                    )
+                    sync_refusal = session.uninstall_package(
+                        str(source), scope="project"
+                    )
+                    assert sync_refusal["lifecycle"] == "failed"
+                    assert sync_refusal["errorCode"] == (
+                        "package_target_classification_indeterminate"
+                    )
+                    assert legacy_refresh_checks == []
+                refused_by_session = asyncio.run(
+                    session.execute_package_lifecycle(
+                        "install",
+                        "https://packages.example.test/unknown.whl",
+                        entrypoint="rpc",
+                        operation_id="operation:session-refused",
+                        scope="project",
+                    )
+                )
+                assert refused_by_session["lifecycle"] == "failed"
+                assert refused_by_session["path"] == ""
+                assert desired.snapshot().inventory_revision == 1
+            elif entrypoint == "startup":
+                runtime = compose()
+                activation = runtime.lifecycle
+                runtime.activate()
+
+                class Settings:
+                    def get_project_settings(self) -> dict[str, object]:
+                        return {"packages": [str(source)]}
+
+                    def get_global_settings(self) -> dict[str, object]:
+                        return {}
+
+                    def get_session_settings(self) -> dict[str, object]:
+                        return {}
+
+                committed_operation_id = sha256(
+                    f"startup:product-runtime:project:{source}".encode()
+                ).hexdigest()
+                resolved = PackageSourceResolver(
+                    settings_manager=Settings(),
+                    materializer=None,
+                    session_id="product-runtime",
+                    product_lifecycle=activation,
+                    product_lifecycle_mode="enforced",
+                ).resolve_configured_sources_sync()
+                assert len(resolved.records) == 1
+                assert resolved.records[0].lifecycle == "installed"
+            else:
+                runtime = compose()
+                activation = runtime.lifecycle
+                runtime.activate()
+                direct_outcome = activation.route(
+                    PackageProductLifecycleIntentV1(
+                        operation_id="operation:product-runtime",
+                        action="install",
+                        source=str(source),
+                        scope="project",
+                    ),
+                    entrypoint="cli",
+                )
+                assert direct_outcome.handled
+                assert direct_outcome.record is not None
+                assert direct_outcome.record.lifecycle == "installed"
+            assert desired.snapshot().inventory_revision == 1
+            committed_set = PackageCommittedSetJournal(
+                state_root / "committed-sets.jsonl"
+            ).current(committed_operation_id)
+            assert committed_set is not None
+            from loushang.harness.resources.packages.product_admission_binding import (
+                PackageProductAdmissionBindingJournal,
+            )
+
+            original_admission = PackageProductAdmissionBindingJournal(
+                state_root / "admission-bindings.jsonl"
+            ).read_binding(committed_operation_id)
+            assert original_admission is not None
+            assert original_admission.admission.request.admission_request_id == (
+                admission_request.admission_request_id
+            )
+            assert original_admission.admission.request.lease_id == (
+                admission_request.lease_id
+            )
+            assert len(committed_set.committed_set.dependency_refs) == int(
+                with_dependency
+            )
+            if entrypoint == "gc_dependency_versions":
+                updated = activation.route(
+                    PackageProductLifecycleIntentV1(
+                        operation_id="operation:product-dependency-v2",
+                        action="update",
+                        source=str(versioned_source),
+                        scope="project",
+                    ),
+                    entrypoint="cli",
+                )
+                assert updated.handled
+                assert updated.record is not None
+                assert updated.record.failure_code == "package_route_unavailable"
+                assert desired.snapshot().inventory_revision == 1
+                assert (
+                    len(
+                        PackageCommittedSetJournal(
+                            state_root / "committed-sets.jsonl"
+                        ).records()
+                    )
+                    == 1
+                )
+                assert (
+                    len(
+                        PackageStoreSettlementJournal(
+                            state_root / "dependency-settlements.jsonl"
+                        ).records()
+                    )
+                    == 1
+                )
+                return
+            if entrypoint == "gc_dependency_shared":
+                second_install = activation.route(
+                    PackageProductLifecycleIntentV1(
+                        operation_id="operation:product-shared-second",
+                        action="install",
+                        source=str(shared_source),
+                        scope="project",
+                    ),
+                    entrypoint="cli",
+                )
+                assert second_install.record is not None
+                assert second_install.record.disposition == "committed", (
+                    second_install.record.failure_code
+                )
+                runtime.dispose_runtime()
+                runtime_lease.release()
+                runtime_lease_released = True
+                _assert_posix_product_shared_dependency_gc(
+                    workspace=workspace,
+                    state_root=state_root,
+                    plugin_root=plugin_root,
+                    policy=policy,
+                    environment=environment,
+                    root_store_identity=root_store_identity,
+                    dependency_store_identity=dependency_store_identity,
+                    epoch_runtime=epoch_runtime,
+                    management=management,
+                    desired=desired,
+                    bindings=bindings,
+                    gate=gate,
+                )
+                return
+            inventory = runtime.inventory
+            targets = inventory.list_update_targets(scope="project")
+            assert tuple(target.source for target in targets) == (str(source),)
+            update_manifest = inventory.bind_update_targets(
+                operation_id="operation:product-update-all",
+                scope="project",
+                targets=targets,
+            )
+            assert update_manifest.target_refs == (targets[0].target_ref,)
+            assert (
+                inventory.bind_update_targets(
+                    operation_id="operation:product-update-all",
+                    scope="project",
+                    targets=targets,
+                )
+                == update_manifest
+            )
+            checks = asyncio.run(
+                inventory.check_updates(
+                    request=PackageProductUpdateCheckRequestV1(
+                        operation_id="operation:product-check-updates",
+                        entrypoint="rpc",
+                        scope="project",
+                    )
+                )
+            )
+            assert len(checks) == 1
+            assert checks[0].target_ref == targets[0].target_ref
+            assert not checks[0].update_available
+            assert checks[0].failure_code is None
+
+            def forbidden_legacy(*_args: object, **_kwargs: object) -> None:
+                raise AssertionError("Plugin operation reached a legacy Package effect")
+
+            operations = PackageOperationsRuntime(
+                get_materializer=forbidden_legacy,
+                add_source=forbidden_legacy,
+                remove_source=forbidden_legacy,
+                refresh_resources=forbidden_legacy,
+                product_lifecycle=runtime.lifecycle,
+                product_inventory=runtime.inventory,
+                product_lifecycle_mode=runtime.mode,
+            )
+            refused_operation = asyncio.run(
+                operations.install(
+                    "https://packages.example.test/unknown.whl",
+                    scope="project",
+                    entrypoint="rpc",
+                    operation_id="operation:product-operations-refused",
+                )
+            )
+            assert refused_operation.lifecycle == "failed"
+            assert desired.snapshot().inventory_revision == 1
+            restarted_inventory = PackageProductLocalWheelInventory(
+                binding_id=activation.binding_id,
+                policy=policy,
+                desired_state=desired,
+                committed_sets=PackageCommittedSetJournal(
+                    state_root / "committed-sets.jsonl"
+                ),
+                manifest_path=state_root / "update-manifests.jsonl",
+            )
+            assert (
+                restarted_inventory.bind_update_targets(
+                    operation_id="operation:product-update-all",
+                    scope="project",
+                    targets=targets,
+                )
+                == update_manifest
+            )
+            unknown_inventory = PackageProductLocalWheelInventory(
+                binding_id=activation.binding_id,
+                policy=replace(policy, bindings=()),
+                desired_state=desired,
+                committed_sets=PackageCommittedSetJournal(
+                    state_root / "committed-sets.jsonl"
+                ),
+                manifest_path=state_root / "unknown-update-manifests.jsonl",
+            )
+            unknown_checks = asyncio.run(
+                unknown_inventory.check_updates(
+                    request=PackageProductUpdateCheckRequestV1(
+                        operation_id="operation:unknown-check",
+                        entrypoint="session",
+                        scope="project",
+                    )
+                )
+            )
+            assert unknown_checks[0].failure_code == "package_update_source_unavailable"
+            changed_root_policy = replace(
+                policy,
+                bindings=(replace(policy.bindings[0], artifact_digest="f" * 64),),
+            )
+            changed_root_inventory = PackageProductLocalWheelInventory(
+                binding_id=activation.binding_id,
+                policy=changed_root_policy,
+                desired_state=desired,
+                committed_sets=PackageCommittedSetJournal(
+                    state_root / "committed-sets.jsonl"
+                ),
+                manifest_path=state_root / "changed-update-manifests.jsonl",
+            )
+            changed_root_checks = asyncio.run(
+                changed_root_inventory.check_updates(
+                    request=PackageProductUpdateCheckRequestV1(
+                        operation_id="operation:changed-root-check",
+                        entrypoint="rpc",
+                        scope="project",
+                    )
+                )
+            )
+            assert changed_root_checks[0].update_available
+            if with_dependency:
+                changed_dependency_inventory = PackageProductLocalWheelInventory(
+                    binding_id=activation.binding_id,
+                    policy=replace(
+                        policy,
+                        dependencies=(
+                            replace(policy.dependencies[0], artifact_digest="f" * 64),
+                        ),
+                    ),
+                    desired_state=desired,
+                    committed_sets=PackageCommittedSetJournal(
+                        state_root / "committed-sets.jsonl"
+                    ),
+                    manifest_path=state_root / "changed-dependency-manifests.jsonl",
+                )
+                changed_dependency_checks = asyncio.run(
+                    changed_dependency_inventory.check_updates(
+                        request=PackageProductUpdateCheckRequestV1(
+                            operation_id="operation:changed-dependency-check",
+                            entrypoint="rpc",
+                            scope="project",
+                        )
+                    )
+                )
+                assert changed_dependency_checks[0].update_available
+            lifecycle_journal = PackageLifecycleJournal(state_root / "lifecycle.jsonl")
+            before_restart = lifecycle_journal.records()
+            restarted = compose()
+            restarted.activate()
+            assert restarted.binding_id == runtime.binding_id
+            assert lifecycle_journal.records() == before_restart
+            assert desired.snapshot().inventory_revision == 1
+            foreign_desired = PluginDesiredStateLedger(
+                tmp_path / "foreign-product-desired.jsonl", gc_gate=gate
+            )
+            with pytest.raises(ValueError, match="Product owner"):
+                compose(foreign_desired)
+            assert lifecycle_journal.records() == before_restart
+            for refused_entrypoint, source_value in (
+                ("rpc", "https://packages.example.test/unknown.whl"),
+                ("direct_materializer", str(source)),
+            ):
+                refused = activation.route(
+                    PackageProductLifecycleIntentV1(
+                        operation_id=f"operation:refused:{refused_entrypoint}",
+                        action="install",
+                        source=source_value,
+                        scope="project",
+                    ),
+                    entrypoint=refused_entrypoint,
+                )
+                assert refused.handled
+                assert refused.record is not None
+                assert refused.record.lifecycle == "failed"
+            assert desired.snapshot().inventory_revision == 1
+            if entrypoint in {
+                "gc",
+                "gc_crash",
+                "gc_tamper",
+                "gc_collision",
+                "gc_invalid_id",
+                "gc_prior_result",
+                "gc_command",
+                "gc_command_stale",
+                "gc_command_unsealed",
+                "gc_dependency",
+                "gc_dependency_failure",
+                "gc_dependency_repair_collision",
+            }:
+                from loushang.harness.plugin_management.application import (
+                    PluginManagementQueryV1,
+                    PluginManagementReadModelProjector,
+                )
+
+                private_data = state_root / "plugin-private-data"
+                private_data.mkdir(mode=0o700)
+                private_marker = private_data / "user-state.txt"
+                private_marker.write_bytes(b"must survive Package removal and GC")
+                installation_key = desired.snapshot().installations[0].installation_key
+                if entrypoint in {
+                    "gc_dependency",
+                    "gc_dependency_failure",
+                    "gc_dependency_repair_collision",
+                }:
+                    assert session is not None
+                    asyncio.run(session.dispose())
+                    session = None
+                    runtime_lease.release()
+                    runtime_lease_released = True
+                    _assert_posix_product_dependency_gc_after_install(
+                        workspace=workspace,
+                        state_root=state_root,
+                        plugin_root=plugin_root,
+                        policy=policy,
+                        environment=environment,
+                        root_store_identity=root_store_identity,
+                        dependency_store_identity=dependency_store_identity,
+                        epoch_runtime=epoch_runtime,
+                        management=management,
+                        desired=desired,
+                        bindings=bindings,
+                        gate=gate,
+                        first_store_failure=entrypoint
+                        in {"gc_dependency_failure", "gc_dependency_repair_collision"},
+                        repair_store_failure=(
+                            entrypoint == "gc_dependency_repair_collision"
+                        ),
+                    )
+                else:
+                    _assert_product_root_gc_after_install(
+                        tmp_path=tmp_path,
+                        state_root=state_root,
+                        plugin_root=plugin_root,
+                        store_id=store_id,
+                        management=management,
+                        desired=desired,
+                        bindings=bindings,
+                        gate=gate,
+                        with_dependency=with_dependency,
+                        crash_after_delete=entrypoint == "gc_crash",
+                        drop_store_tombstone=entrypoint == "gc_tamper",
+                        collide_before_delete=entrypoint == "gc_collision",
+                        invalid_attempt_id=entrypoint == "gc_invalid_id",
+                        prior_result_conflict=entrypoint == "gc_prior_result",
+                        via_product_command=entrypoint
+                        in {
+                            "gc_command",
+                            "gc_command_stale",
+                            "gc_command_unsealed",
+                        },
+                        stale_product_command=entrypoint == "gc_command_stale",
+                        unsealed_product_command=entrypoint == "gc_command_unsealed",
+                    )
+                assert private_marker.read_bytes() == (
+                    b"must survive Package removal and GC"
+                )
+                projection = PluginManagementReadModelProjector(
+                    desired_state=desired,
+                    operations=management,
+                ).snapshot(
+                    PluginManagementQueryV1(
+                        correlation_id="gc-separate-data-and-backup",
+                        product_id=installation_key.product_id,
+                        installation_scope=installation_key.installation_scope,
+                        scope_id=installation_key.scope_id,
+                        plugin_ids=(installation_key.plugin_id,),
+                    )
+                )
+                assert {"backup_retention", "private_data"} <= set(
+                    projection.owner_revisions.unsupported_dimensions
+                )
+                assert len(projection.installations) == 1
+                assert projection.installations[0].desired_state == "absent"
+                return
+            expected_inventory_revision = 1
+            if entrypoint == "session" and not with_dependency:
+                from loushang.harness.plugin_management.operations import (
+                    PluginManagementCommandV1,
+                )
+                from loushang.harness.plugin_management.package_product import (
+                    PackageProductRuntimeReadError,
+                    PackageProductSelectedRootReader,
+                )
+                from loushang.harness.plugin_management.records import (
+                    PluginDesiredStateMutationV1,
+                    PluginInstallationKeyV1,
+                )
+
+                (selected,) = desired.snapshot().installations
+                key = selected.installation_key
+                root_settlements = PackageStoreSettlementJournal(
+                    state_root / "root-settlements.jsonl"
+                )
+                root_store = PosixPackagePluginRootMaterializationStore(
+                    plugin_root,
+                    store_identity=root_store_identity,
+                    package_store_id=store_id,
+                    settlement_journal=root_settlements,
+                )
+                with pytest.raises(PackageProductRuntimeReadError) as disabled:
+                    runtime.read_selected_plugin_file(
+                        key, "coding_base/plugin.json", max_bytes=4096
+                    )
+                assert disabled.value.code == "package_product_root_not_selected"
+                with pytest.raises(PackageProductRuntimeReadError) as disabled_batch:
+                    runtime.read_selected_plugin_files(
+                        key, ("coding_base/plugin.json",), max_total_bytes=4096
+                    )
+                assert disabled_batch.value.code == "package_product_root_not_selected"
+                with pytest.raises(PackageProductRuntimeReadError) as disabled_capture:
+                    runtime.capture_selected_plugin_root(
+                        key, max_files=64, max_total_bytes=1024 * 1024
+                    )
+                assert (
+                    disabled_capture.value.code == "package_product_root_not_selected"
+                )
+                with pytest.raises(PackageProductRuntimeReadError) as disabled_manifest:
+                    runtime.capture_selected_plugin_manifest(
+                        key, max_files=64, max_total_bytes=1024 * 1024
+                    )
+                assert (
+                    disabled_manifest.value.code == "package_product_root_not_selected"
+                )
+                enabled = management.submit(
+                    PluginManagementCommandV1(
+                        action="enable",
+                        mutation=PluginDesiredStateMutationV1(
+                            operation_id="operation:product-read-enable",
+                            idempotency_key="request:product-read-enable",
+                            expected_inventory_revision=1,
+                            installation_key=key,
+                            desired_state="installed_enabled",
+                            package_revision=None,
+                            actor_id="product-runtime",
+                            policy_revision="product-policy:1",
+                        ),
+                    )
+                )
+                assert enabled.result is not None
+                assert enabled.result.disposition == "succeeded"
+                expected_inventory_revision = 2
+                for logical_path in (
+                    "coding_base/plugin.json",
+                    "coding_base/declarations/plugin.json",
+                    "coding_base/prompts/standard.md",
+                    "coding_base/skills/standard/SKILL.md",
+                ):
+                    assert (
+                        runtime.read_selected_plugin_file(
+                            key, logical_path, max_bytes=64 * 1024
+                        )
+                        == base_files[logical_path]
+                    )
+                selected_paths = (
+                    "coding_base/plugin.json",
+                    "coding_base/declarations/plugin.json",
+                    "coding_base/prompts/standard.md",
+                    "coding_base/skills/standard/SKILL.md",
+                )
+                assert runtime.read_selected_plugin_files(
+                    key, selected_paths, max_total_bytes=64 * 1024
+                ) == tuple(base_files[path] for path in selected_paths)
+                captured = runtime.capture_selected_plugin_root(
+                    key, max_files=64, max_total_bytes=1024 * 1024
+                )
+                assert captured.installation_key == key
+                assert (
+                    captured.instance_revision_ref
+                    == desired.snapshot()
+                    .installation(key)
+                    .selection.instance_revision_ref
+                )
+                assert (
+                    captured.root_ref.artifact_digest
+                    == captured.package_revision.package_content_digest
+                )
+                assert (
+                    captured.committed_record.committed_set.root_ref
+                    == captured.root_ref
+                )
+                assert tuple(path for path, _ in captured.files) == tuple(
+                    entry.logical_path for entry in captured.manifest.entries
+                )
+                assert all(
+                    dict(captured.files)[path] == body
+                    for path, body in base_files.items()
+                )
+                from loushang.harness.resources.packages.plugin_lifecycle.posix_materialization import (
+                    PosixPackagePluginRootReadOnlyStore,
+                )
+
+                owner_files_before = tuple(
+                    sorted(
+                        (str(path.relative_to(state_root)), path.read_bytes())
+                        for path in state_root.rglob("*")
+                        if path.is_file()
+                    )
+                )
+                read_only_reader = PackageProductSelectedRootReader(
+                    product_id=policy.product_id,
+                    scope_id=policy.project_scope_id,
+                    installation_scope="workspace",
+                    desired_state=desired,
+                    bindings=PluginPackageGcBindingJournal(bindings.path),
+                    committed_sets=PackageCommittedSetJournal(
+                        state_root / "committed-sets.jsonl"
+                    ),
+                    root_settlements=root_settlements,
+                    root_store=PosixPackagePluginRootReadOnlyStore(
+                        plugin_root,
+                        store_identity=root_store_identity,
+                        settlement_journal=root_settlements,
+                    ),
+                    gc_gate=gate,
+                )
+                assert (
+                    read_only_reader.capture_selected_root_read_only(
+                        key, max_files=64, max_total_bytes=1024 * 1024
+                    )
+                    == captured
+                )
+                from loushang.harness.package_product.product_local_wheel_runtime import (
+                    _LocalWheelSelectedManifestReader,
+                )
+
+                preview_manifest = _LocalWheelSelectedManifestReader(
+                    policy=policy, root_reader=read_only_reader, read_only=True
+                ).capture_selected_manifest(
+                    key, max_files=64, max_total_bytes=1024 * 1024
+                )
+                assert preview_manifest.snapshot == captured
+                assert preview_manifest.verified_manifest().name == "coding.base"
+                with pytest.raises(TypeError, match="read-only owners"):
+                    runtime._selected_root_reader.capture_selected_root_read_only(
+                        key, max_files=64, max_total_bytes=1024 * 1024
+                    )
+                with pytest.raises(PackageProductRuntimeReadError) as wrong_scope:
+                    read_only_reader.capture_selected_root_read_only(
+                        replace(key, scope_id="workspace:foreign"),
+                        max_files=64,
+                        max_total_bytes=1024 * 1024,
+                    )
+                assert wrong_scope.value.code == "package_product_root_scope_changed"
+                assert owner_files_before == tuple(
+                    sorted(
+                        (str(path.relative_to(state_root)), path.read_bytes())
+                        for path in state_root.rglob("*")
+                        if path.is_file()
+                    )
+                )
+                selected_manifest = runtime.capture_selected_plugin_manifest(
+                    key, max_files=64, max_total_bytes=1024 * 1024
+                )
+                assert (
+                    runtime.capture_selected_plugin_manifest_for(
+                        "coding.base", max_files=64, max_total_bytes=1024 * 1024
+                    )
+                    == selected_manifest
+                )
+                runtime.assert_selected_plugin_manifest_current(selected_manifest)
+                with pytest.raises(PackageProductRuntimeReadError):
+                    runtime.capture_selected_plugin_manifest_for(
+                        "coding.absent", max_files=64, max_total_bytes=1024 * 1024
+                    )
+                assert selected_manifest.snapshot == captured
+                product_coding_manager = asyncio.run(
+                    SessionManager.new(
+                        session_dir=tmp_path / "product-coding-startup",
+                        cwd=str(workspace),
+                        persist=False,
+                    )
+                )
+                product_coding_lease = register_package_product_runtime_lease(
+                    registry,
+                    fence=fence,
+                    runtime_id="runtime:product-coding-startup",
+                    runtime_version="2.0.0",
+                    runtime_protocol_epoch=2,
+                )
+                product_coding_factory = replace(
+                    factory,
+                    expected_session_id=(
+                        product_coding_manager.get_header().conversation_id
+                    ),
+                    runtime_lease=product_coding_lease,
+                )
+                product_coding_session = None
+                try:
+                    with (
+                        patch(
+                            "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                            side_effect=AssertionError("legacy coding.base assembly"),
+                        ),
+                        patch(
+                            "loushang.coding.bootstrap._default_package_materializer",
+                            side_effect=AssertionError("legacy package materializer"),
+                        ),
+                    ):
+                        product_coding_session = create_agent_session(
+                            session_manager=product_coding_manager,
+                            model=Model(
+                                id="plc9b-product-coding",
+                                name="PLC9B Product Coding",
+                                provider="test",
+                                endpoint="anthropic-messages",
+                                capabilities=Capabilities(
+                                    reasoning=True,
+                                    input=("text",),
+                                    context_window=128000,
+                                    max_tokens=4096,
+                                ),
+                            ),
+                            services=create_services(
+                                settings_manager=SettingsManager(
+                                    ControlConfig(
+                                        capabilities={"coding.lsp": "disabled"}
+                                    )
+                                )
+                            ),
+                            package_product_runtime_factory=product_coding_factory,
+                            composition_set="coding-standard",
+                        )
+                    asyncio.run(product_coding_session.prepare_model_call_runtime())
+                    native_skill = workspace / "skills" / "review" / "SKILL.md"
+                    native_skill.parent.mkdir(parents=True)
+                    native_skill.write_text(
+                        "---\nname: review\ndescription: Local review\n---\nLocal review.\n",
+                        encoding="utf-8",
+                    )
+                    asyncio.run(product_coding_session.refresh_resources())
+                    assert "review" in {
+                        item.name
+                        for item in product_coding_session.list_skill_statuses()
+                    }
+                    native_skill.unlink()
+                    assert (
+                        product_coding_session._package_controller.get_package_materializer()
+                        is None
+                    )
+                    assert {
+                        tool.name
+                        for tool in product_coding_session._composition.tool_controller.get_all_tools()
+                    } == {"bash", "edit", "find", "grep", "ls", "read", "write"}
+                    assert "changelog" in {
+                        command.name
+                        for command in product_coding_session.list_commands()
+                    }
+                    assert "skill:standard" in {
+                        command.name
+                        for command in product_coding_session.list_commands()
+                    }
+                    from loushang.apphost import (
+                        SessionBindingKeyV1,
+                        SessionCreateIntentV1,
+                        SessionCreateRequestV1,
+                    )
+                    from loushang.appserver.protocol import SessionScopeV1
+                    from loushang.coding.hosted_catalog import (
+                        CODING_HOSTED_COMPATIBILITY_ID,
+                        CodingHostedScopeV1,
+                        CodingHostedSessionCatalogV1,
+                    )
+                    from loushang.coding.hosted_session import (
+                        CodingRealHostedSessionFactoryV1,
+                    )
+
+                    hosted_product_owner = product_runtime_owner
+
+                    async def product_hosted_session() -> None:
+                        hosted_scope = CodingHostedScopeV1(
+                            SessionScopeV1.CWD,
+                            tmp_path / "product-hosted-sessions",
+                            workspace,
+                        )
+                        catalog = CodingHostedSessionCatalogV1((hosted_scope,))
+                        candidate = await catalog.create_candidate(
+                            SessionCreateIntentV1(
+                                SessionCreateRequestV1(
+                                    "coding",
+                                    hosted_scope.fingerprint,
+                                    "b" * 32,
+                                    requested_continuity_id="product-hosted",
+                                    requested_scope=hosted_scope.discovery_scope,
+                                ),
+                                CODING_HOSTED_COMPATIBILITY_ID,
+                            )
+                        )
+                        claimed = await candidate.claim()
+                        identity = claimed.opaque_binding.record.identity
+                        prior_leases = len(
+                            registry.snapshot(store_id=store_id).active_leases
+                        )
+
+                        hosted_factory = CodingRealHostedSessionFactoryV1(
+                            services_factory=lambda _cwd: create_services(
+                                settings_manager=SettingsManager(
+                                    ControlConfig(
+                                        capabilities={"coding.lsp": "disabled"}
+                                    )
+                                )
+                            ),
+                            model=Model(
+                                id="plc9b-product-hosted",
+                                name="PLC9B Product Hosted",
+                                provider="test",
+                                endpoint="anthropic-messages",
+                                capabilities=Capabilities(
+                                    input=("text",),
+                                    context_window=128000,
+                                    max_tokens=4096,
+                                ),
+                            ),
+                            tools=[],
+                        )
+                        hosted = None
+                        try:
+                            with (
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                                    side_effect=AssertionError(
+                                        "legacy coding.base assembly"
+                                    ),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap._default_package_materializer",
+                                    side_effect=AssertionError(
+                                        "legacy package materializer"
+                                    ),
+                                ),
+                                patch(
+                                    "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                                    return_value=legacy_layout,
+                                ),
+                                patch(
+                                    "loushang.coding.package_product_runtime.version",
+                                    return_value="2.0.0",
+                                ),
+                            ):
+                                hosted = await hosted_factory.create_session(
+                                    binding_key=SessionBindingKeyV1(
+                                        identity.product_id,
+                                        identity.continuity_id,
+                                        identity.session_id,
+                                    ),
+                                    opaque_session_binding=claimed.opaque_binding,
+                                )
+                            assert (
+                                len(hosted_factory._product_owner_selection._owners)
+                                == 1
+                            )
+                            assert (
+                                hosted.control._package_controller.get_package_materializer()
+                                is None
+                            )
+                            assert any(
+                                command.name == "standard"
+                                and command.source == "prompt"
+                                for command in hosted.control.list_commands()
+                            )
+                            await hosted.control.prepare_model_call_runtime()
+                            assert "skill:standard" in {
+                                command.name
+                                for command in hosted.control.list_commands()
+                            }
+                        finally:
+                            if hosted is not None:
+                                await hosted.close()
+                            await claimed.close()
+                            await candidate.close()
+                            await hosted_factory.close()
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_leases
+                        )
+
+                    asyncio.run(product_hosted_session())
+                    foreign_workspace = tmp_path / "foreign-product-hosted-workspace"
+                    foreign_workspace.mkdir(mode=0o700)
+                    foreign_manager = asyncio.run(
+                        SessionManager.new(
+                            session_dir=tmp_path / "foreign-product-hosted-sessions",
+                            cwd=str(foreign_workspace),
+                            persist=False,
+                        )
+                    )
+                    prior_leases = len(
+                        registry.snapshot(store_id=store_id).active_leases
+                    )
+                    with pytest.raises(ValueError, match="workspace changed"):
+                        hosted_product_owner.factory_for_session(foreign_manager)
+                    assert (
+                        len(registry.snapshot(store_id=store_id).active_leases)
+                        == prior_leases
+                    )
+                    moved_workspace = tmp_path / "moved-product-hosted-workspace"
+                    workspace.rename(moved_workspace)
+                    workspace.mkdir(mode=0o700)
+                    try:
+                        with pytest.raises(ValueError, match="identity changed"):
+                            hosted_product_owner.factory_for_session(
+                                product_coding_manager
+                            )
+                    finally:
+                        workspace.rmdir()
+                        moved_workspace.rename(workspace)
+                    assert (
+                        len(registry.snapshot(store_id=store_id).active_leases)
+                        == prior_leases
+                    )
+                    failed_manager = asyncio.run(
+                        SessionManager.new(
+                            session_dir=tmp_path / "failed-product-hosted-sessions",
+                            cwd=str(workspace),
+                            persist=False,
+                        )
+                    )
+                    with patch(
+                        "loushang.harness.package_product.product_local_wheel_runtime.PosixLocalWheelProductRuntimeFactory",
+                        side_effect=RuntimeError("factory construction failed"),
+                    ):
+                        with pytest.raises(
+                            RuntimeError, match="factory construction failed"
+                        ):
+                            hosted_product_owner.factory_for_session(failed_manager)
+                    assert (
+                        len(registry.snapshot(store_id=store_id).active_leases)
+                        == prior_leases
+                    )
+                    moved_control = tmp_path / "moved-product-hosted-control"
+                    control_root.rename(moved_control)
+                    control_root.mkdir(mode=0o700)
+                    try:
+                        with pytest.raises(ValueError, match="control root changed"):
+                            hosted_product_owner.factory_for_session(failed_manager)
+                    finally:
+                        control_root.rmdir()
+                        moved_control.rename(control_root)
+                    assert (
+                        len(registry.snapshot(store_id=store_id).active_leases)
+                        == prior_leases
+                    )
+                    pending_factory = hosted_product_owner.factory_for_session(
+                        failed_manager
+                    )
+                    control_root.rename(moved_control)
+                    control_root.mkdir(mode=0o700)
+                    try:
+                        with pytest.raises(ValueError, match="control root changed"):
+                            pending_factory.create(
+                                PackageProductRuntimeRequestV1(
+                                    product_id="coding",
+                                    session_id=failed_manager.get_header().conversation_id,
+                                    cwd=str(workspace),
+                                )
+                            )
+                    finally:
+                        control_root.rmdir()
+                        moved_control.rename(control_root)
+                        pending_factory.dispose_unbound_runtime()
+                    assert (
+                        len(registry.snapshot(store_id=store_id).active_leases)
+                        == prior_leases
+                    )
+                    disabled_again = management.submit(
+                        PluginManagementCommandV1(
+                            action="disable",
+                            mutation=PluginDesiredStateMutationV1(
+                                operation_id="operation:product-session-disable",
+                                idempotency_key="request:product-session-disable",
+                                expected_inventory_revision=2,
+                                installation_key=key,
+                                desired_state="installed_disabled",
+                                package_revision=None,
+                                actor_id="product-runtime",
+                                policy_revision="product-policy:1",
+                            ),
+                        )
+                    )
+                    assert disabled_again.result is not None
+                    assert disabled_again.result.disposition == "succeeded"
+                    with pytest.raises(PackageProductRuntimeReadError) as disabled_pin:
+                        runtime.assert_selected_plugin_manifest_current(
+                            selected_manifest
+                        )
+                    assert (
+                        disabled_pin.value.code == "package_product_root_not_selected"
+                    )
+                    with pytest.raises(CodingBasePluginAssemblyError) as disabled_call:
+                        asyncio.run(product_coding_session.prepare_model_call_runtime())
+                    assert (
+                        disabled_call.value.code
+                        == "coding_base_product_restart_required"
+                    )
+                    enabled_again = management.submit(
+                        PluginManagementCommandV1(
+                            action="enable",
+                            mutation=PluginDesiredStateMutationV1(
+                                operation_id="operation:product-session-enable",
+                                idempotency_key="request:product-session-enable",
+                                expected_inventory_revision=3,
+                                installation_key=key,
+                                desired_state="installed_enabled",
+                                package_revision=None,
+                                actor_id="product-runtime",
+                                policy_revision="product-policy:1",
+                            ),
+                        )
+                    )
+                    assert enabled_again.result is not None
+                    assert enabled_again.result.disposition == "succeeded"
+                    with pytest.raises(PackageProductRuntimeReadError) as stale_pin:
+                        runtime.assert_selected_plugin_manifest_current(
+                            selected_manifest
+                        )
+                    assert (
+                        stale_pin.value.code == "package_product_root_selection_changed"
+                    )
+                    with pytest.raises(CodingBasePluginAssemblyError) as stale_call:
+                        asyncio.run(product_coding_session.prepare_model_call_runtime())
+                    assert (
+                        stale_call.value.code == "coding_base_product_restart_required"
+                    )
+                    with pytest.raises(
+                        CodingResourceCatalogAdmissionError
+                    ) as stale_refresh:
+                        asyncio.run(product_coding_session.refresh_resources())
+                    assert "product_selected_base_refresh_requires_restart" in str(
+                        stale_refresh.value
+                    )
+                    expected_inventory_revision = 4
+                finally:
+                    if product_coding_session is not None:
+                        asyncio.run(product_coding_session.dispose())
+                    else:
+                        product_coding_lease.release()
+                assert tuple(
+                    path for path, _ in selected_manifest.declaration_documents
+                ) == ("coding_base/declarations/plugin.json",)
+                assert tuple(
+                    declaration.contribution_id
+                    for _, document in selected_manifest.declaration_documents
+                    for declaration in document.declarations
+                ) == (
+                    "coding.builtin",
+                    "coding.builtin.windows",
+                    "coding.standard",
+                    "prompt-standard",
+                    "skill-standard",
+                )
+                assert tuple(
+                    reservation.contribution_id
+                    for reservation, declaration in (
+                        selected_manifest.verified_data_only_declarations()
+                    )
+                    if declaration.reservation_fingerprint == reservation.fingerprint
+                ) == (
+                    "coding.builtin",
+                    "coding.builtin.windows",
+                    "coding.standard",
+                    "prompt-standard",
+                    "skill-standard",
+                )
+                from loushang.harness.environment import LocalHostEnvironmentProbe
+                from loushang.harness.resources.plugins.selection import (
+                    PluginContributionRef,
+                )
+
+                trust = selected_manifest.source_trust_snapshot
+                assert trust is not None
+                assert trust.source_trust_policy_revision == policy.authority_revision
+                base_plan, base_tool, base_tools = prepare_coding_base_product_plan(
+                    selected_manifest,
+                    resolve_coding_composition_set("coding-standard"),
+                    installation_key=key,
+                    session_id=session_manager.get_header().conversation_id,
+                    host_environment=LocalHostEnvironmentProbe().detect(),
+                )
+                assert base_plan.context.instance_revision_refs == (
+                    captured.instance_revision_ref,
+                )
+                assert captured.committed_record.committed_set.set_id in (
+                    base_plan.context.policy_revision
+                )
+                assert base_plan.source_trust_snapshots == (trust,)
+                assert base_plan.selected_contributions == (
+                    PluginContributionRef("coding.base", "coding.builtin"),
+                    PluginContributionRef("coding.base", "coding.standard"),
+                    PluginContributionRef("coding.base", "prompt-standard"),
+                    PluginContributionRef("coding.base", "skill-standard"),
+                )
+                assert base_tool == "coding.builtin"
+                assert base_tools
+                compiled_base = compile_coding_base_product_selection(
+                    selected_manifest,
+                    resolve_coding_composition_set("coding-standard"),
+                    installation_key=key,
+                    session_id=session_manager.get_header().conversation_id,
+                    host_environment=LocalHostEnvironmentProbe().detect(),
+                    evaluated_at=1,
+                )
+                assert compiled_base.plan == base_plan
+                assert compiled_base.tool_contribution_id == base_tool
+                from loushang.harness.tools.workspace.factory import ToolsOptions
+
+                product_owners = compiled_base.build_owners(
+                    clock=lambda: 1,
+                    tool_options=ToolsOptions(
+                        host_environment=compiled_base.host_environment
+                    ),
+                )
+                assert product_owners.tool is not None
+                assert product_owners.command is not None
+                without_tools = compile_coding_base_product_selection(
+                    selected_manifest,
+                    resolve_coding_composition_set("coding-standard"),
+                    installation_key=key,
+                    session_id=session_manager.get_header().conversation_id,
+                    host_environment=compiled_base.host_environment,
+                    evaluated_at=1,
+                    include_tool_contribution=False,
+                    include_tool_claim_prompt=False,
+                )
+                tool_free_owners = without_tools.build_owners(
+                    clock=lambda: 1,
+                    tool_options=ToolsOptions(
+                        host_environment=compiled_base.host_environment
+                    ),
+                )
+                assert tool_free_owners.tool is None
+                assert tool_free_owners.command is not None
+                assert len(compiled_base.product_composition.resource_admissions) == 2
+                assert len(compiled_base.product_composition.catalog_admissions) == 2
+                from loushang.harness.capabilities.workspace_provider import (
+                    workspace_capability_provider_binding,
+                )
+                from loushang.harness.workspace.operations import LocalToolOperations
+
+                class _UnusedProcessLauncher:
+                    async def start(self, request, *, correlation_id, signal=None):
+                        raise AssertionError(
+                            "Product compilation must not launch a process"
+                        )
+
+                workspace_binding = workspace_capability_provider_binding(
+                    operations=LocalToolOperations(),
+                    process_launcher=_UnusedProcessLauncher(),
+                    scope_instance_id="workspace:product-store-session",
+                    binding_input_fingerprint="f" * 64,
+                    source_id="product-store-test",
+                )
+                product_session = compiled_base.bind_workspace(workspace_binding)
+                assert (
+                    product_session.session_inputs.product_composition
+                    is compiled_base.product_composition
+                )
+                assert product_session.session_inputs.resolved_providers.entries == ()
+                assert product_session.session_inputs.component_requests == ()
+                assert {
+                    admission.candidate.owner_id
+                    for admission in (
+                        product_session.session_inputs.product_composition.catalog_admissions
+                    )
+                } == {"tools.workspace", "commands.session"}
+                assert {
+                    admission.candidate.contribution_id
+                    for admission in (
+                        *compiled_base.product_composition.resource_admissions,
+                        *compiled_base.product_composition.catalog_admissions,
+                    )
+                } == {
+                    "coding.builtin",
+                    "coding.standard",
+                    "prompt-standard",
+                    "skill-standard",
+                }
+                resource_bodies = {
+                    admission.contribution_id: compiled_base.read_resource_body(
+                        admission.fingerprint, max_bytes=64 * 1024
+                    )
+                    for admission in compiled_base.product_composition.resource_admissions
+                }
+                assert resource_bodies == {
+                    "prompt-standard": base_files["coding_base/prompts/standard.md"],
+                    "skill-standard": base_files[
+                        "coding_base/skills/standard/SKILL.md"
+                    ],
+                }
+                from loushang.harness.resource_catalog.product_snapshot_source import (
+                    ProductSelectedResourceSource,
+                    ProductSnapshotResourceSourceError,
+                    product_snapshot_source_policy_fingerprint,
+                )
+                from loushang.harness.resources._catalog_engine import (
+                    compose_resource_catalog,
+                    default_resource_merge_policy,
+                )
+                from loushang.harness.resources._catalog_package_source import (
+                    PackageResourceDiscoveryBudget,
+                    build_package_resource_discovery_request,
+                )
+                from loushang.harness.resources._catalog_projection import (
+                    project_resource_catalog,
+                )
+                from loushang.harness.resources._catalog_records import (
+                    ResourceCatalogHandle,
+                    ResourceComponentProducer,
+                    ResourceLoadHandle,
+                    ResourceLoadReceipt,
+                    ResourceSourceGenerationRef,
+                    build_activation_policy_snapshot,
+                )
+
+                product_inputs = compiled_base.product_resource_inputs()
+                assert {item.relative_path for item in product_inputs} == {
+                    "prompts/standard.md",
+                    "skills/standard/SKILL.md",
+                }
+                from loushang.coding._resource_catalog_shadow import (
+                    build_coding_initial_resource_catalog_adapter,
+                )
+                from loushang.harness.resources._catalog_input_receipt import (
+                    ResourceCatalogInputReceipt,
+                )
+
+                coding_receipt = ResourceCatalogInputReceipt(
+                    cwd=workspace,
+                    project_resource_root=workspace,
+                    project_context_roots=(),
+                    package_mounts=(),
+                    package_resource_candidates=(),
+                    package_diagnostic_codes=(),
+                    user_resource_roots=(),
+                    explicit_user_resource_roots=frozenset(),
+                    additional_extension_paths=(),
+                    additional_skill_paths=(),
+                    additional_prompt_template_paths=(),
+                    additional_theme_paths=(),
+                    no_extensions=False,
+                    no_skills=False,
+                    no_prompt_templates=False,
+                    no_themes=False,
+                    no_context_files=False,
+                    built_in_resource_packages=(),
+                    context_file_names=("AGENTS.md", "CLAUDE.md"),
+                )
+                coding_adapter = build_coding_initial_resource_catalog_adapter(
+                    coding_receipt,
+                    product_scope_id=session_manager.get_header().conversation_id,
+                    product_composition=compiled_base.product_composition,
+                    product_snapshot_resources=product_inputs,
+                    package_admission_now=1,
+                    clock=lambda: 1,
+                )
+                coding_bundle = coding_adapter.prepare_bootstrap_projection(
+                    product_id="coding",
+                    session_id=session_manager.get_header().conversation_id,
+                    cwd=workspace,
+                )
+                assert len(coding_bundle.skills) == 1
+                from loushang.agent import Agent
+                from loushang.coding.session.agent_session import AgentSession
+                from loushang.harness.extensions.agent import ExtensionRunner
+                from loushang.harness.extensions.context import ExtensionRuntimeBindings
+
+                async def _verify_product_coding_session() -> None:
+                    async def _ignore(_value: object) -> None:
+                        return None
+
+                    product_manager = await SessionManager.new(
+                        session_dir=tmp_path / "product-coding-session",
+                        cwd=str(workspace),
+                        persist=False,
+                        session_id=session_manager.get_header().conversation_id,
+                    )
+                    extension_runner = ExtensionRunner([])
+                    await extension_runner.activate_runtime_generation(
+                        ExtensionRuntimeBindings(
+                            cwd=str(workspace),
+                            get_active_tool_names=lambda: [],
+                            get_model_selection=lambda: None,
+                            set_active_tools=_ignore,
+                            set_model=_ignore,
+                            request_resource_refresh=lambda: None,
+                            shutdown=lambda: None,
+                            record_diagnostic=lambda _diagnostic: None,
+                        )
+                    )
+                    coding_bootstrap = coding_adapter.construct_session(
+                        product_id="coding",
+                        session_id=session_manager.get_header().conversation_id,
+                        base_resource_bundle=coding_bundle,
+                        construct=lambda value: value,
+                    )
+                    with pytest.raises(ValueError, match="requires Catalog bootstrap"):
+                        AgentSession(
+                            agent=Agent(),
+                            session_manager=product_manager,
+                            coding_base_product_session_assembly=product_session,
+                            coding_base_product_runtime_binding=runtime,
+                            workspace_capability_binding=workspace_binding,
+                            coding_plugin_clock=lambda: 1,
+                        )
+                    with pytest.raises(ValueError, match="workspace binding changed"):
+                        AgentSession(
+                            agent=Agent(),
+                            session_manager=product_manager,
+                            coding_base_product_session_assembly=product_session,
+                            coding_base_product_runtime_binding=runtime,
+                            coding_plugin_clock=lambda: 1,
+                            initial_resource_catalog_bootstrap=coding_bootstrap,
+                        )
+                    with pytest.raises(ValueError, match="requires runtime binding"):
+                        AgentSession(
+                            agent=Agent(),
+                            session_manager=product_manager,
+                            coding_base_product_session_assembly=product_session,
+                            workspace_capability_binding=workspace_binding,
+                            initial_resource_catalog_bootstrap=coding_bootstrap,
+                        )
+                    foreign_manager = await SessionManager.new(
+                        session_dir=tmp_path / "foreign-product-coding-session",
+                        cwd=str(workspace),
+                        persist=False,
+                    )
+                    with pytest.raises(ValueError, match="Session identity changed"):
+                        AgentSession(
+                            agent=Agent(),
+                            session_manager=foreign_manager,
+                            coding_base_product_session_assembly=product_session,
+                            coding_base_product_runtime_binding=runtime,
+                            workspace_capability_binding=workspace_binding,
+                            initial_resource_catalog_bootstrap=coding_bootstrap,
+                        )
+                    product_agent_session = AgentSession(
+                        agent=Agent(),
+                        session_manager=product_manager,
+                        resource_bundle=coding_bundle,
+                        extension_runner=extension_runner,
+                        coding_base_product_session_assembly=product_session,
+                        coding_base_product_runtime_binding=runtime,
+                        workspace_capability_binding=workspace_binding,
+                        coding_plugin_clock=lambda: 1,
+                        initial_resource_catalog_bootstrap=coding_bootstrap,
+                    )
+                    try:
+                        with pytest.raises(
+                            CodingBasePluginAssemblyError
+                        ) as stale_direct:
+                            await product_agent_session.prepare_model_call_runtime()
+                        assert (
+                            stale_direct.value.code
+                            == "coding_base_product_restart_required"
+                        )
+                        assert coding_bootstrap.state != "published"
+                    finally:
+                        await product_agent_session.dispose()
+
+                asyncio.run(_verify_product_coding_session())
+                with pytest.raises(ValueError, match="requires a composition"):
+                    build_coding_initial_resource_catalog_adapter(
+                        coding_receipt,
+                        product_snapshot_resources=product_inputs,
+                        package_admission_now=1,
+                    )
+                with pytest.raises(
+                    CodingResourceCatalogAdmissionError,
+                    match="legacy_package_inputs_with_product_snapshot",
+                ):
+                    build_coding_initial_resource_catalog_adapter(
+                        replace(
+                            coding_receipt,
+                            package_diagnostic_codes=("legacy_package_probe",),
+                        ),
+                        product_scope_id=(session_manager.get_header().conversation_id),
+                        product_composition=compiled_base.product_composition,
+                        product_snapshot_resources=product_inputs,
+                        package_admission_now=1,
+                    )
+                from loushang.harness.resource_catalog.product_inputs import (
+                    InitialResourceCatalogProductAdapter,
+                    InitialResourceCatalogProductSelection,
+                )
+
+                product_adapter = InitialResourceCatalogProductAdapter(
+                    InitialResourceCatalogProductSelection(
+                        product_policy_revision=(
+                            compiled_base.product_composition.authority_context.product_policy_revision
+                        ),
+                        product_composition=compiled_base.product_composition,
+                        product_snapshot_resources=product_inputs,
+                    ),
+                    clock=lambda: 1,
+                )
+                adapter_bundle = product_adapter.prepare_bootstrap_projection(
+                    product_id="coding",
+                    session_id="product-selected-coding-base",
+                    cwd=tmp_path,
+                )
+                assert len(adapter_bundle.skills) == 1
+                bootstrap = product_adapter.construct_session(
+                    product_id="coding",
+                    session_id="product-selected-coding-base",
+                    base_resource_bundle=adapter_bundle,
+                    construct=lambda value: value,
+                )
+                assert bootstrap._inputs.package_resources == ()
+                assert bootstrap._inputs.product_snapshot_resources == product_inputs
+
+                async def _verify_product_session_bootstrap() -> None:
+                    from loushang.harness.capabilities import (
+                        stage_resource_composition_candidate,
+                        standard_capability_composition_plan,
+                    )
+                    from loushang.harness.extensions.agent import ExtensionRunner
+                    from loushang.harness.extensions.context import (
+                        ExtensionRuntimeBindings,
+                    )
+                    from loushang.harness.runtime import RuntimeProfileResolver
+
+                    async def _ignore(_value: object) -> None:
+                        return None
+
+                    bindings = ExtensionRuntimeBindings(
+                        cwd=str(tmp_path),
+                        get_active_tool_names=lambda: [],
+                        get_model_selection=lambda: None,
+                        set_active_tools=_ignore,
+                        set_model=_ignore,
+                        request_resource_refresh=lambda: None,
+                        shutdown=lambda: None,
+                        record_diagnostic=lambda _diagnostic: None,
+                    )
+                    extension_runtime = ExtensionRunner([])
+                    await extension_runtime.activate_runtime_generation(bindings)
+                    profile = RuntimeProfileResolver().resolve(
+                        standard_capability_composition_plan(product_id="coding")
+                    )
+                    staged = stage_resource_composition_candidate(profile)
+                    try:
+                        await bootstrap.prepare(
+                            extension_host=extension_runtime,
+                            staged_resource_candidate=staged,
+                            bindings=bindings,
+                        )
+                        generation = staged._require_prepared_owner_generation()
+                        assert len(generation.catalog_snapshot.effective_entries) == 2
+                        assert generation.ownership_state == "root_owned"
+                        for entry in generation.catalog_snapshot.effective_entries:
+                            candidate = (
+                                generation.catalog_snapshot.candidate_by_fingerprint(
+                                    entry.primary_candidate_fingerprint
+                                )
+                            )
+                            assert (
+                                candidate.expected_content_digest
+                                == sha256(
+                                    resource_bodies[
+                                        candidate.content_origin.resource_contribution_id
+                                    ]
+                                ).hexdigest()
+                            )
+                    finally:
+                        await bootstrap.abort()
+
+                asyncio.run(_verify_product_session_bootstrap())
+                source_ref = ResourceSourceGenerationRef(
+                    source_id="test.product.selected.resources",
+                    product_id=product_inputs[0].admission.product_id,
+                    generation="store-product-selection:1",
+                    source_policy_fingerprint=product_snapshot_source_policy_fingerprint(
+                        product_id=product_inputs[0].admission.product_id,
+                        resources=product_inputs,
+                    ),
+                    producer=ResourceComponentProducer(
+                        component_contribution_id="test.product.selected.resources",
+                        component_candidate_fingerprint="a" * 64,
+                        component_admission_fingerprint="b" * 64,
+                        binding_fingerprint="c" * 64,
+                        plugin_instance_revision_ref="first-party:product-snapshot@1",
+                        package_content_digest="d" * 64,
+                    ),
+                )
+                product_source = ProductSelectedResourceSource(
+                    source_generation_ref=source_ref,
+                    resources=product_inputs,
+                )
+                with pytest.raises(ValueError, match="policy changed"):
+                    ProductSelectedResourceSource(
+                        source_generation_ref=replace(
+                            source_ref, source_policy_fingerprint="0" * 64
+                        ),
+                        resources=product_inputs,
+                    )
+                with pytest.raises(
+                    ProductSnapshotResourceSourceError
+                ) as foreign_source:
+                    product_source.discover_initial(
+                        build_package_resource_discovery_request(
+                            product_id=source_ref.product_id,
+                            source_generation_ref=replace(
+                                source_ref, generation="foreign-generation"
+                            ),
+                            admission_fingerprints=tuple(
+                                item.admission.fingerprint for item in product_inputs
+                            ),
+                        )
+                    )
+                assert foreign_source.value.reason == "foreign_source_generation"
+                with pytest.raises(
+                    ProductSnapshotResourceSourceError
+                ) as missing_admission:
+                    product_source.discover_initial(
+                        build_package_resource_discovery_request(
+                            product_id=source_ref.product_id,
+                            source_generation_ref=source_ref,
+                            admission_fingerprints=(
+                                product_inputs[0].admission.fingerprint,
+                            ),
+                        )
+                    )
+                assert missing_admission.value.reason == "admission_set_mismatch"
+                with pytest.raises(ProductSnapshotResourceSourceError) as over_budget:
+                    product_source.discover_initial(
+                        build_package_resource_discovery_request(
+                            product_id=source_ref.product_id,
+                            source_generation_ref=source_ref,
+                            admission_fingerprints=tuple(
+                                item.admission.fingerprint for item in product_inputs
+                            ),
+                            budget=PackageResourceDiscoveryBudget(maximum_items=1),
+                        )
+                    )
+                assert over_budget.value.reason == "item_count_exceeded"
+                with (
+                    patch.object(
+                        Path, "open", side_effect=AssertionError("host path read")
+                    ),
+                    patch.object(
+                        Path, "read_bytes", side_effect=AssertionError("host path read")
+                    ),
+                ):
+                    source_snapshot = product_source.discover_initial(
+                        build_package_resource_discovery_request(
+                            product_id=source_ref.product_id,
+                            source_generation_ref=source_ref,
+                            admission_fingerprints=tuple(
+                                item.admission.fingerprint for item in product_inputs
+                            ),
+                        )
+                    )
+                catalog = compose_resource_catalog(
+                    (source_snapshot,),
+                    catalog_generation=1,
+                    engine_binding_fingerprint="e" * 64,
+                    merge_policy=default_resource_merge_policy(),
+                    activation_policy=build_activation_policy_snapshot(
+                        policy_revision="test-product-selected-resources"
+                    ),
+                )
+                projection = project_resource_catalog(
+                    catalog_snapshot=catalog,
+                    cwd=tmp_path,
+                    descriptor_bindings=product_source.projection_bindings,
+                )
+                assert projection is not None
+                assert all(
+                    not item.descriptor.source_path.is_absolute()
+                    for item in projection.selected_bindings
+                )
+                for entry in catalog.effective_entries:
+                    candidate = catalog.candidate_by_fingerprint(
+                        entry.primary_candidate_fingerprint
+                    )
+                    handle = ResourceLoadHandle.from_catalog(
+                        catalog_handle=ResourceCatalogHandle(
+                            catalog_generation=catalog.catalog_generation,
+                            snapshot_fingerprint=catalog.snapshot_fingerprint,
+                            identity=entry.identity,
+                            candidate_fingerprint=candidate.candidate_fingerprint,
+                        ),
+                        candidate=candidate,
+                    )
+                    with (
+                        patch.object(
+                            Path, "open", side_effect=AssertionError("host path read")
+                        ),
+                        patch.object(
+                            Path,
+                            "read_bytes",
+                            side_effect=AssertionError("host path read"),
+                        ),
+                    ):
+                        read = product_source.load(handle)
+                    assert ResourceLoadReceipt.from_validated_read(
+                        load_handle=handle, body_read=read
+                    )
+                    assert (
+                        read.body
+                        == resource_bodies[
+                            candidate.content_origin.resource_contribution_id
+                        ]
+                    )
+                    with pytest.raises(
+                        ProductSnapshotResourceSourceError
+                    ) as wrong_body:
+                        product_source.load(
+                            replace(handle, expected_content_digest="0" * 64)
+                        )
+                    assert wrong_body.value.reason == "load_handle_identity_mismatch"
+                product_source.dispose()
+                with pytest.raises(
+                    ProductSnapshotResourceSourceError
+                ) as disposed_source:
+                    product_source.discover_initial(
+                        build_package_resource_discovery_request(
+                            product_id=source_ref.product_id,
+                            source_generation_ref=source_ref,
+                            admission_fingerprints=tuple(
+                                item.admission.fingerprint for item in product_inputs
+                            ),
+                        )
+                    )
+                assert disposed_source.value.reason == "source_disposed"
+                from loushang.harness.resource_catalog.shadow import (
+                    run_first_party_resource_catalog_shadow,
+                )
+
+                async def _verify_product_catalog_owner() -> None:
+                    generation = await run_first_party_resource_catalog_shadow(
+                        product_id=source_ref.product_id,
+                        scope_id="product-selected-coding-base",
+                        runtime_id="product-selected-coding-base",
+                        product_policy_revision="product-selected-coding-base-v1",
+                        root_handles=(),
+                        product_snapshot_resources=product_inputs,
+                        issued_at=1,
+                        expires_at=100,
+                        now=1,
+                        projection_cwd=tmp_path,
+                    )
+                    try:
+                        assert generation.catalog_projection is not None
+                        assert len(generation.catalog_snapshot.effective_entries) == 2
+                        assert len(generation.source_snapshots) == 1
+                        assert generation.source_snapshots[
+                            0
+                        ].source_generation_ref.source_id == (
+                            "harness.resources.source.product_snapshot"
+                        )
+                        for entry in generation.catalog_snapshot.effective_entries:
+                            handle = generation.load_handle(entry.identity)
+                            loaded = await generation.load(handle)
+                            assert (
+                                loaded.body
+                                == resource_bodies[
+                                    generation.catalog_snapshot.candidate_by_fingerprint(
+                                        entry.primary_candidate_fingerprint
+                                    ).content_origin.resource_contribution_id
+                                ]
+                            )
+                    finally:
+                        assert await generation.dispose() == ()
+
+                asyncio.run(_verify_product_catalog_owner())
+                from loushang.harness.resource_catalog.bootstrap_projection import (
+                    prepare_resource_catalog_bootstrap_projection,
+                )
+
+                product_bundle = prepare_resource_catalog_bootstrap_projection(
+                    product_id=source_ref.product_id,
+                    runtime_id="product-selected-coding-base",
+                    product_policy_revision="product-selected-coding-base-v1",
+                    cwd=tmp_path,
+                    root_handles=(),
+                    product_snapshot_resources=product_inputs,
+                )
+                assert len(product_bundle.prompts) == 1
+                assert product_bundle.prompts[0].text == (
+                    base_files["coding_base/prompts/standard.md"]
+                    .decode("utf-8")
+                    .strip()
+                )
+                assert len(product_bundle.skills) == 1
+                assert product_bundle.skills[0].name == "standard"
+                with pytest.raises(CodingBasePluginAssemblyError) as foreign_body:
+                    compiled_base.read_resource_body(
+                        "foreign-admission", max_bytes=64 * 1024
+                    )
+                assert (
+                    foreign_body.value.code
+                    == "coding_base_product_resource_unavailable"
+                )
+                with pytest.raises(CodingBasePluginAssemblyError) as over_budget_body:
+                    compiled_base.read_resource_body(
+                        compiled_base.product_composition.resource_admissions[
+                            0
+                        ].fingerprint,
+                        max_bytes=0,
+                    )
+                assert over_budget_body.value.code == (
+                    "coding_base_product_resource_unavailable"
+                )
+                changed_candidate = replace(
+                    compiled_base.product_composition.resource_admissions[0].candidate,
+                    source_trust_policy_revision="foreign-policy",
+                )
+                with pytest.raises(ProductCompositionAssemblyError) as changed_source:
+                    _assemble_product_contribution_candidates(
+                        plan=compiled_base.plan,
+                        candidates=(changed_candidate,),
+                        owner_bindings=(),
+                        mandatory_roots=(),
+                        definitions=(),
+                        select_optional_requirements=lambda _preview: (),
+                        evaluated_at=1,
+                    )
+                assert changed_source.value.code == (
+                    "product_contribution_candidate_mismatch"
+                )
+                with pytest.raises(ValueError, match="changed captured bytes"):
+                    replace(
+                        selected_manifest,
+                        manifest=replace(
+                            selected_manifest.manifest,
+                            contribution_index=replace(
+                                selected_manifest.manifest.contribution_index,
+                                items=tuple(
+                                    item
+                                    for item in selected_manifest.manifest.contribution_index.items
+                                    if item.contribution_id != "coding.standard"
+                                ),
+                            ),
+                        ),
+                    )
+                with pytest.raises(ValueError, match="source trust changed"):
+                    replace(
+                        selected_manifest,
+                        source_trust_snapshot=replace(
+                            trust, package_source_identity="foreign-source"
+                        ),
+                    )
+                with pytest.raises(CodingBasePluginAssemblyError) as missing_trust:
+                    prepare_coding_base_product_plan(
+                        replace(selected_manifest, source_trust_snapshot=None),
+                        resolve_coding_composition_set("coding-standard"),
+                        installation_key=key,
+                        session_id=session_manager.get_header().conversation_id,
+                        host_environment=LocalHostEnvironmentProbe().detect(),
+                    )
+                assert (
+                    missing_trust.value.code == "coding_base_product_source_untrusted"
+                )
+                with pytest.raises(CodingBasePluginAssemblyError) as foreign_scope_plan:
+                    prepare_coding_base_product_plan(
+                        selected_manifest,
+                        resolve_coding_composition_set("coding-standard"),
+                        installation_key=replace(key, scope_id="workspace:foreign"),
+                        session_id=session_manager.get_header().conversation_id,
+                        host_environment=LocalHostEnvironmentProbe().detect(),
+                    )
+                assert (
+                    foreign_scope_plan.value.code
+                    == "coding_base_product_selection_mismatch"
+                )
+                from loushang.harness.package_product.product_local_wheel_runtime import (
+                    _LocalWheelSelectedManifestReader,
+                )
+
+                assert isinstance(
+                    runtime._selected_root_reader, PackageProductSelectedRootReader
+                )
+                untrusted_reader = _LocalWheelSelectedManifestReader(
+                    policy=replace(
+                        policy,
+                        bindings=(
+                            replace(policy.bindings[0], source_trust_class=None),
+                        ),
+                    ),
+                    root_reader=runtime._selected_root_reader,
+                )
+                untrusted_selected = untrusted_reader.capture_selected_manifest(
+                    key, max_files=64, max_total_bytes=1024 * 1024
+                )
+                assert untrusted_selected.source_trust_snapshot is None
+                with pytest.raises(CodingBasePluginAssemblyError) as untrusted_plan:
+                    prepare_coding_base_product_plan(
+                        untrusted_selected,
+                        resolve_coding_composition_set("coding-standard"),
+                        installation_key=key,
+                        session_id=session_manager.get_header().conversation_id,
+                        host_environment=LocalHostEnvironmentProbe().detect(),
+                    )
+                assert (
+                    untrusted_plan.value.code == "coding_base_product_source_untrusted"
+                )
+                wrong_path_reader = _LocalWheelSelectedManifestReader(
+                    policy=replace(
+                        policy,
+                        bindings=(
+                            replace(
+                                policy.bindings[0],
+                                plugin_manifest_path=(
+                                    "coding_base/declarations/plugin.json"
+                                ),
+                            ),
+                        ),
+                    ),
+                    root_reader=runtime._selected_root_reader,
+                )
+                with pytest.raises(PackageProductRuntimeReadError) as wrong_path:
+                    wrong_path_reader.capture_selected_manifest(
+                        key, max_files=64, max_total_bytes=1024 * 1024
+                    )
+                assert wrong_path.value.code == "package_product_manifest_invalid"
+                from loushang.harness.resources.plugins.manifest import (
+                    PluginManifestError,
+                    PluginManifestParser,
+                )
+
+                manifest_path = policy.bindings[0].plugin_manifest_path
+                assert manifest_path == "coding_base/plugin.json"
+                parsed = selected_manifest.manifest
+                assert parsed.name == "coding.base"
+                assert parsed.version == "1"
+                assert parsed.root_relative_path.as_posix() == "coding_base"
+                assert tuple(
+                    item.contribution_id for item in parsed.contribution_index.items
+                ) == (
+                    "coding.builtin",
+                    "coding.builtin.windows",
+                    "coding.standard",
+                    "prompt-standard",
+                    "skill-standard",
+                )
+                missing_declaration = dict(captured.files)
+                del missing_declaration["coding_base/declarations/plugin.json"]
+                with pytest.raises(PluginManifestError) as missing_source:
+                    PluginManifestParser().parse_file_set(
+                        missing_declaration,
+                        manifest_logical_path=manifest_path,
+                    )
+                assert (
+                    missing_source.value.code
+                    == "invalid_plugin_contribution_entrypoint"
+                )
+                with pytest.raises(PluginManifestError) as wrong_manifest:
+                    PluginManifestParser().parse_file_set(
+                        dict(captured.files),
+                        manifest_logical_path="coding_base/declarations/plugin.json",
+                    )
+                assert wrong_manifest.value.code == "invalid_plugin_manifest"
+                with pytest.raises(PackageProductRuntimeReadError) as capture_budget:
+                    runtime.capture_selected_plugin_root(
+                        key, max_files=64, max_total_bytes=1
+                    )
+                assert (
+                    capture_budget.value.code
+                    == "package_product_root_capture_budget_exceeded"
+                )
+                with pytest.raises(PackageProductRuntimeReadError) as over_budget:
+                    runtime.read_selected_plugin_files(
+                        key, selected_paths, max_total_bytes=1
+                    )
+                assert over_budget.value.code == "package_product_root_file_unavailable"
+                with pytest.raises(PackageProductRuntimeReadError) as undeclared:
+                    runtime.read_selected_plugin_files(
+                        key, ("coding_base/missing.py",), max_total_bytes=4096
+                    )
+                assert undeclared.value.code == "package_product_root_file_unavailable"
+                reopened = PackageProductSelectedRootReader(
+                    product_id=policy.product_id,
+                    scope_id=policy.project_scope_id,
+                    installation_scope="workspace",
+                    desired_state=PluginDesiredStateLedger(desired.path, gc_gate=gate),
+                    bindings=PluginPackageGcBindingJournal(bindings.path),
+                    committed_sets=PackageCommittedSetJournal(
+                        state_root / "committed-sets.jsonl"
+                    ),
+                    root_settlements=PackageStoreSettlementJournal(
+                        root_settlements.path
+                    ),
+                    root_store=root_store,
+                    gc_gate=gate,
+                )
+                assert (
+                    reopened.read_selected_file(
+                        key, "coding_base/plugin.json", max_bytes=4096
+                    )
+                    == base_files["coding_base/plugin.json"]
+                )
+                foreign_key = PluginInstallationKeyV1(
+                    product_id=key.product_id,
+                    installation_scope=key.installation_scope,
+                    scope_id="workspace:foreign",
+                    plugin_id=key.plugin_id,
+                )
+                with pytest.raises(PackageProductRuntimeReadError) as foreign:
+                    runtime.read_selected_plugin_file(
+                        foreign_key, "coding_base/plugin.json", max_bytes=4096
+                    )
+                assert foreign.value.code == "package_product_root_scope_changed"
+                with pytest.raises(PackageProductRuntimeReadError) as no_crosswalk:
+                    PackageProductSelectedRootReader(
+                        product_id=policy.product_id,
+                        scope_id=policy.project_scope_id,
+                        installation_scope="workspace",
+                        desired_state=desired,
+                        bindings=PluginPackageGcBindingJournal(
+                            tmp_path / "missing-product-crosswalk.jsonl"
+                        ),
+                        committed_sets=PackageCommittedSetJournal(
+                            state_root / "committed-sets.jsonl"
+                        ),
+                        root_settlements=root_settlements,
+                        root_store=root_store,
+                        gc_gate=gate,
+                    ).read_selected_file(key, "coding_base/plugin.json", max_bytes=4096)
+                assert no_crosswalk.value.code == "package_product_root_unbound"
+            if checked_in_base:
+                from loushang.harness.plugin_management.operations import (
+                    PluginManagementCommandV1,
+                )
+                from loushang.harness.plugin_management.records import (
+                    PluginDesiredStateMutationV1,
+                    PluginInstallationKeyV1,
+                )
+
+                capability_artifacts = prepare_posix_coding_capability_product_wheels(
+                    product_source_root
+                )
+                configured_artifact = next(
+                    artifact
+                    for artifact in capability_artifacts
+                    if artifact.plugin_id == "coding.arch.default"
+                )
+                configured_settings = workspace / ".loushang" / "product-sources.json"
+                configured_settings.write_text(
+                    json.dumps({"packages": [str(configured_artifact.path)]}),
+                    encoding="utf-8",
+                )
+                configured_manager = asyncio.run(
+                    SessionManager.new(
+                        session_dir=tmp_path / "configured-product-sessions",
+                        cwd=str(workspace),
+                        persist=False,
+                    )
+                )
+                configured_operation_id = sha256(
+                    (
+                        "startup:"
+                        + configured_manager.get_header().conversation_id
+                        + f":project:{configured_artifact.path}"
+                    ).encode()
+                ).hexdigest()
+                configured_session = None
+                prior_configured_leases = len(
+                    registry.snapshot(store_id=store_id).active_leases
+                )
+                try:
+                    with (
+                        patch(
+                            "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                            return_value=legacy_layout,
+                        ),
+                        patch(
+                            "loushang.coding.package_product_runtime.version",
+                            return_value="2.0.0",
+                        ),
+                        patch(
+                            "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                            side_effect=AssertionError("legacy base assembly"),
+                        ),
+                        patch(
+                            "loushang.coding.bootstrap._default_package_materializer",
+                            side_effect=AssertionError("legacy package materializer"),
+                        ),
+                    ):
+                        configured_session = create_agent_session(
+                            session_manager=configured_manager,
+                            model=Model(
+                                id="plc9b-configured-success",
+                                name="PLC9B Configured Success",
+                                provider="test",
+                                endpoint="anthropic-messages",
+                                capabilities=Capabilities(
+                                    reasoning=True,
+                                    input=("text",),
+                                    context_window=128000,
+                                    max_tokens=4096,
+                                ),
+                            ),
+                            services=create_services(
+                                settings_manager=SettingsManager(
+                                    project_settings_path=configured_settings
+                                )
+                            ),
+                            composition_set="coding-minimal",
+                            resource_catalog_source_policy=(
+                                CODING_READ_ONLY_AGENT_RESOURCE_CATALOG_SOURCE_POLICY
+                            ),
+                        )
+                    assert (
+                        configured_session._package_controller.get_package_materializer()
+                        is None
+                    )
+                    configured_status = PackageLifecycleJournal(
+                        state_root / "lifecycle.jsonl"
+                    ).status(configured_operation_id)
+                    assert configured_status is not None
+                    assert configured_status.disposition == "committed"
+                    assert (
+                        PackageCommittedSetJournal(
+                            state_root / "committed-sets.jsonl"
+                        ).current(configured_operation_id)
+                        is not None
+                    )
+                    cli_artifact = next(
+                        artifact
+                        for artifact in capability_artifacts
+                        if artifact.plugin_id == "coding.lsp.default"
+                    )
+                    with patch.object(
+                        configured_session,
+                        "install_package",
+                        side_effect=AssertionError("legacy transport install"),
+                    ):
+                        cli_install = asyncio.run(
+                            run_package_lifecycle(
+                                configured_session,
+                                PackageLifecycleRequest(
+                                    install=(str(cli_artifact.path),), scope="project"
+                                ),
+                            )
+                        )
+                    cli_record = cli_install.outputs[0]["record"]
+                    assert isinstance(cli_record, dict)
+                    cli_operation_id = str(cli_record["operationId"])
+                    cli_status = PackageLifecycleJournal(
+                        state_root / "lifecycle.jsonl"
+                    ).status(cli_operation_id)
+                    assert cli_status is not None
+                    assert cli_status.disposition == "committed"
+                    assert (
+                        PackageCommittedSetJournal(
+                            state_root / "committed-sets.jsonl"
+                        ).current(cli_operation_id)
+                        is not None
+                    )
+                    rpc_install_output = io.StringIO()
+                    rpc_install = RpcPackageCommands(
+                        runtime=object(),
+                        get_session=lambda: configured_session,
+                        output=RpcOutput(rpc_install_output),
+                    )
+                    before_rpc_install = len(
+                        PackageLifecycleJournal(
+                            state_root / "lifecycle.jsonl"
+                        ).records()
+                    )
+                    committed_before_rpc = len(
+                        PackageCommittedSetJournal(
+                            state_root / "committed-sets.jsonl"
+                        ).records()
+                    )
+                    desired_before_rpc = desired.snapshot()
+                    with patch.object(
+                        configured_session,
+                        "install_package",
+                        side_effect=AssertionError("legacy transport install"),
+                    ):
+                        asyncio.run(
+                            dict(rpc_install.bindings())["install_package"](
+                                "request:default-product-install-replay",
+                                {"source": str(cli_artifact.path), "scope": "project"},
+                            )
+                        )
+                    rpc_response = json.loads(rpc_install_output.getvalue())
+                    assert rpc_response["success"] is False
+                    rpc_records = PackageLifecycleJournal(
+                        state_root / "lifecycle.jsonl"
+                    ).records()[before_rpc_install:]
+                    assert rpc_records
+                    rpc_operation_ids = {
+                        record.request.operation_id for record in rpc_records
+                    }
+                    assert len(rpc_operation_ids) == 1
+                    rpc_status = PackageLifecycleJournal(
+                        state_root / "lifecycle.jsonl"
+                    ).status(next(iter(rpc_operation_ids)))
+                    assert rpc_status is not None
+                    assert rpc_status.failure is not None
+                    assert rpc_status.failure.code == "package_route_unavailable"
+                    assert (
+                        len(
+                            PackageCommittedSetJournal(
+                                state_root / "committed-sets.jsonl"
+                            ).records()
+                        )
+                        == committed_before_rpc
+                    )
+                    assert desired.snapshot() == desired_before_rpc
+                    before_rpc_replay = len(
+                        PackageLifecycleJournal(
+                            state_root / "lifecycle.jsonl"
+                        ).records()
+                    )
+                    with patch.object(
+                        configured_session,
+                        "install_package",
+                        side_effect=AssertionError("legacy transport install"),
+                    ):
+                        asyncio.run(
+                            dict(rpc_install.bindings())["install_package"](
+                                "request:default-product-install-replay",
+                                {"source": str(cli_artifact.path), "scope": "project"},
+                            )
+                        )
+                    assert json.loads(
+                        rpc_install_output.getvalue().splitlines()[-1]
+                    ) == (rpc_response)
+                    assert (
+                        len(
+                            PackageLifecycleJournal(
+                                state_root / "lifecycle.jsonl"
+                            ).records()
+                        )
+                        == before_rpc_replay
+                    )
+                    refused_source = "https://packages.example.test/unknown.whl"
+                    before_transport = len(
+                        PackageLifecycleJournal(
+                            state_root / "lifecycle.jsonl"
+                        ).records()
+                    )
+                    desired_before_transport = desired.snapshot()
+                    with patch.object(
+                        configured_session,
+                        "install_package",
+                        side_effect=AssertionError("legacy transport install"),
+                    ):
+                        with pytest.raises(PackageLifecycleError):
+                            asyncio.run(
+                                run_package_lifecycle(
+                                    configured_session,
+                                    PackageLifecycleRequest(
+                                        install=(refused_source,), scope="project"
+                                    ),
+                                )
+                            )
+                        rpc_output = io.StringIO()
+                        rpc = RpcPackageCommands(
+                            runtime=object(),
+                            get_session=lambda: configured_session,
+                            output=RpcOutput(rpc_output),
+                        )
+                        asyncio.run(
+                            dict(rpc.bindings())["install_package"](
+                                "request:default-product-install-refusal",
+                                {"source": refused_source, "scope": "project"},
+                            )
+                        )
+                    assert json.loads(rpc_output.getvalue())["success"] is False
+                    transport_failures = [
+                        record
+                        for record in PackageLifecycleJournal(
+                            state_root / "lifecycle.jsonl"
+                        ).records()[before_transport:]
+                        if record.request.action == "install"
+                        and record.status.failure is not None
+                    ]
+                    assert len(transport_failures) == 2
+                    assert (
+                        len(
+                            {
+                                record.request.operation_id
+                                for record in transport_failures
+                            }
+                        )
+                        == 2
+                    )
+                    assert desired.snapshot() == desired_before_transport
+                finally:
+                    if configured_session is not None:
+                        asyncio.run(configured_session.dispose())
+                assert len(registry.snapshot(store_id=store_id).active_leases) == (
+                    prior_configured_leases
+                )
+
+                def compose_builtin_product(selected_state):
+                    owner = open_coding_builtin_product_runtime_owner(
+                        legacy_layout,
+                        epoch_runtime,
+                        selected_state,
+                        workspace=workspace,
+                        runtime_version="2.0.0",
+                        runtime_protocol_epoch=2,
+                    )
+                    assert {
+                        item.plugin_id for item in owner.product_owner.policy.bindings
+                    } == {
+                        "coding.base",
+                        "coding.arch.default",
+                        "coding.lsp.default",
+                    }
+                    capability_manager = asyncio.run(
+                        SessionManager.new(
+                            session_dir=tmp_path / "builtin-product-sessions",
+                            cwd=str(workspace),
+                            persist=False,
+                        )
+                    )
+                    capability_factory = owner.factory_for_session(capability_manager)
+                    try:
+                        return capability_factory.create(
+                            PackageProductRuntimeRequestV1(
+                                product_id="coding",
+                                session_id=(
+                                    capability_manager.get_header().conversation_id
+                                ),
+                                cwd=str(workspace),
+                            )
+                        ).activate()
+                    except BaseException:
+                        capability_factory.dispose_unbound_runtime()
+                        raise
+
+                combined_runtime = compose_builtin_product(product_state)
+                try:
+                    for capability_artifact in capability_artifacts:
+                        if capability_artifact not in (
+                            configured_artifact,
+                            cli_artifact,
+                        ):
+                            capability_outcome = combined_runtime.lifecycle.route(
+                                PackageProductLifecycleIntentV1(
+                                    operation_id=(
+                                        f"operation:product-{capability_artifact.plugin_id}"
+                                    ),
+                                    action="install",
+                                    source=str(capability_artifact.path),
+                                    scope="project",
+                                ),
+                                entrypoint="session",
+                            )
+                            assert capability_outcome.handled
+                            assert capability_outcome.record is not None
+                            assert capability_outcome.record.lifecycle == "installed"
+                        capability_key = PluginInstallationKeyV1(
+                            product_id="coding",
+                            installation_scope="workspace",
+                            scope_id=policy.project_scope_id,
+                            plugin_id=capability_artifact.plugin_id,
+                        )
+                        capability_enablement = management.submit(
+                            PluginManagementCommandV1(
+                                action="enable",
+                                mutation=PluginDesiredStateMutationV1(
+                                    operation_id=(
+                                        f"operation:enable-{capability_artifact.plugin_id}"
+                                    ),
+                                    idempotency_key=(
+                                        f"request:enable-{capability_artifact.plugin_id}"
+                                    ),
+                                    expected_inventory_revision=(
+                                        desired.snapshot().inventory_revision
+                                    ),
+                                    installation_key=capability_key,
+                                    desired_state="installed_enabled",
+                                    package_revision=None,
+                                    actor_id=factory.actor_id,
+                                    policy_revision=factory.desired_policy_revision,
+                                ),
+                            )
+                        )
+                        assert capability_enablement.result is not None
+                        assert capability_enablement.result.disposition == "succeeded"
+                        selected_capability = (
+                            combined_runtime.capture_selected_plugin_manifest_for(
+                                capability_artifact.plugin_id,
+                                max_files=64,
+                                max_total_bytes=1024 * 1024,
+                            )
+                        )
+                        assert (
+                            selected_capability.verified_manifest().name
+                            == capability_artifact.plugin_id
+                        )
+                        definition_path = (
+                            capability_artifact.plugin_id.replace(".", "_")
+                            + "/definition.py"
+                        )
+                        with zipfile.ZipFile(capability_artifact.path) as wheel:
+                            assert dict(selected_capability.snapshot.files)[
+                                definition_path
+                            ] == wheel.read(definition_path)
+                        with pytest.raises(ValueError, match="not data-only"):
+                            selected_capability.verified_data_only_declarations()
+                finally:
+                    combined_runtime.dispose_runtime()
+                expected_inventory_revision = desired.snapshot().inventory_revision
+            if checked_in_base:
+                hidden_package = tmp_path / "hidden-post-b-package"
+                hidden_lifecycle = tmp_path / "hidden-post-b-lifecycle"
+                legacy_root.rename(hidden_package)
+                legacy_layout.root.rename(hidden_lifecycle)
+            try:
+                reopened_state = open_coding_package_product_state(
+                    legacy_layout, epoch_runtime
+                )
+                if checked_in_base:
+                    application_owner = open_coding_fenced_product_application_owner(
+                        legacy_layout,
+                        workspace=workspace,
+                        runtime_version="2.0.0",
+                        runtime_protocol_epoch=2,
+                    )
+                    reopened_owner = open_coding_base_product_runtime_owner(
+                        legacy_layout,
+                        epoch_runtime,
+                        reopened_state,
+                        workspace=workspace,
+                        runtime_version="2.0.0",
+                        runtime_protocol_epoch=2,
+                    )
+                    assert (
+                        reopened_owner.product_owner.policy
+                        == product_runtime_owner.product_owner.policy
+                    )
+                    reopened_builtin = compose_builtin_product(reopened_state)
+                    try:
+                        product_capabilities = (
+                            open_coding_product_capability_resolution(
+                                reopened_builtin,
+                                plugin_ids=(
+                                    "coding.lsp.default",
+                                    "coding.arch.default",
+                                ),
+                            )
+                        )
+                        builtin_revisions = open_coding_product_builtin_resolution(
+                            reopened_builtin
+                        )
+                        try:
+                            assert {
+                                package.manifest.name
+                                for package in builtin_revisions.packages
+                            } == {
+                                "coding.base",
+                                "coding.lsp.default",
+                                "coding.arch.default",
+                            }
+                            base_revision = next(
+                                package
+                                for package in builtin_revisions.packages
+                                if package.manifest.name == "coding.base"
+                            )
+                            with base_revision.revision_handle.open_file(
+                                "declarations/plugin.json"
+                            ) as stream:
+                                assert (
+                                    stream.read()
+                                    == dict(
+                                        reopened_builtin.capture_selected_plugin_manifest_for(
+                                            "coding.base",
+                                            max_files=64,
+                                            max_total_bytes=1024 * 1024,
+                                        ).snapshot.files
+                                    )["coding_base/declarations/plugin.json"]
+                                )
+                        finally:
+                            builtin_revisions.close()
+                        selected_capabilities = []
+                        for capability_artifact in capability_artifacts:
+                            selected_capability = (
+                                reopened_builtin.capture_selected_plugin_manifest_for(
+                                    capability_artifact.plugin_id,
+                                    max_files=64,
+                                    max_total_bytes=1024 * 1024,
+                                )
+                            )
+                            assert (
+                                selected_capability.verified_manifest().name
+                                == capability_artifact.plugin_id
+                            )
+                            selected_capabilities.append(selected_capability)
+                            package = next(
+                                item
+                                for item in product_capabilities.packages
+                                if item.manifest.name == capability_artifact.plugin_id
+                            )
+                            assert (
+                                package.content_digest
+                                == capability_artifact.artifact_digest
+                            )
+                            binding = next(
+                                item
+                                for item in product_capabilities.bindings
+                                if item.plugin_id == capability_artifact.plugin_id
+                            )
+                            assert binding.source_identity == (
+                                selected_capability.snapshot.package_revision.package_source_identity
+                            )
+                            definition_path = (
+                                capability_artifact.plugin_id.replace(".", "_")
+                                + "/definition.py"
+                            )
+                            with pytest.raises(PluginRevisionError) as wheel_path:
+                                package.revision_handle.open_file(definition_path)
+                            assert (
+                                wheel_path.value.code == "invalid_plugin_revision_path"
+                            )
+                            with zipfile.ZipFile(capability_artifact.path) as wheel:
+                                with package.revision_handle.open_file(
+                                    "definition.py"
+                                ) as stream:
+                                    assert stream.read() == wheel.read(definition_path)
+                            product_module = load_verified_plugin_python_module(
+                                revision_handle=package.revision_handle,
+                                dependency_lock=package.dependency_lock,
+                                relative_path="definition.py",
+                                module_name=(
+                                    "coding_product_probe_"
+                                    + capability_artifact.plugin_id.replace(".", "_")
+                                ),
+                                host_api_prefixes=(
+                                    "loushang.plugin",
+                                    "loushang.harness.capabilities",
+                                    "loushang.harness.plugin_authoring",
+                                ),
+                                distribution_evidence_resolver=(
+                                    coding_plugin_distribution_evidence_resolver()
+                                ),
+                            )
+                            assert callable(product_module.resolve("declare"))
+                        product_configurations = {
+                            "coding.lsp.default": CodingLspPluginConfigV1.from_runtime_inputs(
+                                workspace_root=workspace,
+                                definitions=(),
+                                baseline_environment={},
+                            ),
+                            "coding.arch.default": CodingArchPluginConfigV1.from_runtime_inputs(
+                                workspace_root=workspace,
+                                private_data_root=(
+                                    reopened_state.state_root
+                                    / "private-data"
+                                    / "coding-arch-default"
+                                ),
+                            ),
+                        }
+                        product_policy_revision = (
+                            reopened_owner.product_owner.policy.policy_revision
+                        )
+                        product_preparation = (
+                            prepare_coding_product_capability_plugin_composition(
+                                reopened_builtin,
+                                session_id=(
+                                    session_manager.get_header().conversation_id
+                                ),
+                                configurations=product_configurations,
+                                state_root=(tmp_path / "product-capability-approval"),
+                                clock=lambda: 1_700_000_000_000,
+                                product_policy_revision=product_policy_revision,
+                            )
+                        )
+                        try:
+                            assert (
+                                product_preparation.selection.plan.context.instance_revision_refs
+                                == tuple(
+                                    sorted(
+                                        (
+                                            item.snapshot.instance_revision_ref
+                                            for item in selected_capabilities
+                                        ),
+                                        key=lambda item: item.plugin_id,
+                                    )
+                                )
+                            )
+                            assert (
+                                product_preparation.selection.plan.source_trust_snapshots
+                                == tuple(
+                                    sorted(
+                                        (
+                                            item.source_trust_snapshot
+                                            for item in selected_capabilities
+                                            if item.source_trust_snapshot is not None
+                                        ),
+                                        key=lambda item: item.plugin_id,
+                                    )
+                                )
+                            )
+                            decisions = (
+                                PluginExecutionDecisionJournal(
+                                    product_preparation.state_root
+                                    / "definition-decisions.jsonl",
+                                    scope_kind="workspace",
+                                    scope_id=product_preparation.scope_id,
+                                    clock=lambda: 1_700_000_000_000,
+                                )
+                                .snapshot()
+                                .decisions
+                            )
+                            assert len(decisions) == 2
+                            assert all(
+                                item.disposition == "approved" for item in decisions
+                            )
+                            assert {
+                                (
+                                    candidate.package.manifest.name,
+                                    candidate.declaration.contribution_id,
+                                )
+                                for candidate in product_preparation.selection.candidates
+                            } == {
+                                ("coding.lsp.default", "coding-lsp-default"),
+                                ("coding.lsp.default", "coding-lsp-tools"),
+                                ("coding.arch.default", "coding-arch-default"),
+                                ("coding.arch.default", "coding-arch-tools"),
+                            }
+                            product_assembly = product_preparation.bind_workspace(
+                                workspace_binding,
+                                host_boot_id="a" * 32,
+                                tool_modes={
+                                    capability_id: "on_demand"
+                                    for capability_id in (
+                                        product_preparation.provider_owner_authorities
+                                    )
+                                },
+                                clock=lambda: 1_700_000_000_000,
+                            )
+                            try:
+                                assert (
+                                    len(
+                                        product_assembly.session_inputs.component_requests
+                                    )
+                                    == 2
+                                )
+                                assert set(product_assembly.tool_owners) == {
+                                    "coding.lsp.default",
+                                    "coding.arch.default",
+                                }
+                            finally:
+                                product_assembly.abort_unpublished()
+                        finally:
+                            product_preparation.close()
+                        builtin_session_id = (
+                            session_manager.get_header().conversation_id
+                        )
+                        with pytest.raises(ValueError, match="base selection changed"):
+                            prepare_coding_builtin_product_composition(
+                                reopened_builtin,
+                                base_compilation=compiled_base,
+                                session_id=builtin_session_id,
+                                configurations=product_configurations,
+                                state_root=(tmp_path / "stale-builtin-approval"),
+                                clock=lambda: 1_700_000_000_000,
+                            )
+                        current_base_compilation = (
+                            compile_coding_base_product_selection(
+                                reopened_builtin.capture_selected_plugin_manifest_for(
+                                    "coding.base",
+                                    max_files=64,
+                                    max_total_bytes=1024 * 1024,
+                                ),
+                                resolve_coding_composition_set("coding-standard"),
+                                installation_key=key,
+                                session_id=builtin_session_id,
+                                host_environment=compiled_base.host_environment,
+                                evaluated_at=1,
+                            )
+                        )
+                        builtin_preparation = (
+                            prepare_coding_builtin_product_composition(
+                                reopened_builtin,
+                                base_compilation=current_base_compilation,
+                                session_id=builtin_session_id,
+                                configurations=product_configurations,
+                                state_root=(tmp_path / "builtin-product-approval"),
+                                clock=lambda: 1_700_000_000_000,
+                            )
+                        )
+                        try:
+                            assert set(
+                                builtin_preparation.capability_preparation.selection.plan.selected_plugin_ids
+                            ) == {
+                                "coding.base",
+                                "coding.lsp.default",
+                                "coding.arch.default",
+                            }
+                            assert (
+                                builtin_preparation.base_compilation.product_composition
+                                is builtin_preparation.capability_preparation.product_composition
+                            )
+                            builtin_session = builtin_preparation.bind_workspace(
+                                workspace_binding,
+                                host_boot_id="a" * 32,
+                                tool_modes={
+                                    capability_id: "on_demand"
+                                    for capability_id in (
+                                        builtin_preparation.capability_preparation.provider_owner_authorities
+                                    )
+                                },
+                                clock=lambda: 1_700_000_000_000,
+                            )
+                            try:
+                                assert (
+                                    builtin_session.base_session.session_inputs
+                                    is builtin_session.capability_assembly.session_inputs
+                                )
+                                assert (
+                                    len(
+                                        builtin_session.base_session.compilation.product_resource_inputs()
+                                    )
+                                    == 2
+                                )
+                                assert all(
+                                    admission.candidate.dependency_lock_digest
+                                    == current_base_compilation.selected_manifest.snapshot.package_revision.dependency_lock_digest
+                                    for admission in builtin_session.base_session.compilation.product_composition.resource_admissions
+                                )
+                                assert (
+                                    builtin_session.base_session.compilation.build_owners(
+                                        clock=lambda: 1,
+                                        tool_options=ToolsOptions(
+                                            host_environment=compiled_base.host_environment
+                                        ),
+                                    ).tool
+                                    is not None
+                                )
+                                assert (
+                                    len(
+                                        builtin_session.capability_assembly.session_inputs.component_requests
+                                    )
+                                    == 2
+                                )
+                            finally:
+                                builtin_session.abort_unpublished()
+                        finally:
+                            builtin_preparation.close()
+                        prior_builtin_session_leases = len(
+                            registry.snapshot(store_id=store_id).active_leases
+                        )
+                        default_builtin_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "builtin-default-session",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        default_builtin_factory = application_owner.factory_for_session(
+                            default_builtin_manager
+                        )
+                        default_builtin_session = None
+                        try:
+                            with (
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                                    side_effect=AssertionError("legacy base route"),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_coding_capability_plugin_composition",
+                                    side_effect=AssertionError(
+                                        "legacy Capability route"
+                                    ),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap._default_package_materializer",
+                                    side_effect=AssertionError("legacy materializer"),
+                                ),
+                            ):
+                                default_builtin_session = create_agent_session(
+                                    session_manager=default_builtin_manager,
+                                    model=Model(
+                                        id="plc9b-builtin-default",
+                                        name="PLC9B Builtin Default",
+                                        provider="test",
+                                        endpoint="anthropic-messages",
+                                        capabilities=Capabilities(
+                                            reasoning=True,
+                                            input=("text",),
+                                            context_window=128000,
+                                            max_tokens=4096,
+                                        ),
+                                    ),
+                                    services=create_services(
+                                        settings_manager=SettingsManager(
+                                            ControlConfig()
+                                        )
+                                    ),
+                                    package_product_runtime_factory=default_builtin_factory,
+                                    composition_set="coding-standard",
+                                )
+                                asyncio.run(
+                                    default_builtin_session.prepare_model_call_runtime()
+                                )
+                            assert default_builtin_session._coding_capability_plugin_assembly is None
+                            assert default_builtin_session._deferred_lsp_slot is not None
+                            assert default_builtin_session._deferred_lsp_slot.state == "dormant"
+                            assert (
+                                default_builtin_session._coding_base_product_compilation.plan.selected_plugin_ids
+                                == ("coding.base",)
+                            )
+                            assert default_builtin_session._coding_base_product_compilation.product_composition is not None
+                            assert (
+                                default_builtin_session._package_controller.get_package_materializer()
+                                is None
+                            )
+                            with pytest.raises(
+                                RuntimeError, match="runtime leases remain active"
+                            ):
+                                application_owner.close()
+                        finally:
+                            if default_builtin_session is not None:
+                                asyncio.run(default_builtin_session.dispose())
+                            else:
+                                default_builtin_factory.dispose_unbound_runtime()
+                        missing_capability_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "missing-product-capability",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        missing_capability_factory = reopened_owner.factory_for_session(
+                            missing_capability_manager
+                        )
+                        try:
+                            with (
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_coding_capability_plugin_composition",
+                                    side_effect=AssertionError(
+                                        "legacy Capability fallback"
+                                    ),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap._default_package_materializer",
+                                    side_effect=AssertionError(
+                                        "legacy materializer fallback"
+                                    ),
+                                ),
+                                pytest.raises(PackageProductRuntimeReadError),
+                            ):
+                                create_agent_session(
+                                    session_manager=missing_capability_manager,
+                                    model=Model(
+                                        id="plc9b-missing-capability",
+                                        name="PLC9B Missing Capability",
+                                        provider="test",
+                                        endpoint="anthropic-messages",
+                                        capabilities=Capabilities(
+                                            reasoning=True,
+                                            input=("text",),
+                                            context_window=128000,
+                                            max_tokens=4096,
+                                        ),
+                                    ),
+                                    services=create_services(
+                                        settings_manager=SettingsManager(
+                                            ControlConfig(
+                                                capabilities={"coding.lsp": "always"}
+                                            )
+                                        )
+                                    ),
+                                    package_product_runtime_factory=(
+                                        missing_capability_factory
+                                    ),
+                                    composition_set="coding-standard",
+                                )
+                        finally:
+                            missing_capability_factory.dispose_unbound_runtime()
+                        architecture_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "builtin-architecture-session",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        architecture_factory = application_owner.factory_for_session(
+                            architecture_manager
+                        )
+                        assert (
+                            architecture_factory.epoch_runtime
+                            is default_builtin_factory.epoch_runtime
+                        )
+                        architecture_session = None
+                        try:
+                            with (
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                                    side_effect=AssertionError("legacy base route"),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap.prepare_coding_capability_plugin_composition",
+                                    side_effect=AssertionError(
+                                        "legacy Capability route"
+                                    ),
+                                ),
+                                patch(
+                                    "loushang.coding.bootstrap._default_package_materializer",
+                                    side_effect=AssertionError("legacy materializer"),
+                                ),
+                            ):
+                                architecture_session = create_agent_session(
+                                    session_manager=architecture_manager,
+                                    model=Model(
+                                        id="plc9b-builtin-architecture",
+                                        name="PLC9B Builtin Architecture",
+                                        provider="test",
+                                        endpoint="anthropic-messages",
+                                        capabilities=Capabilities(
+                                            reasoning=True,
+                                            input=("text",),
+                                            context_window=128000,
+                                            max_tokens=4096,
+                                        ),
+                                    ),
+                                    services=create_services(
+                                        settings_manager=SettingsManager(
+                                            ControlConfig()
+                                        )
+                                    ),
+                                    package_product_runtime_factory=architecture_factory,
+                                    composition_set="coding-architecture",
+                                )
+                                asyncio.run(
+                                    architecture_session.prepare_model_call_runtime()
+                                )
+                            assert set(
+                                architecture_session._coding_base_product_compilation.plan.selected_plugin_ids
+                            ) == {
+                                "coding.base",
+                                "coding.arch.default",
+                            }
+                            assert set(
+                                architecture_session._coding_capability_plugin_assembly.tool_owners
+                            ) == {"coding.arch.default"}
+                            assert architecture_session._deferred_lsp_slot is not None
+                            assert architecture_session._deferred_lsp_slot.state == "dormant"
+                        finally:
+                            if architecture_session is not None:
+                                asyncio.run(architecture_session.dispose())
+                            else:
+                                architecture_factory.dispose_unbound_runtime()
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_builtin_session_leases
+                        )
+
+                        async def standalone_product_session() -> None:
+                            with patch(
+                                "loushang.coding.bootstrap.resolve_platform_home",
+                                return_value=tmp_path / "standalone-platform",
+                            ):
+                                standalone = create_agent_session_runtime(
+                                    session_dir=tmp_path / "standalone-b-sessions",
+                                    model=Model(
+                                        id="plc9b-standalone-default",
+                                        name="PLC9B Standalone Default",
+                                        provider="test",
+                                        endpoint="anthropic-messages",
+                                        capabilities=Capabilities(
+                                            reasoning=True,
+                                            input=("text",),
+                                            context_window=128000,
+                                            max_tokens=4096,
+                                        ),
+                                    ),
+                                    services=create_services(
+                                        settings_manager=SettingsManager(
+                                            ControlConfig()
+                                        )
+                                    ),
+                                    persist=False,
+                                )
+                            try:
+                                with (
+                                    patch(
+                                        "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                                        return_value=legacy_layout,
+                                    ),
+                                    patch(
+                                        "loushang.coding.package_product_runtime.version",
+                                        return_value="2.0.0",
+                                    ),
+                                    patch(
+                                        "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                                        side_effect=AssertionError(
+                                            "legacy standalone base"
+                                        ),
+                                    ),
+                                    patch(
+                                        "loushang.coding.bootstrap.prepare_coding_capability_plugin_composition",
+                                        side_effect=AssertionError(
+                                            "legacy standalone Capability"
+                                        ),
+                                    ),
+                                    patch(
+                                        "loushang.coding.bootstrap._default_package_materializer",
+                                        side_effect=AssertionError(
+                                            "legacy standalone materializer"
+                                        ),
+                                    ),
+                                ):
+                                    selected = await standalone.create_session(
+                                        cwd=str(workspace)
+                                    )
+                                    await selected.prepare_model_call_runtime()
+                                assert (
+                                    selected._package_controller.get_package_materializer()
+                                    is None
+                                )
+                                assert (
+                                    selected._coding_base_product_compilation.plan.selected_plugin_ids
+                                    == ("coding.base",)
+                                )
+                            finally:
+                                await standalone.dispose_session_runtime()
+
+                        asyncio.run(standalone_product_session())
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_builtin_session_leases
+                        )
+                        direct_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "direct-b-sessions",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        direct_session = None
+                        with (
+                            patch(
+                                "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                                return_value=legacy_layout,
+                            ),
+                            patch(
+                                "loushang.coding.package_product_runtime.version",
+                                return_value="2.0.0",
+                            ),
+                            patch(
+                                "loushang.coding.bootstrap.prepare_managed_coding_base_plugin_assembly",
+                                side_effect=AssertionError("legacy direct base"),
+                            ),
+                            patch(
+                                "loushang.coding.bootstrap.prepare_coding_capability_plugin_composition",
+                                side_effect=AssertionError("legacy direct Capability"),
+                            ),
+                            patch(
+                                "loushang.coding.bootstrap._default_package_materializer",
+                                side_effect=AssertionError(
+                                    "legacy direct materializer"
+                                ),
+                            ),
+                        ):
+                            try:
+                                direct_session = create_agent_session(
+                                    session_manager=direct_manager,
+                                    model=Model(
+                                        id="plc9b-direct-default",
+                                        name="PLC9B Direct Default",
+                                        provider="test",
+                                        endpoint="anthropic-messages",
+                                        capabilities=Capabilities(
+                                            reasoning=True,
+                                            input=("text",),
+                                            context_window=128000,
+                                            max_tokens=4096,
+                                        ),
+                                    ),
+                                    services=create_services(
+                                        settings_manager=SettingsManager(
+                                            ControlConfig()
+                                        )
+                                    ),
+                                )
+                                asyncio.run(direct_session.prepare_model_call_runtime())
+                                assert (
+                                    direct_session._package_controller.get_package_materializer()
+                                    is None
+                                )
+                                assert (
+                                    direct_session._coding_base_product_compilation.plan.selected_plugin_ids
+                                    == ("coding.base",)
+                                )
+                                before_transports = len(
+                                    PackageLifecycleJournal(
+                                        state_root / "lifecycle.jsonl"
+                                    ).records()
+                                )
+                                with patch.object(
+                                    direct_session,
+                                    "update_package",
+                                    side_effect=AssertionError(
+                                        "legacy transport update"
+                                    ),
+                                ):
+                                    with pytest.raises(
+                                        PackageLifecycleError,
+                                        match="package_route_unavailable",
+                                    ):
+                                        asyncio.run(
+                                            run_package_lifecycle(
+                                                direct_session,
+                                                PackageLifecycleRequest(
+                                                    update=(str(source),),
+                                                    scope="project",
+                                                ),
+                                            )
+                                        )
+                                    direct_rpc_output = io.StringIO()
+                                    direct_rpc = RpcPackageCommands(
+                                        runtime=object(),
+                                        get_session=lambda: direct_session,
+                                        output=RpcOutput(direct_rpc_output),
+                                    )
+                                    asyncio.run(
+                                        dict(direct_rpc.bindings())["update_package"](
+                                            "request:default-product-update",
+                                            {"source": str(source), "scope": "project"},
+                                        )
+                                    )
+                                direct_rpc_result = json.loads(
+                                    direct_rpc_output.getvalue().splitlines()[-1]
+                                )
+                                assert direct_rpc_result["success"] is False
+                                transport_failures = [
+                                    record
+                                    for record in PackageLifecycleJournal(
+                                        state_root / "lifecycle.jsonl"
+                                    ).records()[before_transports:]
+                                    if record.request.action == "update"
+                                    and record.status.failure is not None
+                                    and record.status.failure.code
+                                    == "package_route_unavailable"
+                                ]
+                                assert len(transport_failures) == 2
+                            finally:
+                                if direct_session is not None:
+                                    asyncio.run(direct_session.dispose())
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_builtin_session_leases
+                        )
+                        rejected_direct_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "rejected-direct-b-sessions",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        with (
+                            patch(
+                                "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                                return_value=legacy_layout,
+                            ),
+                            patch(
+                                "loushang.coding.package_product_runtime.version",
+                                return_value="2.0.0",
+                            ),
+                            pytest.raises(
+                                ValueError, match="Unsupported Coding composition set"
+                            ),
+                        ):
+                            create_agent_session(
+                                session_manager=rejected_direct_manager,
+                                model=Model(
+                                    id="plc9b-direct-rejected",
+                                    name="PLC9B Direct Rejected",
+                                    provider="test",
+                                    endpoint="anthropic-messages",
+                                    capabilities=Capabilities(
+                                        reasoning=True,
+                                        input=("text",),
+                                        context_window=128000,
+                                        max_tokens=4096,
+                                    ),
+                                ),
+                                composition_set="unsupported",
+                            )
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_builtin_session_leases
+                        )
+                        configured_manager = asyncio.run(
+                            SessionManager.new(
+                                session_dir=tmp_path / "configured-b-sessions",
+                                cwd=str(workspace),
+                                persist=False,
+                            )
+                        )
+                        before_configured = len(
+                            PackageLifecycleJournal(
+                                state_root / "lifecycle.jsonl"
+                            ).records()
+                        )
+                        configured_services = create_services(
+                            settings_manager=SettingsManager(
+                                ControlConfig(
+                                    package_sources=(
+                                        PackageSourceConfig(source=str(source)),
+                                    )
+                                )
+                            )
+                        )
+                        with (
+                            patch(
+                                "loushang.coding.package_product_runtime.resolve_coding_plugin_lifecycle_state_layout",
+                                return_value=legacy_layout,
+                            ),
+                            patch(
+                                "loushang.coding.package_product_runtime.version",
+                                return_value="2.0.0",
+                            ),
+                            patch(
+                                "loushang.coding.bootstrap._default_package_materializer",
+                                side_effect=AssertionError(
+                                    "legacy startup materializer"
+                                ),
+                            ),
+                            pytest.raises(PackageProductStartupSourceError),
+                        ):
+                            create_agent_session(
+                                session_manager=configured_manager,
+                                model=Model(
+                                    id="plc9b-configured-default",
+                                    name="PLC9B Configured Default",
+                                    provider="test",
+                                    endpoint="anthropic-messages",
+                                    capabilities=Capabilities(
+                                        reasoning=True,
+                                        input=("text",),
+                                        context_window=128000,
+                                        max_tokens=4096,
+                                    ),
+                                ),
+                                services=configured_services,
+                            )
+                        configured_records = PackageLifecycleJournal(
+                            state_root / "lifecycle.jsonl"
+                        ).records()[before_configured:]
+                        assert any(
+                            record.request.action == "install"
+                            and record.status.failure is not None
+                            for record in configured_records
+                        )
+                        configured_failure_codes = {
+                            record.status.failure.code
+                            for record in configured_records
+                            if record.request.action == "install"
+                            and record.status.failure is not None
+                        }
+                        startup_diagnostics = (
+                            configured_services.diagnostics_service.get_diagnostics(
+                                phase="startup", source="package"
+                            )
+                        )
+                        assert configured_failure_codes <= {
+                            diagnostic.code for diagnostic in startup_diagnostics
+                        }
+                        assert all(
+                            diagnostic.type == "error"
+                            for diagnostic in startup_diagnostics
+                            if diagnostic.code in configured_failure_codes
+                        )
+                        assert (
+                            len(registry.snapshot(store_id=store_id).active_leases)
+                            == prior_builtin_session_leases
+                        )
+                        # Other live Store owners do not retain this
+                        # application's rooted control handle.
+                        application_owner.close()
+                        with pytest.raises(ValueError, match="closed"):
+                            application_owner.epoch_runtime.assert_current()
+                        stale_preparation = (
+                            prepare_coding_product_capability_plugin_composition(
+                                reopened_builtin,
+                                session_id=(
+                                    session_manager.get_header().conversation_id
+                                ),
+                                configurations=product_configurations,
+                                state_root=(
+                                    tmp_path / "stale-product-capability-approval"
+                                ),
+                                clock=lambda: 1_700_000_000_000,
+                                product_policy_revision=product_policy_revision,
+                            )
+                        )
+                        reopened_builtin.dispose_runtime()
+                        try:
+                            with pytest.raises(PluginRevisionError) as stale_selection:
+                                stale_preparation.bind_workspace(
+                                    workspace_binding,
+                                    host_boot_id="a" * 32,
+                                    tool_modes={
+                                        capability_id: "on_demand"
+                                        for capability_id in (
+                                            stale_preparation.provider_owner_authorities
+                                        )
+                                    },
+                                    clock=lambda: 1_700_000_000_000,
+                                )
+                            assert (
+                                stale_selection.value.code == "plugin_revision_changed"
+                            )
+                        finally:
+                            stale_preparation.close()
+                    finally:
+                        reopened_builtin.dispose_runtime()
+                    try:
+                        for package in product_capabilities.packages:
+                            with pytest.raises(PluginRevisionError) as closed:
+                                package.revision_handle.verify()
+                            assert closed.value.code == "plugin_revision_changed"
+                    finally:
+                        product_capabilities.close()
+            finally:
+                if checked_in_base:
+                    hidden_lifecycle.rename(legacy_layout.root)
+                    hidden_package.rename(legacy_root)
+            assert reopened_state.state_root == state_root
+            assert reopened_state.desired_state.snapshot() == desired.snapshot()
+            assert reopened_state.gc_bindings.records() == bindings.records()
+            before_swap = lifecycle_journal.records()
+            plugin_root.rename(tmp_path / "moved-plugin-store")
+            plugin_root.mkdir(mode=0o700)
+            if entrypoint == "session" and not with_dependency:
+                with pytest.raises(PackagePhysicalStagingError) as swapped:
+                    runtime.read_selected_plugin_file(
+                        key, "coding_base/plugin.json", max_bytes=4096
+                    )
+                assert swapped.value.code == "package_publication_root_untrusted"
+            if entrypoint == "session":
+                with pytest.raises(ValueError, match="cutover evidence changed"):
+                    factory.create(
+                        PackageProductRuntimeRequestV1(
+                            product_id="coding",
+                            session_id=session_manager.get_header().conversation_id,
+                            cwd=str(workspace),
+                        )
+                    )
+            with pytest.raises(PackageProductActivationError) as changed_root:
+                activation.route(
+                    PackageProductLifecycleIntentV1(
+                        operation_id="operation:changed-root",
+                        action="install",
+                        source=str(source),
+                        scope="project",
+                    ),
+                    entrypoint="startup",
+                )
+            assert changed_root.value.code == "package_runtime_epoch_unsupported"
+            assert lifecycle_journal.records() == before_swap
+            assert desired.snapshot().inventory_revision == expected_inventory_revision
+        finally:
+            if session is not None:
+                asyncio.run(session.dispose())
+                if entrypoint == "session" and not with_dependency:
+                    from loushang.harness.package_product.product_runtime import (
+                        PackageProductRuntimeActivationError,
+                    )
+
+                    with pytest.raises(PackageProductRuntimeActivationError) as closed:
+                        runtime.read_selected_plugin_file(
+                            key, "coding_base/plugin.json", max_bytes=4096
+                        )
+                    assert closed.value.code == "package_product_runtime_inactive"
+                    with pytest.raises(
+                        PackageProductRuntimeActivationError
+                    ) as closed_batch:
+                        runtime.read_selected_plugin_files(
+                            key, ("coding_base/plugin.json",), max_total_bytes=4096
+                        )
+                    assert closed_batch.value.code == "package_product_runtime_inactive"
+                    with pytest.raises(
+                        PackageProductRuntimeActivationError
+                    ) as closed_capture:
+                        runtime.capture_selected_plugin_root(
+                            key, max_files=64, max_total_bytes=1024 * 1024
+                        )
+                    assert (
+                        closed_capture.value.code == "package_product_runtime_inactive"
+                    )
+                    with pytest.raises(
+                        PackageProductRuntimeActivationError
+                    ) as closed_manifest:
+                        runtime.capture_selected_plugin_manifest(
+                            key, max_files=64, max_total_bytes=1024 * 1024
+                        )
+                    assert (
+                        closed_manifest.value.code == "package_product_runtime_inactive"
+                    )
+                try:
+                    unexpected = registry.snapshot(store_id=store_id)
+                except PackageEpochRuntimeLeaseRegistryError as released:
+                    assert released.code == "package_epoch_lease_absent"
+                else:
+                    scope = locals()
+                    owner_ids = {
+                        name: sha256(value.get_header().conversation_id.encode()).hexdigest()
+                        for name, value in scope.items()
+                        if isinstance(value, SessionManager)
+                    }
+                    raise AssertionError(
+                        f"unexpected live epoch leases: {unexpected!r}; owners={owner_ids!r}"
+                    )
+            if not runtime_lease_released:
+                runtime_lease.release()
+        assert pre_b_tree() == frozen_pre_b_tree
+    finally:
+        if application_owner is not None:
+            application_owner.close()
+        epoch_runtime.close()
+
+
+def _configured_product_gc_owner(
+    *,
+    workspace: Path,
+    state_root: Path,
+    plugin_root: Path,
+    policy: PackageProductLocalWheelPolicy,
+    environment: PackageResolutionEnvironmentV1,
+    root_store_identity: str,
+    dependency_store_identity: str,
+    epoch_runtime: PackageProductPosixFencedRuntimeOwner,
+    management: PluginManagementService,
+    desired: PluginDesiredStateLedger,
+    bindings: PluginPackageGcBindingJournal,
+    gate: PluginPackageGcReservationJournal,
+) -> PosixLocalWheelProductSessionOwner:
+    return PosixLocalWheelProductSessionOwner(
+        workspace=workspace,
+        state_root=state_root,
+        plugin_store_root=plugin_root,
+        policy=policy,
+        environment=environment,
+        acquisition_budgets=PackageAcquisitionBudgetV1(
+            max_transport_bytes=256 * 1024,
+            max_requests=1,
+            max_redirects=0,
+            max_wall_time_ms=1000,
+        ),
+        inspection_budgets=PackageInspectionBudgetV1(),
+        closure_budgets=PackageClosureBudgetV1(),
+        root_store_identity=root_store_identity,
+        dependency_store_identity=dependency_store_identity,
+        epoch_runtime=epoch_runtime,
+        management=management,
+        desired_state=desired,
+        gc_bindings=bindings,
+        gc_gate=gate,
+        actor_id="product-runtime",
+        desired_policy_revision="product-policy:1",
+        recovery_identity="product-runtime-recovery",
+        runtime_version="2.0.0",
+        runtime_protocol_epoch=2,
+    )
+
+
+def _assert_posix_product_dependency_gc_after_install(
+    *,
+    workspace: Path,
+    state_root: Path,
+    plugin_root: Path,
+    policy: PackageProductLocalWheelPolicy,
+    environment: PackageResolutionEnvironmentV1,
+    root_store_identity: str,
+    dependency_store_identity: str,
+    epoch_runtime: PackageProductPosixFencedRuntimeOwner,
+    management: PluginManagementService,
+    desired: PluginDesiredStateLedger,
+    bindings: PluginPackageGcBindingJournal,
+    gate: PluginPackageGcReservationJournal,
+    first_store_failure: bool,
+    repair_store_failure: bool,
+) -> None:
+    from argparse import Namespace
+
+    from loushang.coding.cli.package_gc import (
+        _CodingPackageGcRepairAuthority,
+        _operation_identity,
+    )
+    from loushang.coding.cli.package_gc import (
+        _run as run_gc_operator_command,
+    )
+    from loushang.harness.package_product.product_gc_executor import (
+        PackageProductGcExecutionError,
+        PackageProductRootGcCommandV1,
+    )
+    from loushang.harness.plugin_management.operations import PluginManagementCommandV1
+    from loushang.harness.plugin_management.package_gc_dependency_journal import (
+        PackageDependencyGcJournal,
+        PackageDependencyGcStartV1,
+    )
+    from loushang.harness.plugin_management.package_gc_dependency_repair import (
+        PackageDependencyGcRepairJournal,
+        PackageDependencyGcRepairJournalError,
+    )
+    from loushang.harness.plugin_management.package_gc_dependency_review import (
+        PackageDependencyGcRepairReviewJournal,
+        _review_id,
+    )
+    from loushang.harness.plugin_management.records import PluginDesiredStateMutationV1
+    from loushang.harness.resources.packages.plugin_lifecycle.posix_materialization import (
+        PosixPackageDependencyMaterializationStore,
+    )
+
+    selected = desired.snapshot().installations[0]
+    removed = management.submit(
+        PluginManagementCommandV1(
+            action="remove",
+            mutation=PluginDesiredStateMutationV1(
+                operation_id="operation:dependency-gc-remove",
+                idempotency_key="request:dependency-gc-remove",
+                expected_inventory_revision=1,
+                installation_key=selected.installation_key,
+                desired_state="absent",
+                package_revision=None,
+                actor_id="product-runtime",
+                policy_revision="product-policy:1",
+            ),
+        )
+    )
+    assert removed.status == "terminal"
+    product = _configured_product_gc_owner(
+        workspace=workspace,
+        state_root=state_root,
+        plugin_root=plugin_root,
+        policy=policy,
+        environment=environment,
+        root_store_identity=root_store_identity,
+        dependency_store_identity=dependency_store_identity,
+        epoch_runtime=epoch_runtime,
+        management=management,
+        desired=desired,
+        bindings=bindings,
+        gate=gate,
+    )
+    gc = open_posix_local_wheel_product_root_gc(product)
+    gc.prepare()
+    (candidate,) = gc.candidates()
+    assert candidate.package_revision == selected.selection.package_revision
+    (retained,) = gc.dependency_inspections()
+    assert retained.retention.disposition == "retained"
+    assert retained.target is None
+    (dependency_settlement,) = PackageStoreSettlementJournal(
+        state_root / "dependency-settlements.jsonl"
+    ).records()
+    with pytest.raises(PackageProductGcExecutionError) as live_holder:
+        gc.delete_dependency(
+            retained.retention.dependency_ref.ref_id,
+            expected_settlement_id=dependency_settlement.settlement_id,
+            operation_id="operation:dependency-live-holder",
+            idempotency_key="request:dependency-live-holder",
+        )
+    assert live_holder.value.code == "plugin_package_gc_dependency_target_unavailable"
+    assert not (state_root / "dependency-gc.jsonl").exists()
+    root_result = gc.execute(
+        PackageProductRootGcCommandV1(
+            candidate=candidate,
+            reservation_operation_id="operation:dependency-gc-reserve",
+            reservation_idempotency_key="request:dependency-gc-reserve",
+            attempt_operation_id="operation:dependency-gc-root-delete",
+            attempt_idempotency_key="request:dependency-gc-root-delete",
+        )
+    )
+    assert root_result.disposition == "succeeded"
+    (orphan,) = gc.operator_snapshot().dependency_inspections
+    assert orphan.retention.disposition == "orphan_candidate"
+    assert orphan.target is not None
+    settlement = orphan.target.settlement
+    dependency_tree = state_root / "dependency-store" / settlement.final_name
+    assert dependency_tree.is_dir()
+    journal_path = state_root / "dependency-gc.jsonl"
+    with pytest.raises(PackageProductGcExecutionError) as wrong_settlement:
+        gc.delete_dependency(
+            orphan.retention.dependency_ref.ref_id,
+            expected_settlement_id="0" * 64,
+            operation_id="operation:dependency-wrong-settlement",
+            idempotency_key="request:dependency-wrong-settlement",
+        )
+    assert (
+        wrong_settlement.value.code == "plugin_package_gc_dependency_target_unavailable"
+    )
+    live_runtime = product.factory_for_session(
+        session_id="dependency-gc-live-session",
+        cwd=workspace,
+        runtime_id="dependency-gc-live-session",
+    )
+    try:
+        with pytest.raises(PackageProductGcExecutionError) as active_runtime:
+            gc.delete_dependency(
+                orphan.retention.dependency_ref.ref_id,
+                expected_settlement_id=settlement.settlement_id,
+                operation_id="operation:dependency-live-runtime",
+                idempotency_key="request:dependency-live-runtime",
+            )
+        assert active_runtime.value.code == "plugin_package_gc_runtime_active"
+    finally:
+        live_runtime.dispose_unbound_runtime()
+    assert dependency_tree.is_dir()
+    assert not journal_path.exists()
+    failed_attempt = None
+    if first_store_failure:
+
+        def fail_store_delete(*args: object, **kwargs: object) -> object:
+            raise PackagePhysicalStagingError(
+                "Dependency Store tree is temporarily unavailable",
+                code="package_publication_root_untrusted",
+            )
+
+        with patch.object(
+            PosixPackageDependencyMaterializationStore,
+            "delete_settlement",
+            fail_store_delete,
+        ):
+            failed_attempt = gc.delete_dependency(
+                orphan.retention.dependency_ref.ref_id,
+                expected_settlement_id=settlement.settlement_id,
+                operation_id="operation:dependency-store-failure",
+                idempotency_key="request:dependency-store-failure",
+            )
+        assert failed_attempt.disposition == "terminal_failure"
+        assert failed_attempt.error_code == "package_publication_root_untrusted"
+        assert dependency_tree.is_dir()
+        (start, _) = PackageDependencyGcJournal(journal_path).events()
+        assert isinstance(start, PackageDependencyGcStartV1)
+        review_path = state_root / "dependency-gc-reviews.jsonl"
+        reviews = PackageDependencyGcRepairReviewJournal(review_path)
+        with pytest.raises(PackageProductGcExecutionError) as wrong_review:
+            gc.record_terminal_dependency_review(
+                start.start_id,
+                expected_terminal_attempt_id=failed_attempt.attempt_id,
+                expected_settlement_id="0" * 64,
+                expected_error_code=failed_attempt.error_code,
+                actor_id="coding:package-gc-cli",
+                policy_revision="coding:package-gc-repair-v1",
+                remediation_reference="incident:dependency-tree-reviewed",
+            )
+        assert wrong_review.value.code == (
+            "plugin_package_gc_dependency_repair_review_refused"
+        )
+        assert not review_path.exists()
+        reviewed = run_gc_operator_command(
+            gc,
+            Namespace(
+                action="review-dependency-debt",
+                start_id=start.start_id,
+                terminal_attempt_id=failed_attempt.attempt_id,
+                settlement_id=settlement.settlement_id,
+                error_code=failed_attempt.error_code,
+                remediation_reference="incident:dependency-tree-reviewed",
+            ),
+        )
+        (review,) = reviews.records()
+        assert reviewed["reviewId"] == review.review_id
+        assert review.start_id == failed_attempt.start_id
+        assert PackageDependencyGcRepairReviewJournal(review_path).records() == (
+            review,
+        )
+        before_review_replay = review_path.read_bytes()
+        assert (
+            reviews.record(
+                start,
+                failed_attempt,
+                actor_id="coding:package-gc-cli",
+                policy_revision="coding:package-gc-repair-v1",
+                remediation_reference="incident:dependency-tree-reviewed",
+            )
+            == review
+        )
+        with pytest.raises(ValueError, match="repair review changed"):
+            reviews.record(
+                start,
+                failed_attempt,
+                actor_id="coding:package-gc-cli",
+                policy_revision="coding:package-gc-repair-v1",
+                remediation_reference="incident:unreviewed-replacement",
+            )
+        assert review_path.read_bytes() == before_review_replay
+        forged_identity = review._identity()
+        forged_identity["settlementId"] = "0" * 64
+        forged_document = {
+            **review.to_dict(),
+            **forged_identity,
+            "reviewId": _review_id(forged_identity),
+        }
+        review_path.write_text(
+            json.dumps(forged_document, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        with pytest.raises(PackageProductGcExecutionError) as forged_review:
+            gc.inspect_dependency_repair(forged_document["reviewId"])
+        assert forged_review.value.code == (
+            "plugin_package_gc_dependency_repair_review_refused"
+        )
+        review_path.write_bytes(before_review_replay)
+        repair_path = state_root / "dependency-gc-repairs.jsonl"
+        repairs = PackageDependencyGcRepairJournal(repair_path)
+        repair_operation_id = _operation_identity(
+            "dependency-repair",
+            epoch_runtime.registry.store_id,
+            review.review_id,
+            "reviewed-repair",
+        )
+        repair_start = repairs.begin(
+            review,
+            operation_id=repair_operation_id,
+            idempotency_key=repair_operation_id,
+        )
+        assert repairs.result_for(repair_start) is None
+        assert (
+            PackageDependencyGcRepairJournal(repair_path).begin(
+                review,
+                operation_id=repair_operation_id,
+                idempotency_key=repair_operation_id,
+            )
+            == repair_start
+        )
+        before_repair_replay = repair_path.read_bytes()
+        with pytest.raises(PackageDependencyGcRepairJournalError) as changed_repair:
+            repairs.begin(
+                review,
+                operation_id="operation:changed-repair",
+                idempotency_key="request:changed-repair",
+            )
+        assert changed_repair.value.code == (
+            "plugin_package_gc_dependency_repair_start_conflict"
+        )
+        assert repair_path.read_bytes() == before_repair_replay
+        assert gc.inspect_dependency_repair(review.review_id).state == "started"
+        with pytest.raises(PackageProductGcExecutionError) as unknown_review:
+            gc.inspect_dependency_repair("0" * 64)
+        assert unknown_review.value.code == (
+            "plugin_package_gc_dependency_repair_review_unavailable"
+        )
+        before_inspection = journal_path.read_bytes()
+        inspection, debt = gc.inspect_terminal_dependency_debt(failed_attempt.start_id)
+        assert inspection.deletion_state == "terminal_failure"
+        assert inspection.latest_attempt_id == failed_attempt.attempt_id
+        assert debt == failed_attempt
+        assert run_gc_operator_command(
+            gc,
+            Namespace(
+                action="inspect-dependency-debt",
+                start_id=failed_attempt.start_id,
+            ),
+        ) == {
+            "attemptId": failed_attempt.attempt_id,
+            "disposition": "terminal_failure",
+            "errorCode": "package_publication_root_untrusted",
+            "settlementId": settlement.settlement_id,
+            "startId": failed_attempt.start_id,
+            "storeId": epoch_runtime.registry.store_id,
+        }
+        assert journal_path.read_bytes() == before_inspection
+        live_debt_runtime = product.factory_for_session(
+            session_id="dependency-gc-debt-live-session",
+            cwd=workspace,
+            runtime_id="dependency-gc-debt-live-session",
+        )
+        try:
+            with pytest.raises(PackageProductGcExecutionError) as active_debt:
+                gc.inspect_terminal_dependency_debt(failed_attempt.start_id)
+            assert active_debt.value.code == "plugin_package_gc_runtime_active"
+            with pytest.raises(PackageProductGcExecutionError) as active_review:
+                gc.record_terminal_dependency_review(
+                    start.start_id,
+                    expected_terminal_attempt_id=failed_attempt.attempt_id,
+                    expected_settlement_id=settlement.settlement_id,
+                    expected_error_code=failed_attempt.error_code,
+                    actor_id="coding:package-gc-cli",
+                    policy_revision="coding:package-gc-repair-v1",
+                    remediation_reference="incident:dependency-tree-reviewed",
+                )
+            assert active_review.value.code == "plugin_package_gc_runtime_active"
+        finally:
+            live_debt_runtime.dispose_unbound_runtime()
+        assert journal_path.read_bytes() == before_inspection
+        with pytest.raises(PackageProductGcExecutionError) as unknown_debt:
+            gc.inspect_terminal_dependency_debt("0" * 64)
+        assert (
+            unknown_debt.value.code
+            == "plugin_package_gc_dependency_terminal_debt_unavailable"
+        )
+        assert journal_path.read_bytes() == before_inspection
+        assert (
+            gc.delete_dependency(
+                orphan.retention.dependency_ref.ref_id,
+                expected_settlement_id=settlement.settlement_id,
+                operation_id="operation:dependency-store-failure",
+                idempotency_key="request:dependency-store-failure",
+            )
+            == failed_attempt
+        )
+        (failed_status,) = gc.operator_snapshot().dependency_inspections
+        assert failed_status.to_dict()["targetStatus"] == "terminal_failure"
+        with patch.object(
+            PosixPackageDependencyMaterializationStore,
+            "delete_settlement",
+            side_effect=AssertionError("terminal debt reached Store again"),
+        ):
+            assert (
+                gc.retry_dependency(
+                    failed_attempt.start_id,
+                    operation_id="operation:dependency-terminal-retry",
+                    idempotency_key="request:dependency-terminal-retry",
+                )
+                == failed_attempt
+            )
+            assert (
+                run_gc_operator_command(
+                    gc,
+                    Namespace(
+                        action="retry-dependency",
+                        start_id=failed_attempt.start_id,
+                        attempt_key="terminal-retry",
+                    ),
+                )["disposition"]
+                == "terminal_failure"
+            )
+        with pytest.raises(PackageProductGcExecutionError) as closed_repair:
+            gc.repair_terminal_dependency_debt(
+                review.review_id,
+                operation_id=repair_start.operation_id,
+                idempotency_key=repair_start.idempotency_key,
+            )
+        assert closed_repair.value.code == (
+            "plugin_package_gc_dependency_repair_unavailable"
+        )
+
+        class RefusingRepairAuthority:
+            def authorizes(self, candidate: object, target: object) -> bool:
+                return False
+
+        before_policy_refusal = repair_path.read_bytes()
+        with patch.object(
+            PosixPackageDependencyMaterializationStore,
+            "delete_settlement",
+            side_effect=AssertionError("refused repair reached Store"),
+        ):
+            with pytest.raises(PackageProductGcExecutionError) as policy_refusal:
+                replace(
+                    gc, repair_authority=RefusingRepairAuthority()
+                ).repair_terminal_dependency_debt(
+                    review.review_id,
+                    operation_id=repair_start.operation_id,
+                    idempotency_key=repair_start.idempotency_key,
+                )
+        assert policy_refusal.value.code == (
+            "plugin_package_gc_dependency_repair_review_refused"
+        )
+        assert repair_path.read_bytes() == before_policy_refusal
+
+        repair_owner = replace(gc, repair_authority=_CodingPackageGcRepairAuthority())
+        root_gc_results = state_root / "gc-results.jsonl"
+        settled_root_results = root_gc_results.read_bytes()
+        root_gc_results.write_bytes(b"")
+        try:
+            with patch.object(
+                PosixPackageDependencyMaterializationStore,
+                "delete_settlement",
+                side_effect=AssertionError("lost holder proof reached Store"),
+            ):
+                with pytest.raises(PackageProductGcExecutionError) as lost_holder:
+                    repair_owner.repair_terminal_dependency_debt(
+                        review.review_id,
+                        operation_id=repair_start.operation_id,
+                        idempotency_key=repair_start.idempotency_key,
+                    )
+            assert lost_holder.value.code == (
+                "plugin_package_gc_dependency_terminal_debt_unavailable"
+            )
+        finally:
+            root_gc_results.write_bytes(settled_root_results)
+        assert repair_path.read_bytes() == before_policy_refusal
+        if repair_store_failure:
+            with patch.object(
+                PosixPackageDependencyMaterializationStore,
+                "delete_settlement",
+                side_effect=PackagePhysicalStagingError(
+                    "Dependency tree still conflicts",
+                    code="package_publication_collision",
+                ),
+            ):
+                repair_failure = repair_owner.repair_terminal_dependency_debt(
+                    review.review_id,
+                    operation_id=repair_start.operation_id,
+                    idempotency_key=repair_start.idempotency_key,
+                )
+            assert repair_failure.disposition == "terminal_failure"
+            assert repair_failure.error_code == "package_publication_collision"
+            assert dependency_tree.is_dir()
+            assert gc.inspect_dependency_repair(review.review_id).state == (
+                "terminal_failure"
+            )
+            assert (
+                run_gc_operator_command(gc, Namespace(action="list"))[
+                    "dependencyRepairs"
+                ][0]["state"]
+                == "terminal_failure"
+            )
+            with patch.object(
+                PosixPackageDependencyMaterializationStore,
+                "delete_settlement",
+                side_effect=AssertionError("terminal repair reached Store again"),
+            ):
+                assert (
+                    repair_owner.repair_terminal_dependency_debt(
+                        review.review_id,
+                        operation_id=repair_start.operation_id,
+                        idempotency_key=repair_start.idempotency_key,
+                    )
+                    == repair_failure
+                )
+            with pytest.raises(PackageProductGcExecutionError) as wrong_predecessor:
+                gc.record_terminal_dependency_review(
+                    start.start_id,
+                    expected_terminal_attempt_id=failed_attempt.attempt_id,
+                    expected_settlement_id=settlement.settlement_id,
+                    expected_error_code=failed_attempt.error_code,
+                    actor_id="coding:package-gc-cli",
+                    policy_revision="coding:package-gc-repair-v1",
+                    remediation_reference="incident:second-remediation",
+                    prior_repair_result_id="0" * 64,
+                )
+            assert wrong_predecessor.value.code == (
+                "plugin_package_gc_dependency_repair_review_refused"
+            )
+            second_review_output = run_gc_operator_command(
+                gc,
+                Namespace(
+                    action="review-dependency-debt",
+                    start_id=start.start_id,
+                    terminal_attempt_id=failed_attempt.attempt_id,
+                    settlement_id=settlement.settlement_id,
+                    error_code=failed_attempt.error_code,
+                    remediation_reference="incident:second-remediation",
+                    prior_repair_result_id=repair_failure.repair_result_id,
+                ),
+            )
+            second_review = reviews.records()[-1]
+            assert second_review_output["reviewId"] == second_review.review_id
+            assert second_review.record_version == 2
+            assert (
+                second_review.prior_repair_result_id == repair_failure.repair_result_id
+            )
+            assert gc.inspect_dependency_repair(second_review.review_id).state == (
+                "reviewed"
+            )
+            with pytest.raises(PackageDependencyGcRepairJournalError) as old_review:
+                repairs.begin(
+                    review,
+                    operation_id="operation:old-review-new-attempt",
+                    idempotency_key="request:old-review-new-attempt",
+                )
+            assert old_review.value.code == (
+                "plugin_package_gc_dependency_repair_start_conflict"
+            )
+            second_output = run_gc_operator_command(
+                repair_owner,
+                Namespace(
+                    action="repair-dependency-debt",
+                    review_id=second_review.review_id,
+                    attempt_key="second-remediation",
+                ),
+            )
+            assert second_output["disposition"] == "succeeded"
+            assert not dependency_tree.exists()
+            assert gc.inspect_dependency_repair(review.review_id).state == (
+                "terminal_failure"
+            )
+            assert gc.inspect_dependency_repair(second_review.review_id).state == (
+                "succeeded"
+            )
+            assert (
+                gc.record_terminal_dependency_review(
+                    start.start_id,
+                    expected_terminal_attempt_id=failed_attempt.attempt_id,
+                    expected_settlement_id=settlement.settlement_id,
+                    expected_error_code=failed_attempt.error_code,
+                    actor_id="coding:package-gc-cli",
+                    policy_revision="coding:package-gc-repair-v1",
+                    remediation_reference="incident:second-remediation",
+                    prior_repair_result_id=repair_failure.repair_result_id,
+                )
+                == second_review
+            )
+            with pytest.raises(PackageProductGcExecutionError) as stale_predecessor:
+                gc.record_terminal_dependency_review(
+                    start.start_id,
+                    expected_terminal_attempt_id=failed_attempt.attempt_id,
+                    expected_settlement_id=settlement.settlement_id,
+                    expected_error_code=failed_attempt.error_code,
+                    actor_id="coding:package-gc-cli",
+                    policy_revision="coding:package-gc-repair-v1",
+                    remediation_reference="incident:third-remediation",
+                    prior_repair_result_id=repair_failure.repair_result_id,
+                )
+            assert stale_predecessor.value.code == (
+                "plugin_package_gc_dependency_repair_review_refused"
+            )
+            settled_reviews = review_path.read_bytes()
+            forged_identity = second_review._identity()
+            forged_identity["priorRepairResultId"] = "0" * 64
+            forged_document = {
+                **second_review.to_dict(),
+                **forged_identity,
+                "reviewId": _review_id(forged_identity, version=2),
+            }
+            review_lines = review_path.read_text(encoding="utf-8").splitlines()
+            assert len(review_lines) == 2
+            review_lines[-1] = json.dumps(forged_document, sort_keys=True)
+            review_path.write_text("\n".join(review_lines) + "\n", encoding="utf-8")
+            try:
+                with pytest.raises(PackageProductGcExecutionError) as forged_prior:
+                    gc.inspect_dependency_repair(forged_document["reviewId"])
+                assert forged_prior.value.code == (
+                    "plugin_package_gc_dependency_repair_review_refused"
+                )
+            finally:
+                review_path.write_bytes(settled_reviews)
+            review_documents = [
+                json.loads(line)
+                for line in settled_reviews.decode("utf-8").splitlines()
+            ]
+            for index in (0, 1):
+                changed = [dict(item) for item in review_documents]
+                if index == 0:
+                    changed[index]["priorRepairResultId"] = None
+                else:
+                    changed[index].pop("priorRepairResultId")
+                review_path.write_text(
+                    "\n".join(json.dumps(item, sort_keys=True) for item in changed)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with pytest.raises(ValueError):
+                    PackageDependencyGcRepairReviewJournal(review_path).records()
+            review_path.write_bytes(settled_reviews)
+            settled_repairs = repair_path.read_bytes()
+            repair_documents = [
+                json.loads(line)
+                for line in settled_repairs.decode("utf-8").splitlines()
+            ]
+            for index in (0, 2):
+                changed = [dict(item) for item in repair_documents]
+                if index == 0:
+                    changed[index]["priorRepairResultId"] = None
+                else:
+                    changed[index].pop("priorRepairResultId")
+                repair_path.write_text(
+                    "\n".join(json.dumps(item, sort_keys=True) for item in changed)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                with pytest.raises(ValueError):
+                    PackageDependencyGcRepairJournal(repair_path).events()
+            repair_path.write_bytes(settled_repairs)
+            assert [
+                item["state"]
+                for item in run_gc_operator_command(gc, Namespace(action="list"))[
+                    "dependencyRepairs"
+                ]
+            ] == ["terminal_failure", "succeeded"]
+            return
+        original_repair_record = PackageDependencyGcRepairJournal.record
+        with patch.object(
+            PackageDependencyGcRepairJournal,
+            "record",
+            side_effect=RuntimeError("crash after reviewed Store deletion"),
+        ):
+            with pytest.raises(RuntimeError, match="crash after reviewed"):
+                repair_owner.repair_terminal_dependency_debt(
+                    review.review_id,
+                    operation_id=repair_start.operation_id,
+                    idempotency_key=repair_start.idempotency_key,
+                )
+        assert not dependency_tree.exists()
+        assert (
+            PackageDependencyGcRepairJournal(repair_path).result_for(repair_start)
+            is None
+        )
+        assert gc.inspect_dependency_repair(review.review_id).state == "started"
+        assert PackageDependencyGcRepairJournal.record is original_repair_record
+        child_script = """
+import json
+import sys
+from argparse import Namespace
+from hashlib import sha256
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from test_plc9b_adversarial import _closure_environment, _configured_product_gc_owner
+from loushang.coding._plugin_lifecycle import resolve_ephemeral_coding_plugin_lifecycle_state_layout
+from loushang.coding.cli.package_gc import _CodingPackageGcRepairAuthority, _run
+from loushang.coding.package_epoch_layout import resolve_coding_package_epoch_layout
+from loushang.coding.package_product_runtime import open_coding_package_product_state
+from loushang.harness.package_product.product_root_gc_runtime import open_posix_local_wheel_product_root_gc
+from loushang.harness.resources.packages.product_epoch_guard import PackageProductPosixFencedRuntimeOwner
+from loushang.harness.resources.packages.product_local_wheel_policy import (
+    PackageProductLocalWheelBindingV1,
+    PackageProductLocalWheelDependencyV1,
+    PackageProductLocalWheelPolicy,
+)
+
+base = Path(sys.argv[2])
+workspace = base / "workspace"
+source_root = base / "sources"
+source = source_root / "acme_plugin-1.0-py3-none-any.whl"
+dependency = source_root / "dependency-2.0-py3-none-any.whl"
+environment = _closure_environment()
+policy = PackageProductLocalWheelPolicy(
+    product_id="coding",
+    project_scope_id="workspace:manifest",
+    source_root=source_root,
+    bindings=(PackageProductLocalWheelBindingV1(
+        source_identity=str(source),
+        requested_package="acme-plugin==1.0",
+        plugin_id="acme.plugin",
+        artifact_digest=sha256(source.read_bytes()).hexdigest(),
+    ),),
+    dependencies=(PackageProductLocalWheelDependencyV1(
+        source_identity=str(dependency),
+        project_name="dependency",
+        version="2.0",
+        artifact_digest=sha256(dependency.read_bytes()).hexdigest(),
+    ),),
+    policy_revision="package-policy:1",
+    quota_profile_revision="quota:1",
+    resolution_environment_fingerprint=environment.fingerprint,
+    authority_id="coding-local-source:runtime",
+)
+layout = resolve_ephemeral_coding_plugin_lifecycle_state_layout(
+    base / "legacy-coding", cwd=workspace
+)
+epoch = resolve_coding_package_epoch_layout(layout)
+runtime = PackageProductPosixFencedRuntimeOwner.open(
+    authority_root=epoch.authority_root,
+    control_root=epoch.control_root,
+    store_id=epoch.store_id,
+    epochs_root_name=epoch.epochs_root_name,
+)
+try:
+    state = open_coding_package_product_state(layout, runtime)
+    product = _configured_product_gc_owner(
+        workspace=workspace,
+        state_root=state.state_root,
+        plugin_root=epoch.epoch_root(runtime.cutover_result.fence.request.namespace_id),
+        policy=policy,
+        environment=environment,
+        root_store_identity=sys.argv[3],
+        dependency_store_identity=sys.argv[4],
+        epoch_runtime=runtime,
+        management=state.management,
+        desired=state.desired_state,
+        bindings=state.gc_bindings,
+        gate=state.gc_gate,
+    )
+    gc = open_posix_local_wheel_product_root_gc(
+        product, repair_authority=_CodingPackageGcRepairAuthority()
+    )
+    print(json.dumps(_run(gc, Namespace(
+        action="repair-dependency-debt",
+        review_id=sys.argv[5],
+        attempt_key="reviewed-repair",
+    ))))
+finally:
+    runtime.close()
+"""
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_script,
+                str(Path(__file__).parent),
+                str(workspace.parent),
+                root_store_identity,
+                dependency_store_identity,
+                review.review_id,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        repaired_output = json.loads(child.stdout)
+        repaired = PackageDependencyGcRepairJournal(repair_path).result_for(
+            repair_start
+        )
+        assert repaired is not None
+        assert repaired_output["repairResultId"] == repaired.repair_result_id
+        assert repaired.disposition == "succeeded"
+        assert repaired.store_result is not None
+        assert repaired.store_result.disposition == "already_absent"
+        repair_status = gc.inspect_dependency_repair(review.review_id)
+        assert repair_status.state == "succeeded"
+        assert repair_status.repair_result_id == repaired.repair_result_id
+        assert gc.operator_snapshot().dependency_repairs == (repair_status,)
+        assert (
+            run_gc_operator_command(gc, Namespace(action="list"))["dependencyRepairs"][
+                0
+            ]["state"]
+            == "succeeded"
+        )
+        assert (
+            run_gc_operator_command(
+                gc,
+                Namespace(
+                    action="inspect-dependency-repair", review_id=review.review_id
+                ),
+            )["state"]
+            == "succeeded"
+        )
+        reopened_repair_owner = open_posix_local_wheel_product_root_gc(
+            product, repair_authority=_CodingPackageGcRepairAuthority()
+        )
+        assert reopened_repair_owner.inspect_dependency_repair(review.review_id) == (
+            repair_status
+        )
+        with patch.object(
+            PosixPackageDependencyMaterializationStore,
+            "delete_settlement",
+            side_effect=AssertionError("settled repair reached Store again"),
+        ):
+            assert (
+                reopened_repair_owner.repair_terminal_dependency_debt(
+                    review.review_id,
+                    operation_id=repair_start.operation_id,
+                    idempotency_key=repair_start.idempotency_key,
+                )
+                == repaired
+            )
+            assert (
+                gc.retry_dependency(
+                    failed_attempt.start_id,
+                    operation_id="operation:after-reviewed-repair",
+                    idempotency_key="request:after-reviewed-repair",
+                )
+                == failed_attempt
+            )
+        raw_repair = repair_path.read_text(encoding="utf-8")
+        repair_kind = '"recordKind": "dependency_gc_repair_start"'
+        assert repair_kind in raw_repair
+        repair_path.write_text(
+            raw_repair.replace(repair_kind, f"{repair_kind},{repair_kind}", 1),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="duplicate JSON key"):
+            PackageDependencyGcRepairJournal(repair_path).events()
+        raw_review = review_path.read_text(encoding="utf-8")
+        actor_field = '"actorId": "coding:package-gc-cli"'
+        assert actor_field in raw_review
+        review_path.write_text(
+            raw_review.replace(actor_field, f"{actor_field},{actor_field}", 1),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="duplicate JSON key"):
+            PackageDependencyGcRepairReviewJournal(review_path).records()
+        return
+    with pytest.raises(PackageProductGcExecutionError) as not_terminal_debt:
+        gc.inspect_terminal_dependency_debt(orphan.retention.dependency_ref.ref_id)
+    assert (
+        not_terminal_debt.value.code
+        == "plugin_package_gc_dependency_terminal_debt_unavailable"
+    )
+    original_record = PackageDependencyGcJournal.record
+
+    def crash_after_store_delete(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("crash after dependency Store deletion")
+
+    with patch.object(PackageDependencyGcJournal, "record", crash_after_store_delete):
+        with pytest.raises(RuntimeError, match="crash after dependency Store deletion"):
+            run_gc_operator_command(
+                gc,
+                Namespace(
+                    action="delete-dependency",
+                    dependency_ref_id=orphan.retention.dependency_ref.ref_id,
+                    settlement_id=settlement.settlement_id,
+                    attempt_key="first-delete",
+                ),
+            )
+    assert not dependency_tree.exists()
+    events = PackageDependencyGcJournal(journal_path).events()
+    start = events[0]
+    assert len(events) == (2 if first_store_failure else 1)
+    assert isinstance(start, PackageDependencyGcStartV1)
+    assert start.settlement_id == settlement.settlement_id
+    (pending,) = gc.operator_snapshot().dependency_inspections
+    assert pending.to_dict()["targetStatus"] == (
+        "retryable_failure" if first_store_failure else "started"
+    )
+    assert pending.deletion_start_id == start.start_id
+    reopened = open_posix_local_wheel_product_root_gc(product)
+    result = reopened.retry_dependency(
+        start.start_id,
+        operation_id="operation:dependency-gc-retry",
+        idempotency_key="request:dependency-gc-retry",
+    )
+    assert result.disposition == "succeeded"
+    assert result.store_result is not None
+    assert result.store_result.disposition == "already_absent"
+    assert (
+        reopened.retry_dependency(
+            start.start_id,
+            operation_id="operation:dependency-gc-retry",
+            idempotency_key="request:dependency-gc-retry",
+        )
+        == result
+    )
+    (finished,) = reopened.operator_snapshot().dependency_inspections
+    assert finished.to_dict()["targetStatus"] == "succeeded"
+    assert finished.latest_attempt_id == result.attempt_id
+    operator_result = run_gc_operator_command(
+        reopened,
+        Namespace(
+            action="retry-dependency",
+            start_id=start.start_id,
+            attempt_key="replay-after-crash",
+        ),
+    )
+    assert operator_result["disposition"] == "succeeded"
+    assert operator_result["startId"] == start.start_id
+    assert original_record is PackageDependencyGcJournal.record
+
+
+def _assert_posix_product_shared_dependency_gc(
+    *,
+    workspace: Path,
+    state_root: Path,
+    plugin_root: Path,
+    policy: PackageProductLocalWheelPolicy,
+    environment: PackageResolutionEnvironmentV1,
+    root_store_identity: str,
+    dependency_store_identity: str,
+    epoch_runtime: PackageProductPosixFencedRuntimeOwner,
+    management: PluginManagementService,
+    desired: PluginDesiredStateLedger,
+    bindings: PluginPackageGcBindingJournal,
+    gate: PluginPackageGcReservationJournal,
+) -> None:
+    from loushang.harness.package_product.product_gc_executor import (
+        PackageProductGcExecutionError,
+        PackageProductRootGcCommandV1,
+    )
+    from loushang.harness.plugin_management.operations import PluginManagementCommandV1
+    from loushang.harness.plugin_management.records import PluginDesiredStateMutationV1
+
+    selected = desired.snapshot().installations
+    assert len(selected) == 2
+    first_revision = selected[0].selection.package_revision
+    second_revision = selected[1].selection.package_revision
+    assert first_revision is not None and second_revision is not None
+    for index, installation in enumerate(selected):
+        removed = management.submit(
+            PluginManagementCommandV1(
+                action="remove",
+                mutation=PluginDesiredStateMutationV1(
+                    operation_id=f"operation:shared-gc-remove:{index}",
+                    idempotency_key=f"request:shared-gc-remove:{index}",
+                    expected_inventory_revision=2 + index,
+                    installation_key=installation.installation_key,
+                    desired_state="absent",
+                    package_revision=None,
+                    actor_id="product-runtime",
+                    policy_revision="product-policy:1",
+                ),
+            )
+        )
+        assert removed.status == "terminal"
+    settlements = PackageStoreSettlementJournal(
+        state_root / "dependency-settlements.jsonl"
+    ).records()
+    assert len(settlements) == 2
+    assert settlements[0].receipt.stable_ref == settlements[1].receipt.stable_ref
+    assert settlements[0].tree_identity == settlements[1].tree_identity
+    dependency_ref = settlements[0].receipt.stable_ref
+    dependency_tree = state_root / "dependency-store" / settlements[0].final_name
+    assert dependency_tree.is_dir()
+    assert len(tuple((state_root / "dependency-store").glob("artifact-*"))) == 1
+    product = _configured_product_gc_owner(
+        workspace=workspace,
+        state_root=state_root,
+        plugin_root=plugin_root,
+        policy=policy,
+        environment=environment,
+        root_store_identity=root_store_identity,
+        dependency_store_identity=dependency_store_identity,
+        epoch_runtime=epoch_runtime,
+        management=management,
+        desired=desired,
+        bindings=bindings,
+        gate=gate,
+    )
+    gc = open_posix_local_wheel_product_root_gc(product)
+    store_opens: list[bool] = []
+    concrete_store = gc.dependency_store_factory
+
+    def counted_dependency_store():
+        store_opens.append(True)
+        return concrete_store()
+
+    gc = replace(gc, dependency_store_factory=counted_dependency_store)
+    gc.prepare()
+    (retained,) = gc.dependency_inspections()
+    assert len(retained.retention.live_root_ref_ids) == 2
+    assert retained.target is None
+    candidates = gc.candidates()
+    assert len(candidates) == 2
+    for index, revision in enumerate((first_revision, second_revision)):
+        candidate = next(
+            item for item in candidates if item.package_revision == revision
+        )
+        root_result = gc.execute(
+            PackageProductRootGcCommandV1(
+                candidate=candidate,
+                reservation_operation_id=f"operation:shared-gc-reserve:{index}",
+                reservation_idempotency_key=f"request:shared-gc-reserve:{index}",
+                attempt_operation_id=f"operation:shared-gc-delete:{index}",
+                attempt_idempotency_key=f"request:shared-gc-delete:{index}",
+            )
+        )
+        assert root_result.disposition == "succeeded"
+        (inspection,) = gc.dependency_inspections()
+        assert dependency_tree.is_dir()
+        if index == 0:
+            assert len(inspection.retention.live_root_ref_ids) == 1
+            with pytest.raises(PackageProductGcExecutionError) as live_holder:
+                gc.delete_dependency(
+                    dependency_ref.ref_id,
+                    expected_settlement_id=settlements[0].settlement_id,
+                    operation_id="operation:shared-gc-early-delete",
+                    idempotency_key="request:shared-gc-early-delete",
+                )
+            assert (
+                live_holder.value.code
+                == "plugin_package_gc_dependency_target_unavailable"
+            )
+            assert store_opens == []
+            assert not (state_root / "dependency-gc.jsonl").exists()
+            gc = replace(
+                open_posix_local_wheel_product_root_gc(product),
+                dependency_store_factory=counted_dependency_store,
+            )
+            (reopened_retention,) = gc.dependency_inspections()
+            assert len(reopened_retention.retention.live_root_ref_ids) == 1
+        else:
+            assert inspection.retention.live_root_ref_ids == ()
+            assert inspection.target is not None
+            assert inspection.target.settlement_id == settlements[0].settlement_id
+    deleted = gc.delete_dependency(
+        dependency_ref.ref_id,
+        expected_settlement_id=settlements[0].settlement_id,
+        operation_id="operation:shared-gc-dependency-delete",
+        idempotency_key="request:shared-gc-dependency-delete",
+    )
+    assert deleted.disposition == "succeeded"
+    assert store_opens == [True]
+    assert not dependency_tree.exists()
+
+
+def _assert_product_root_gc_after_install(
+    *,
+    tmp_path: Path,
+    state_root: Path,
+    plugin_root: Path,
+    store_id: str,
+    management: PluginManagementService,
+    desired: PluginDesiredStateLedger,
+    bindings: PluginPackageGcBindingJournal,
+    gate: PluginPackageGcReservationJournal,
+    with_dependency: bool,
+    crash_after_delete: bool,
+    drop_store_tombstone: bool,
+    collide_before_delete: bool,
+    invalid_attempt_id: bool,
+    prior_result_conflict: bool,
+    via_product_command: bool,
+    stale_product_command: bool,
+    unsealed_product_command: bool,
+) -> None:
+    from loushang.harness.package_product.product_gc_executor import (
+        PackageProductGcExecutionError,
+        PackageProductRootGcApplication,
+        PackageProductRootGcCommandV1,
+        PackageProductRootGcExecutor,
+        PackageProductRootGcReadModel,
+    )
+    from loushang.harness.plugin_management.continuity_adapter import (
+        PluginContinuitySecurityRetirementJournal,
+    )
+    from loushang.harness.plugin_management.instance_runtime import (
+        PluginInstanceRuntimeLedger,
+    )
+    from loushang.harness.plugin_management.operations import PluginManagementCommandV1
+    from loushang.harness.plugin_management.package_gc_reservation import (
+        PluginPackageGcDeletionStartV2,
+    )
+    from loushang.harness.plugin_management.package_gc_results import (
+        PluginPackageGcResultError,
+        PluginPackageGcResultJournal,
+    )
+    from loushang.harness.plugin_management.package_lifecycle import (
+        PluginPackageGcCandidateV1,
+        PluginPackageLifecycleError,
+        PluginPackageLifecycleLedger,
+    )
+    from loushang.harness.plugin_management.records import (
+        PluginDesiredStateMutationV1,
+    )
+    from loushang.harness.plugin_management.retirement import (
+        PluginRetirementIntentLedger,
+    )
+    from loushang.harness.plugin_management.retirement_sets import (
+        PluginRetirementSetLedger,
+    )
+
+    selected = desired.snapshot().installations[0]
+    package_revision = selected.selection.package_revision
+    assert package_revision is not None
+    assert bindings.for_revision(package_revision)
+    removed = management.submit(
+        PluginManagementCommandV1(
+            action="remove",
+            mutation=PluginDesiredStateMutationV1(
+                operation_id="operation:gc-remove",
+                idempotency_key="request:gc-remove",
+                expected_inventory_revision=1,
+                installation_key=selected.installation_key,
+                desired_state="absent",
+                package_revision=None,
+                actor_id="product-runtime",
+                policy_revision="product-policy:1",
+            ),
+        )
+    )
+    assert removed.status == "terminal"
+    runtime_path = tmp_path / "gc-instance-runtime.jsonl"
+    intents = PluginRetirementIntentLedger(management.retirement_intent_journal_path)
+    retirement_sets = PluginRetirementSetLedger(
+        management.retirement_set_journal_path,
+        retirement_intents=intents,
+    )
+    instances = PluginInstanceRuntimeLedger(
+        runtime_path,
+        management_operation_journal_path=management.operation_journal_path,
+        desired_state=desired,
+        retirement_intents=intents,
+        retirement_sets=retirement_sets,
+        security_acceptances=(
+            PluginContinuitySecurityRetirementJournal.for_instance_runtime(runtime_path)
+        ),
+        gc_gate=gate,
+    )
+    packages = PluginPackageLifecycleLedger(
+        tmp_path / "gc-packages.jsonl",
+        startup_id="startup:gc-product",
+        desired_state=desired,
+        instance_runtime=instances,
+        retirement_sets=retirement_sets,
+        gc_gate=gate,
+    )
+    packages.complete_startup_recovery(
+        operation_id="operation:gc-recover",
+        idempotency_key="request:gc-recover",
+        recovery_reference="recovery:gc-product",
+    )
+    (candidate,) = packages.gc_candidates()
+    assert candidate.package_revision == package_revision
+    reservation = None
+    if not via_product_command:
+        reservation = gate.reserve(
+            candidate,
+            lifecycle=packages,
+            operation_id="operation:gc-reserve",
+            idempotency_key="request:gc-reserve",
+        )
+    if not unsealed_product_command:
+        for owner in (desired, instances, packages):
+            owner.seal_gc_writer_epoch()
+
+    root_settlements = PackageStoreSettlementJournal(
+        state_root / "root-settlements.jsonl"
+    )
+    (settlement,) = root_settlements.records()
+    assert (plugin_root / settlement.final_name).is_dir()
+    root_store = PosixPackagePluginRootMaterializationStore(
+        plugin_root,
+        store_identity="product-runtime-root-store",
+        package_store_id=store_id,
+        settlement_journal=root_settlements,
+    )
+    results = PluginPackageGcResultJournal(tmp_path / "gc-results.jsonl")
+    executor = PackageProductRootGcExecutor(
+        gate=gate,
+        lifecycle=packages,
+        bindings=bindings,
+        committed_sets=PackageCommittedSetJournal(state_root / "committed-sets.jsonl"),
+        root_settlements=root_settlements,
+        root_store=root_store,
+        results=results,
+    )
+    read_model = PackageProductRootGcReadModel(executor)
+    assert tuple(row.state for row in read_model.snapshot()) == (
+        () if via_product_command else ("reserved",)
+    )
+    if via_product_command:
+        with pytest.raises(ValueError, match="one bound owner graph"):
+            PackageProductRootGcApplication(
+                gate=PluginPackageGcReservationJournal(gate.path),
+                lifecycle=packages,
+                executor=executor,
+            )
+        application = PackageProductRootGcApplication(
+            gate=gate, lifecycle=packages, executor=executor
+        )
+        if stale_product_command:
+            candidate = PluginPackageGcCandidateV1.create(
+                package_revision=candidate.package_revision,
+                desired_inventory_revision=candidate.desired_inventory_revision + 1,
+                instance_runtime_revision=candidate.instance_runtime_revision,
+                package_journal_revision=candidate.package_journal_revision,
+                recovery_barrier_id=candidate.recovery_barrier_id,
+            )
+        command = PackageProductRootGcCommandV1(
+            candidate=candidate,
+            reservation_operation_id="operation:gc-reserve",
+            reservation_idempotency_key="request:gc-reserve",
+            attempt_operation_id="operation:gc-delete",
+            attempt_idempotency_key="request:gc-delete",
+        )
+        if unsealed_product_command:
+            with pytest.raises(PackageProductGcExecutionError) as unsealed:
+                application.execute(command)
+            assert unsealed.value.code == "plugin_package_gc_writer_epoch_unsealed"
+            assert gate.snapshot().active == ()
+            assert read_model.snapshot() == ()
+            assert (plugin_root / settlement.final_name).is_dir()
+            assert not results.path.exists()
+            return
+        if stale_product_command:
+            with pytest.raises(PluginPackageLifecycleError):
+                application.execute(command)
+            assert gate.snapshot().active == ()
+            assert read_model.snapshot() == ()
+            assert (plugin_root / settlement.final_name).is_dir()
+            assert not root_settlements.is_tombstoned(
+                settlement.receipt.stable_ref.ref_id
+            )
+            assert not executor.committed_sets.is_tombstoned(
+                settlement.receipt.stable_ref.ref_id
+            )
+            assert not results.path.exists()
+            return
+        attempt = application.execute(command)
+        assert application.execute(command) == attempt
+        (reservation,) = gate.snapshot().active
+        assert tuple(row.state for row in read_model.snapshot()) == ("succeeded",)
+    assert reservation is not None
+    if prior_result_conflict:
+        prior_start = PluginPackageGcDeletionStartV2(
+            journal_revision=1,
+            reservation_id="f" * 64,
+            operation_id="operation:prior-gc-start",
+            idempotency_key="request:prior-gc-start",
+            target_settlement_ids=(settlement.settlement_id,),
+        )
+        results.record(
+            prior_start,
+            settlement=settlement,
+            operation_id="operation:prior-gc-attempt",
+            idempotency_key="request:prior-gc-attempt",
+            error_code="prior.result.conflict",
+        )
+        with pytest.raises(PluginPackageGcResultError) as conflict:
+            executor.execute(
+                reservation.reservation_id,
+                operation_id="operation:gc-delete",
+                idempotency_key="request:gc-delete",
+            )
+        assert conflict.value.code == "plugin_package_gc_result_conflict"
+        assert gate.deletion_start(reservation.reservation_id) is not None
+        (status,) = read_model.snapshot()
+        assert status.state == "evidence_conflict"
+        assert status.reason_code == "plugin_package_gc_result_conflict"
+        assert (plugin_root / settlement.final_name).is_dir()
+        assert not root_settlements.is_tombstoned(settlement.receipt.stable_ref.ref_id)
+        assert not executor.committed_sets.is_tombstoned(
+            settlement.receipt.stable_ref.ref_id
+        )
+        return
+    if invalid_attempt_id:
+        with pytest.raises(ValueError, match="attempt identity"):
+            executor.execute(
+                reservation.reservation_id,
+                operation_id=123,  # type: ignore[arg-type]
+                idempotency_key="request:gc-delete",
+            )
+        assert gate.deletion_start(reservation.reservation_id) is None
+        assert tuple(row.state for row in read_model.snapshot()) == ("reserved",)
+        assert (plugin_root / settlement.final_name).is_dir()
+        assert not root_settlements.is_tombstoned(settlement.receipt.stable_ref.ref_id)
+        assert not executor.committed_sets.is_tombstoned(
+            settlement.receipt.stable_ref.ref_id
+        )
+        assert not results.path.exists()
+        return
+    if collide_before_delete:
+        outside = tmp_path / "outside-gc.txt"
+        outside.write_bytes(b"preserve")
+        victim = (
+            plugin_root
+            / settlement.final_name
+            / settlement.file_identities[0].logical_path
+        )
+        victim.unlink()
+        victim.symlink_to(outside)
+        failed = executor.execute(
+            reservation.reservation_id,
+            operation_id="operation:gc-delete",
+            idempotency_key="request:gc-delete",
+        )
+        assert failed.disposition == "terminal_failure"
+        assert failed.store_result is None
+        assert failed.error_code is not None
+        (status,) = read_model.snapshot()
+        assert status.state == "terminal_failure"
+        assert status.reason_code == failed.error_code
+        assert outside.read_bytes() == b"preserve"
+        assert (plugin_root / settlement.final_name).is_dir()
+        assert root_settlements.is_tombstoned(settlement.receipt.stable_ref.ref_id)
+        assert executor.committed_sets.is_tombstoned(
+            settlement.receipt.stable_ref.ref_id
+        )
+        start = gate.deletion_start(reservation.reservation_id)
+        assert start is not None
+        assert PluginPackageGcResultJournal(results.path).attempts(start) == (failed,)
+        assert (
+            executor.execute(
+                reservation.reservation_id,
+                operation_id="operation:gc-retry",
+                idempotency_key="request:gc-retry",
+            )
+            == failed
+        )
+        return
+    if crash_after_delete:
+
+        class InterruptingResults:
+            def attempts(self, start):
+                return results.attempts(start)
+
+            def preflight(self, start, **kwargs):
+                return results.preflight(start, **kwargs)
+
+            def record(self, *_args, **_kwargs):
+                raise RuntimeError("injected crash after physical Store deletion")
+
+        with pytest.raises(RuntimeError, match="injected crash"):
+            replace(executor, results=InterruptingResults()).execute(  # type: ignore[arg-type]
+                reservation.reservation_id,
+                operation_id="operation:gc-delete",
+                idempotency_key="request:gc-delete",
+            )
+        start = gate.deletion_start(reservation.reservation_id)
+        assert start is not None
+        assert results.attempts(start) == ()
+        assert tuple(row.state for row in read_model.snapshot()) == (
+            "deletion_started",
+        )
+        assert not (plugin_root / settlement.final_name).exists()
+        restarted_store = PosixPackagePluginRootMaterializationStore(
+            plugin_root,
+            store_identity="product-runtime-root-store",
+            package_store_id=store_id,
+            settlement_journal=PackageStoreSettlementJournal(root_settlements.path),
+        )
+        executor = replace(
+            executor,
+            root_store=restarted_store,
+            results=PluginPackageGcResultJournal(results.path),
+        )
+        attempt = executor.execute(
+            reservation.reservation_id,
+            operation_id="operation:gc-retry",
+            idempotency_key="request:gc-retry",
+        )
+    elif not via_product_command:
+        attempt = executor.execute(
+            reservation.reservation_id,
+            operation_id="operation:gc-delete",
+            idempotency_key="request:gc-delete",
+        )
+    assert attempt.disposition == "succeeded"
+    assert attempt.store_result is not None
+    assert attempt.store_result.disposition == (
+        "already_absent" if crash_after_delete else "deleted"
+    )
+    (status,) = read_model.snapshot()
+    assert status.state == "succeeded"
+    assert status.latest_attempt == attempt
+    assert status.to_dict()["statusVersion"] == 1
+    assert not (plugin_root / settlement.final_name).exists()
+    assert root_settlements.is_tombstoned(settlement.receipt.stable_ref.ref_id)
+    assert executor.committed_sets.is_tombstoned(settlement.receipt.stable_ref.ref_id)
+    start = gate.deletion_start(reservation.reservation_id)
+    assert start is not None
+    assert start.target_settlement_ids == (settlement.settlement_id,)
+    assert PluginPackageGcResultJournal(results.path).attempts(start) == (attempt,)
+    assert (
+        executor.execute(
+            reservation.reservation_id,
+            operation_id=attempt.operation_id,
+            idempotency_key=attempt.idempotency_key,
+        )
+        == attempt
+    )
+    dependency_settlements = PackageStoreSettlementJournal(
+        state_root / "dependency-settlements.jsonl"
+    ).records()
+    assert len(dependency_settlements) == int(with_dependency)
+    for dependency in dependency_settlements:
+        assert (state_root / "dependency-store" / dependency.final_name).is_dir()
+    if drop_store_tombstone:
+        lines = root_settlements.path.read_text(encoding="utf-8").splitlines()
+        assert json.loads(lines[-1])["recordKind"] == "store_gc_tombstone"
+        root_settlements.path.write_text("\n".join(lines[:-1]) + "\n", encoding="utf-8")
+        with pytest.raises(PackageProductGcExecutionError) as missing_fence:
+            executor.execute(
+                reservation.reservation_id,
+                operation_id=attempt.operation_id,
+                idempotency_key=attempt.idempotency_key,
+            )
+        assert missing_fence.value.code == "plugin_package_gc_fence_missing"
+        (status,) = read_model.snapshot()
+        assert status.state == "evidence_conflict"
+        assert status.reason_code == "plugin_package_gc_fence_missing"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_committed_replay_recovers_before_handoff_open(tmp_path: Path) -> None:
+    admission = _manifest_product_admission()
+    secret = "manifest-product-handoff-recovery"
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source=(
+                f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                f"?token={secret}#{secret}"
+            ),
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        secret=secret,
+        product_ingress=ingress,
+        product_root_target=True,
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+    handoff = _FailOnceProductHandoff(product.finalizer)
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(),
+            budgets=PackageClosureBudgetV1(),
+        ),
+        recovery_identity="manifest-product-handoff-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=handoff,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel,
+            transaction=transaction,
+        )
+    )
+    route = PackageProductRouteRequestV1(
+        entrypoint="cli", ingress=ingress, admission=admission
+    )
+
+    with pytest.raises(RuntimeError, match="crash before Product handoff"):
+        router.route(route)
+    committed = fixture.kernel.status(ingress.operation_id)
+    assert committed is not None
+    assert (committed.phase, committed.disposition) == ("committed", "committed")
+    assert product.journal.records() == ()
+    assert product.desired.snapshot().inventory_revision == 0
+    lifecycle_before = fixture.lifecycle_journal.records()
+
+    recovery = PackageCommittedProductHandoffRecovery(
+        product_id="coding",
+        kernel=fixture.kernel,
+        journal=product.journal,
+        finalizer=product.finalizer,
+    )
+    assert recovery.recover_exact(admission, "other-operation") == ()
+    assert product.journal.records() == ()
+    assert product.desired.snapshot().inventory_revision == 0
+    assert recovery.terminal_state(committed.operation_id) is None
+    recovered = recovery.recover_exact(admission, committed.operation_id)
+    assert recovered == (committed.operation_id,)
+    assert recovery.terminal_state(committed.operation_id) == "settled"
+    assert router.route(route) == committed
+    assert fixture.lifecycle_journal.records() == lifecycle_before
+    assert product.desired.snapshot().inventory_revision == 1
+    assert product.journal.records()[-1].receipt is not None
+    assert product.journal.records()[-1].receipt.state == "settled"
+    assert handoff.calls == 2
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_rebound_committed_handoff_recovers_under_third_admission(
+    tmp_path: Path,
+) -> None:
+    original = _manifest_product_admission()
+    rebound = _manifest_product_admission(runtime_id="runtime:rebound")
+    third = _manifest_product_admission(runtime_id="runtime:third")
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source=f"https://packages.example.test/{WHEEL_FILENAME}",
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=original.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path, product_ingress=ingress, product_root_target=True
+    )
+    proposed = PackageProductRebindAdmissionBindingJournal(
+        tmp_path / "rebind-admissions.jsonl"
+    )
+    product = _native_product_handoff(fixture, tmp_path, rebind_bindings=proposed)
+    handoff = _FailOnceProductHandoff(product.finalizer)
+
+    def test_rebound_authority(
+        request: PackageProductReboundRouteRequestV1,
+        current: PackageLifecycleStatusV1,
+    ) -> None:
+        assert request.decision == decision
+        assert current == resumed
+        assert proposed.read_decision(decision.decision_id) is not None
+
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(), budgets=PackageClosureBudgetV1()
+        ),
+        recovery_identity="manifest-product-rebound-handoff-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=handoff,
+        rebound_execution_authority=test_rebound_authority,
+    )
+    classified = fixture.kernel.submit(ingress)
+    failed = fixture.kernel.interrupt(
+        classified.operation_id,
+        expected_phase=classified.phase,
+        expected_journal_revision=classified.journal_revision,
+        expected_attempt_epoch=classified.attempt_epoch,
+    )
+    decision = PackageLifecycleRebindRequestV1(
+        operation_id=failed.operation_id,
+        request_fingerprint=failed.request_fingerprint,
+        expected_attempt_epoch=failed.attempt_epoch,
+        expected_attempt_revision=failed.attempt_revision,
+        new_runtime_admission_request_id=rebound.request.admission_request_id,
+        source_proof_ref="a" * 64,
+        cleanup_evidence_ref="b" * 64,
+        lease_snapshot_id="c" * 64,
+    )
+    proposed.bind(decision, rebound)
+    record = fixture.lifecycle_journal.record_rebind(decision)
+    resumed = fixture.kernel.resume_rebind(
+        decision, expected_rebind_record_revision=record.record_revision
+    )
+    route = PackageProductReboundRouteRequestV1(
+        entrypoint="operations",
+        ingress=ingress,
+        admission=rebound,
+        decision=decision,
+    )
+    locked_transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(), budgets=PackageClosureBudgetV1()
+        ),
+        recovery_identity="manifest-product-rebound-handoff-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=handoff,
+    )
+    with pytest.raises(PackageProductRouteContractError) as closed:
+        locked_transaction.execute(route, current=resumed)
+    assert closed.value.code == "package_rebind_execution_not_available"
+    assert fixture.kernel.status(resumed.operation_id) == resumed
+    committed = transaction.execute(route, current=resumed)
+    assert (committed.phase, committed.disposition) == ("committed", "committed")
+    with pytest.raises(RuntimeError, match="crash before Product handoff"):
+        transaction.finalize_committed(route, current=committed)
+    assert product.journal.records() == ()
+
+    with pytest.raises(PackageProductActivationError) as unbound:
+        PackageCommittedProductHandoffRecovery(
+            product_id="coding",
+            kernel=fixture.kernel,
+            journal=product.journal,
+            finalizer=product.finalizer,
+        ).recover(third)
+    assert unbound.value.code == "package_product_recovery_incomplete"
+    assert product.journal.records() == ()
+
+    recovered = PackageCommittedProductHandoffRecovery(
+        product_id="coding",
+        kernel=fixture.kernel,
+        journal=product.journal,
+        finalizer=product.finalizer,
+        rebind_bindings=proposed,
+    ).recover(third)
+    assert recovered == (committed.operation_id,)
+    assert product.journal.records()[-1].receipt is not None
+    assert product.journal.records()[-1].receipt.state == "settled"
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_transaction_refuses_non_wheel_source_without_store_fallback(
+    tmp_path: Path,
+) -> None:
+    admission = _manifest_product_admission()
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source="https://packages.example.test/acme_plugin-1.0.tar.gz",
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path, product_ingress=ingress, product_root_target=True
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=PackageProductWheelExecutionFactory(
+            environment=_closure_environment(),
+            budgets=PackageClosureBudgetV1(),
+        ),
+        recovery_identity="manifest-product-non-wheel-refusal",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel, transaction=transaction
+        )
+    )
+    route = PackageProductRouteRequestV1(
+        entrypoint="cli", ingress=ingress, admission=admission
+    )
+
+    refused = router.route(route)
+    before = fixture.lifecycle_journal.records()
+    assert refused.disposition == "rejected"
+    assert refused.failure is not None
+    assert refused.failure.code == "package_artifact_type_rejected"
+    assert fixture.source_authority.authorize_calls == 0
+    assert fixture.root_settlements.records() == ()
+    assert fixture.committed_sets.records() == ()
+    assert product.desired.snapshot().inventory_revision == 0
+    assert router.route(route) == refused
+    assert fixture.lifecycle_journal.records() == before
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_direct_materializer_refusal_never_reaches_real_store(
+    tmp_path: Path,
+) -> None:
+    admission = _manifest_product_admission()
+    secret = "manifest-product-direct-refusal"
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source=(
+                f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                f"?token={secret}#{secret}"
+            ),
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        secret=secret,
+        product_ingress=ingress,
+        product_root_target=True,
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+
+    def unexpected_execution(
+        _request: PackageProductRouteRequestV1,
+        _current: PackageLifecycleStatusV1,
+    ) -> PackageClosureExecutionRequestV2:
+        raise AssertionError("Direct materializer reached the Package transaction")
+
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=unexpected_execution,
+        recovery_identity="manifest-product-direct-refusal-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel,
+            transaction=transaction,
+        )
+    )
+    direct = PackageProductRouteRequestV1(
+        entrypoint="direct_materializer", ingress=ingress, admission=admission
+    )
+    current = fixture.kernel.status(ingress.operation_id)
+    assert current is not None
+    with pytest.raises(PackageProductRouteContractError):
+        transaction.execute(direct, current=current)
+    refused = router.route(direct)
+    assert (refused.phase, refused.disposition) == ("classified", "rejected")
+    assert fixture.source_authority.authorize_calls == 0
+    assert fixture.root_staging.calls == 0
+    assert fixture.root_settlements.records() == ()
+    assert fixture.committed_sets.records() == ()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="Linux-native Store fixture"
+)
+def test_product_transaction_refuses_changed_execution_before_source(
+    tmp_path: Path,
+) -> None:
+    admission = _manifest_product_admission()
+    secret = "manifest-product-identity-refusal"
+    ingress = PackageLifecycleIngressRequestV2.bind_runtime_admission(
+        _request(
+            source=(
+                f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                f"?token={secret}#{secret}"
+            ),
+            environment_fingerprint=_closure_environment().fingerprint,
+        ),
+        runtime_admission_request_id=admission.request.admission_request_id,
+    )
+    fixture = _manifest_native_adoption_fixture(
+        tmp_path,
+        secret=secret,
+        product_ingress=ingress,
+        product_root_target=True,
+    )
+    product = _native_product_handoff(fixture, tmp_path)
+    changed = replace(
+        fixture.execution,
+        artifact=replace(fixture.execution.artifact, request_fingerprint="0" * 64),
+    )
+    transaction = PackageProductLifecycleTransaction(
+        kernel=fixture.kernel,
+        execution=lambda _request, _current: changed,
+        recovery_identity="manifest-product-identity-refusal-recovery",
+        closure=fixture.closure_owner,
+        pins=fixture.pin_owner,
+        staging=fixture.staging_owner,
+        commit=fixture.commit,
+        handoff=product.finalizer,
+    )
+    router = PackageProductLifecycleRouter(
+        execution=PackageProductLifecycleExecutionBinding(
+            owner=fixture.kernel,
+            transaction=transaction,
+        )
+    )
+    refused = router.route(
+        PackageProductRouteRequestV1(
+            entrypoint="cli", ingress=ingress, admission=admission
+        )
+    )
+    assert (refused.phase, refused.disposition) == ("classified", "rejected")
+    assert refused.failure is not None
+    assert refused.failure.code == "package_operation_identity_conflict"
+    assert fixture.source_authority.authorize_calls == 0
+    assert fixture.root_staging.calls == 0
+    assert fixture.root_settlements.records() == ()
+    assert fixture.committed_sets.records() == ()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-native Store fixture")
+@pytest.mark.parametrize(
+    ("fixture_options", "reason"),
+    (
+        (
+            {"fenced_root_identity": sha256(b"wrong-native-root").hexdigest()},
+            "root",
+        ),
+        ({"adoption_installation_id": "wrong-installation"}, "installation"),
+    ),
+)
+def test_native_adoption_rejects_wrong_physical_authority_before_source(
+    tmp_path: Path,
+    fixture_options: dict[str, str],
+    reason: str,
+) -> None:
+    assert sys.platform.startswith("linux")
+    fixture = _manifest_native_adoption_fixture(tmp_path, **fixture_options)
+    before = (
+        fixture.lifecycle_journal.records(),
+        fixture.evidence_journal.records(),
+        fixture.resolution_journal.records(),
+        fixture.pin_journal.records(),
+        fixture.staging_journal.records(),
+        fixture.committed_sets.records(),
+        fixture.root_settlements.records(),
+        fixture.product_projections.capture(),
+    )
+
+    result = fixture.owner.adopt(fixture.request)
+
+    assert result.disposition == "rejected", reason
+    assert result.code == "package_operation_identity_conflict"
+    assert fixture.source_authority.authorize_calls == 0
+    assert fixture.retention.physical_acquisitions == 0
+    assert fixture.root_staging.calls == 0
+    assert before == (
+        fixture.lifecycle_journal.records(),
+        fixture.evidence_journal.records(),
+        fixture.resolution_journal.records(),
+        fixture.pin_journal.records(),
+        fixture.staging_journal.records(),
+        fixture.committed_sets.records(),
+        fixture.root_settlements.records(),
+        fixture.product_projections.capture(),
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux-native Store fixture")
+def test_native_adoption_committed_replay_requires_durable_root_target(
+    tmp_path: Path,
+) -> None:
+    assert sys.platform.startswith("linux")
+    fixture = _manifest_native_adoption_fixture(tmp_path)
+    adopted = fixture.owner.adopt(fixture.request)
+    assert adopted.disposition == "adopted"
+    before = (
+        fixture.lifecycle_journal.records(),
+        fixture.committed_sets.records(),
+        fixture.root_settlements.records(),
+    )
+    fixture.staging_journal.path.write_bytes(b"")
+
+    refused = fixture.owner.adopt(fixture.request)
+
+    assert refused.disposition == "rejected"
+    assert refused.code == "package_operation_identity_conflict"
+    assert fixture.source_authority.authorize_calls == 1
+    assert before == (
+        fixture.lifecycle_journal.records(),
+        fixture.committed_sets.records(),
+        fixture.root_settlements.records(),
+    )
+
+
+@pytest.mark.parametrize("case_id", EXECUTABLE_MANIFEST_CASES)
+def test_manifest_case(
+    case_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if case_id == "B-CLASS-PLUGIN":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        status = owner.submit(_request())
+        _assert_classification(status, decision="plugin_bound", code=None)
+        _assert_replay_is_single_owner(owner, journal)
+    elif case_id == "B-CLASS-NONPLUGIN":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("independent_non_plugin_authority"),
+        )
+        status = owner.submit(_request())
+        _assert_classification(status, decision="non_plugin", code=None)
+        _assert_replay_is_single_owner(owner, journal)
+    elif case_id == "B-CLASS-INDETERMINATE":
+        owner, journal = _owner(tmp_path, facts=_facts())
+        status = owner.submit(_request())
+        _assert_classification(
+            status,
+            decision="indeterminate",
+            code="package_target_classification_indeterminate",
+        )
+        _assert_replay_is_single_owner(owner, journal)
+    elif case_id == "B-CLASS-SPOOF":
+        assert (
+            "plugin_bound"
+            not in inspect.signature(PackageLifecycleIngressRequestV1).parameters
+        )
+        owner, journal = _owner(tmp_path, facts=_facts())
+        status = owner.submit(_request())
+        _assert_classification(
+            status,
+            decision="indeterminate",
+            code="package_target_classification_indeterminate",
+        )
+        _assert_replay_is_single_owner(owner, journal)
+    elif case_id == "B-CLASS-CHANGED":
+        assert sys.platform.startswith("linux")
+        fixture = _manifest_native_adoption_fixture(
+            tmp_path,
+            case_id=case_id,
+            staging_classification_recheck=_ChangedClassificationRecheck(),
+        )
+        product_before = fixture.product_projections.capture()
+
+        result = fixture.owner.adopt(fixture.request)
+        replay = fixture.owner.adopt(fixture.request)
+
+        assert result == replay
+        assert result.disposition == "rejected"
+        assert result.code == "package_target_classification_changed"
+        status = fixture.kernel.status(fixture.request.operation_id)
+        assert status is not None
+        assert (status.phase, status.disposition) == ("staging", "rejected")
+        assert len(fixture.pin_journal.records()) == 1
+        assert fixture.committed_sets.records() == ()
+        assert fixture.product_projections.capture() == product_before
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id == "B-CRASH-COMMITTED":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        classified = owner.submit(_request())
+        published = _advance_lifecycle(owner, classified, "set_published")
+        committed = owner.advance(
+            published.operation_id,
+            next_phase="committed",
+            expected_phase="set_published",
+            expected_journal_revision=published.journal_revision,
+            expected_attempt_epoch=published.attempt_epoch,
+        )
+        before = journal.records()
+        restarted = PackageLifecycleOwner(
+            journal=PackageLifecycleJournal(journal.path),
+            classification_authority=_Authority(_facts("explicit_plugin_intent")),
+            enabled=True,
+        )
+
+        replay = restarted.advance(
+            published.operation_id,
+            next_phase="committed",
+            expected_phase="set_published",
+            expected_journal_revision=published.journal_revision,
+            expected_attempt_epoch=published.attempt_epoch,
+        )
+
+        assert replay == committed
+        assert journal.records() == before
+        assert committed.disposition == "committed"
+    elif case_id == "B-CONCUR-SAME":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        current = owner.accept(_request())
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            classified = tuple(
+                executor.map(
+                    lambda _index: owner.classify(
+                        current.operation_id,
+                        expected_journal_revision=current.journal_revision,
+                        expected_attempt_epoch=current.attempt_epoch,
+                    ),
+                    range(8),
+                )
+            )
+        assert len(set(classified)) == 1
+        current = classified[0]
+        for next_phase in _LIFECYCLE_PHASES[2:]:
+            before = len(journal.records())
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = tuple(
+                    executor.map(
+                        lambda _index, current=current, next_phase=next_phase: (
+                            owner.advance(
+                                current.operation_id,
+                                next_phase=next_phase,
+                                expected_phase=current.phase,
+                                expected_journal_revision=current.journal_revision,
+                                expected_attempt_epoch=current.attempt_epoch,
+                            )
+                        ),
+                        range(8),
+                    )
+                )
+            assert len(set(results)) == 1
+            assert len(journal.records()) == before + 1
+            current = results[0]
+        assert (current.phase, current.disposition) == ("committed", "committed")
+    elif case_id == "B-CONCUR-STALE":
+        for phase in _LIFECYCLE_PHASES[:-1]:
+            root = tmp_path / phase
+            root.mkdir()
+            owner, journal = _owner(
+                root,
+                facts=_facts("explicit_plugin_intent"),
+            )
+            current = owner.accept(_request(operation_id=f"stale-{phase}"))
+            if phase != "accepted":
+                current = owner.classify(
+                    current.operation_id,
+                    expected_journal_revision=current.journal_revision,
+                    expected_attempt_epoch=current.attempt_epoch,
+                )
+                current = _advance_lifecycle(owner, current, phase)
+            prior = current
+            interrupted = owner.interrupt(
+                current.operation_id,
+                expected_phase=current.phase,
+                expected_journal_revision=current.journal_revision,
+                expected_attempt_epoch=current.attempt_epoch,
+            )
+            resumed = owner.retry(
+                PackageLifecycleRetryRequestV1(
+                    operation_id=current.operation_id,
+                    request_fingerprint=current.request_fingerprint,
+                    expected_attempt_epoch=interrupted.attempt_epoch,
+                )
+            )
+            before = journal.records()
+
+            stale = owner.cancel(
+                PackageLifecycleCancelRequestV1(
+                    operation_id=prior.operation_id,
+                    request_fingerprint=prior.request_fingerprint,
+                    expected_phase=prior.phase,
+                    expected_journal_revision=prior.journal_revision,
+                    expected_attempt_epoch=prior.attempt_epoch,
+                )
+            )
+
+            assert stale.disposition == "rejected"
+            assert stale.failure is not None
+            assert stale.failure.code == "package_attempt_stale"
+            assert stale.attempt_epoch == resumed.attempt_epoch == 2
+            assert journal.records() == before
+    elif case_id in {"B-STATE-CANCEL-EARLY", "B-STATE-CANCEL-PINNED"}:
+        transaction_pinned_index = _LIFECYCLE_PHASES.index("transaction_pinned")
+        phases = (
+            _LIFECYCLE_PHASES[:transaction_pinned_index]
+            if case_id == "B-STATE-CANCEL-EARLY"
+            else _LIFECYCLE_PHASES[transaction_pinned_index:-1]
+        )
+        for phase in phases:
+            root = tmp_path / phase
+            root.mkdir()
+            owner, journal = _owner(
+                root,
+                facts=_facts("explicit_plugin_intent"),
+            )
+            current = owner.accept(_request(operation_id=f"cancel-{phase}"))
+            if phase != "accepted":
+                current = owner.classify(
+                    current.operation_id,
+                    expected_journal_revision=current.journal_revision,
+                    expected_attempt_epoch=current.attempt_epoch,
+                )
+                current = _advance_lifecycle(owner, current, phase)
+            before = len(journal.records())
+            request = PackageLifecycleCancelRequestV1(
+                operation_id=current.operation_id,
+                request_fingerprint=current.request_fingerprint,
+                expected_phase=current.phase,
+                expected_journal_revision=current.journal_revision,
+                expected_attempt_epoch=current.attempt_epoch,
+            )
+
+            cancelled = owner.cancel(request)
+            replay = owner.cancel(request)
+
+            assert replay == cancelled
+            assert cancelled.disposition == "cancelled"
+            assert cancelled.failure is not None
+            assert cancelled.failure.code == "package_operation_cancelled"
+            assert len(journal.records()) == before + 1
+            assert not (root / "binding.json").exists()
+            assert not (root / "desired.json").exists()
+    elif case_id in {
+        "B-NOEXEC-IMPORT",
+        "B-NOEXEC-SETUP",
+        "B-NOEXEC-ENTRYPOINT",
+        "B-NOEXEC-ADJACENT",
+    }:
+        assert sys.platform.startswith("linux")
+        sentinel = tmp_path / "artifact-executed"
+        trap = (
+            "from pathlib import Path\n"
+            f"Path({str(sentinel)!r}).write_text('executed')\n"
+            "def main():\n"
+            f"    Path({str(sentinel)!r}).write_text('entrypoint')\n"
+        ).encode()
+        extras: dict[str, bytes] = {}
+        modes: dict[str, int] = {}
+        if case_id == "B-NOEXEC-IMPORT":
+            extras["acme_plugin/import_trap.py"] = trap
+        elif case_id == "B-NOEXEC-ENTRYPOINT":
+            extras["acme_plugin/entrypoint_trap.py"] = trap
+            extras[f"{DIST_INFO}/entry_points.txt"] = (
+                b"[console_scripts]\nacme-trap=acme_plugin.entrypoint_trap:main\n"
+            )
+        elif case_id == "B-NOEXEC-ADJACENT":
+            name = "acme_plugin/post-install"
+            extras[name] = f"#!/bin/sh\necho executed > {sentinel}\n".encode()
+            modes[name] = stat.S_IFREG | 0o755
+
+        def forbidden_effect(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("Package inspection executed an external effect")
+
+        monkeypatch.setattr(subprocess, "Popen", forbidden_effect)
+        monkeypatch.setattr(os, "system", forbidden_effect)
+        monkeypatch.setattr(socket, "create_connection", forbidden_effect)
+
+        if case_id == "B-NOEXEC-SETUP":
+            (
+                kernel,
+                artifact_owner,
+                _journal,
+                _evidence,
+                _cleanup,
+                _store,
+                _source,
+            ) = _b2_owner(
+                tmp_path,
+                case_id=case_id,
+                secret="noexec-secret",
+                payload=_wheel_bytes(
+                    extra_files={"setup.py": trap, "pyproject.toml": trap}
+                ),
+            )
+            classified = kernel.submit(_request())
+            result = artifact_owner.execute(
+                PackageArtifactExecutionRequestV1(
+                    operation_id=classified.operation_id,
+                    request_fingerprint=classified.request_fingerprint,
+                    expected_attempt_epoch=classified.attempt_epoch,
+                    wheel_filename="acme_plugin-1.0.tar.gz",
+                    credential_reference="opaque:noexec-secret",
+                )
+            )
+            assert result.status.disposition == "rejected"
+            assert result.status.failure is not None
+            assert result.status.failure.code == "package_artifact_type_rejected"
+        else:
+            fixture = _manifest_native_adoption_fixture(
+                tmp_path,
+                case_id=case_id,
+                root_payload=_wheel_bytes(extra_files=extras, entry_modes=modes),
+            )
+            result = fixture.owner.adopt(fixture.request)
+            assert result.disposition == "adopted"
+            assert fixture.kernel.status(fixture.request.operation_id).phase == (
+                "committed"
+            )
+        assert not sentinel.exists()
+    elif case_id == "B-STATE-SECRETS":
+        assert sys.platform.startswith("linux")
+        secret = "state-secret-never-persist"
+        fixture = _manifest_native_adoption_fixture(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+        )
+
+        result = fixture.owner.adopt(fixture.request)
+
+        assert result.disposition == "adopted"
+        assert secret not in repr(result)
+        _assert_manifest_secret_absent(tmp_path, secret)
+    elif case_id == "B-STATE-STATUS":
+        secret = "status-secret-never-persist"
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            _evidence,
+            _cleanup,
+            _store,
+            _source,
+        ) = _b2_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            payload=_wheel_bytes()[:-8],
+        )
+        classified = kernel.submit(_request())
+
+        result = artifact_owner.execute(_artifact_execution(classified, secret=secret))
+        replay = artifact_owner.execute(_artifact_execution(classified, secret=secret))
+
+        assert replay.status == result.status
+        assert result.status.failure is not None
+        assert result.status.failure.code == "package_archive_malformed"
+        assert (
+            PackageLifecycleStatusV1.from_dict(result.status.to_dict()) == result.status
+        )
+        assert journal.status(classified.operation_id) == result.status
+        assert secret not in repr((result, replay, journal.records()))
+    elif case_id == "B-COMPAT-LEGACY":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("existing_plugin_history"),
+        )
+
+        status = owner.submit(_request())
+
+        _assert_classification(status, decision="plugin_bound", code=None)
+        _assert_replay_is_single_owner(owner, journal)
+        _assert_no_capability_side_effect(tmp_path)
+    elif case_id == "B-COMPAT-ROLLFORWARD":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        current = owner.submit(_request())
+        current = _advance_lifecycle(owner, current, "transaction_pinned")
+        interrupted = owner.interrupt(
+            current.operation_id,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+        resumed = owner.retry(
+            PackageLifecycleRetryRequestV1(
+                operation_id=current.operation_id,
+                request_fingerprint=current.request_fingerprint,
+                expected_attempt_epoch=interrupted.attempt_epoch,
+            )
+        )
+        committed = _advance_lifecycle(owner, resumed, "committed")
+        before = journal.records()
+
+        replay = owner.submit(_request())
+
+        assert replay == committed
+        assert replay.disposition == "committed"
+        assert journal.records() == before
+    elif case_id in {"B-CRASH-ACCEPTED", "B-CRASH-CLASSIFIED"}:
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        accepted = owner.accept(_request())
+        current = accepted
+        if case_id == "B-CRASH-CLASSIFIED":
+            current = owner.classify(
+                accepted.operation_id,
+                expected_journal_revision=accepted.journal_revision,
+                expected_attempt_epoch=accepted.attempt_epoch,
+            )
+        interrupted = owner.interrupt(
+            current.operation_id,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+        record_count = len(journal.records())
+        replay = owner.interrupt(
+            current.operation_id,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+        assert replay == interrupted
+        assert len(journal.records()) == record_count
+        assert interrupted.disposition == "retryable_failure"
+        assert interrupted.failure is not None
+        assert interrupted.failure.code == "package_operation_interrupted"
+        assert interrupted.request_fingerprint == current.request_fingerprint
+    elif case_id == "B-CONCUR-CONFLICT":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = (
+                executor.submit(owner.submit, _request()),
+                executor.submit(
+                    owner.submit,
+                    _request(source="https://packages.example.test/changed.whl"),
+                ),
+            )
+            statuses = tuple(future.result() for future in futures)
+        accepted = next(status for status in statuses if status.disposition == "active")
+        conflict = next(
+            status for status in statuses if status.disposition == "rejected"
+        )
+        assert conflict.disposition == "rejected"
+        assert conflict.failure is not None
+        assert conflict.failure.code == "package_operation_identity_conflict"
+        assert journal.status(accepted.operation_id) == accepted
+        assert len(journal.records()) == 2
+    elif case_id in {
+        "B-ENTRY-CLI",
+        "B-ENTRY-RPC",
+        "B-ENTRY-SESSION",
+        "B-ENTRY-STARTUP",
+        "B-ENTRY-OPERATIONS",
+    }:
+        entrypoint: PackageProductEntrypoint = {
+            "B-ENTRY-CLI": "cli",
+            "B-ENTRY-RPC": "rpc",
+            "B-ENTRY-SESSION": "session",
+            "B-ENTRY-STARTUP": "startup",
+            "B-ENTRY-OPERATIONS": "operations",
+        }[case_id]  # type: ignore[assignment]
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        transaction = _ManifestProductTransaction(owner)
+        router = PackageProductLifecycleRouter(
+            execution=PackageProductLifecycleExecutionBinding(owner, transaction),
+        )
+        admission = _manifest_product_admission()
+        route = PackageProductRouteRequestV1(
+            entrypoint=entrypoint,
+            ingress=PackageLifecycleIngressRequestV2.bind_runtime_admission(
+                _request(),
+                runtime_admission_request_id=(admission.request.admission_request_id),
+            ),
+            admission=admission,
+        )
+
+        committed = router.route(route)
+        before = journal.records()
+        replay = router.route(route)
+
+        assert replay == committed
+        assert (committed.phase, committed.disposition) == (
+            "committed",
+            "committed",
+        )
+        assert transaction.calls == [entrypoint]
+        assert journal.records() == before
+        _assert_no_capability_side_effect(tmp_path)
+    elif case_id == "B-ENTRY-MATERIALIZER":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        transaction = _ManifestProductTransaction(owner)
+        router = PackageProductLifecycleRouter(
+            execution=PackageProductLifecycleExecutionBinding(owner, transaction),
+        )
+        admission = _manifest_product_admission()
+        route = PackageProductRouteRequestV1(
+            entrypoint="direct_materializer",
+            ingress=PackageLifecycleIngressRequestV2.bind_runtime_admission(
+                _request(),
+                runtime_admission_request_id=(admission.request.admission_request_id),
+            ),
+            admission=admission,
+        )
+
+        refused = router.route(route)
+        before = journal.records()
+        replay = router.route(route)
+
+        assert replay == refused
+        assert (refused.phase, refused.disposition) == ("classified", "rejected")
+        assert refused.failure is not None
+        assert refused.failure.code == "package_route_unavailable"
+        assert transaction.calls == []
+        assert journal.records() == before
+        _assert_no_capability_side_effect(tmp_path)
+    elif case_id == "B-ENTRY-PUBLISH":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+        )
+        transaction = _ManifestProductTransaction(owner)
+        router = PackageProductLifecycleRouter(
+            execution=PackageProductLifecycleExecutionBinding(owner, transaction),
+        )
+        current = _advance_lifecycle(owner, owner.submit(_request()), "staging")
+        before = journal.records()
+        attempt = PackageProductPublishAttemptV1(status=current)
+
+        refused = router.refuse_direct_publish(attempt)
+        after = journal.records()
+        replay = router.refuse_direct_publish(attempt)
+
+        assert replay == refused
+        assert (refused.phase, refused.disposition) == ("staging", "rejected")
+        assert refused.failure is not None
+        assert refused.failure.code == "package_route_unavailable"
+        assert owner.status(current.operation_id) == refused
+        assert transaction.calls == []
+        assert len(after) == len(before) + 1
+        assert journal.records() == after
+        _assert_no_capability_side_effect(tmp_path)
+    elif case_id == "B-ENTRY-DISABLED":
+        owner, journal = _owner(
+            tmp_path,
+            facts=_facts("explicit_plugin_intent"),
+            enabled=False,
+        )
+        status = owner.submit(_request())
+        assert status.phase == "classified"
+        assert status.disposition == "rejected"
+        assert status.failure is not None
+        assert status.failure.code == "package_route_unavailable"
+        assert journal.records() == ()
+        assert not journal.path.exists()
+    elif case_id in IMPLEMENTED_B4C4E_LINUX_ADOPTION_FAILURE_MANIFEST_CASES:
+        assert sys.platform.startswith("linux")
+        fixture = _manifest_native_adoption_fixture(tmp_path, case_id=case_id)
+        legacy_before = fixture.legacy_state.capture()
+        product_before = fixture.product_projections.capture()
+
+        failed = fixture.owner.adopt(fixture.request)
+        after_first = (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+        replay = fixture.owner.adopt(fixture.request)
+
+        expected = {
+            "B-COMPAT-ADOPT-UNAUTHORIZED": (
+                "package_source_unauthorized",
+                "rejected",
+            ),
+            "B-COMPAT-ADOPT-UNAVAILABLE": (
+                "package_operation_timed_out",
+                "retryable_failure",
+            ),
+        }[case_id]
+        assert failed == replay
+        assert (failed.code, failed.disposition) == expected
+        assert failed.failure is not None
+        assert failed.failure.stage == "acquiring"
+        assert fixture.source_authority.authorize_calls == 1
+        if fixture.source_authority.stream is not None:
+            assert fixture.source_authority.stream.requests_started == 1
+            assert fixture.source_authority.stream.redirects_started == 0
+        assert fixture.resolver.calls == 0
+        assert fixture.retention.physical_acquisitions == 0
+        assert fixture.pin_journal.records() == ()
+        assert fixture.staging_journal.records() == ()
+        assert fixture.committed_sets.records() == ()
+        assert fixture.root_settlements.records() == ()
+        assert fixture.root_staging.calls == 0
+        assert fixture.quarantine.attempt_names() == ()
+        assert fixture.quarantine.total_residue_bytes() == 0
+        assert fixture.legacy_state.capture() == legacy_before
+        assert fixture.product_projections.capture() == product_before
+        assert after_first == (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+        assert fixture.secret not in repr((fixture.request, failed, replay))
+        _assert_manifest_secret_absent(tmp_path, fixture.secret)
+    elif case_id in IMPLEMENTED_B4C4G_LINUX_ADOPTION_PRECOMMIT_CRASH_MANIFEST_CASES:
+        assert sys.platform.startswith("linux")
+        for phase in ADOPTION_PRECOMMIT_CRASH_PHASES:
+            recovery_root = tmp_path / f"recover-{phase}"
+            recovery_root.mkdir(mode=0o700)
+            fixture = _manifest_native_adoption_fixture(
+                recovery_root,
+                case_id=case_id,
+                crash_after_phase=phase,
+            )
+            with pytest.raises(_ManifestCrashEdge, match=phase):
+                fixture.owner.adopt(fixture.request)
+            crashed = fixture.kernel.status(fixture.request.operation_id)
+            assert crashed is not None
+            assert (crashed.phase, crashed.disposition) == (phase, "active")
+
+            prior_owner = fixture.owner
+            prior_kernel = fixture.kernel
+            fixture = _restart_manifest_native_adoption_fixture(fixture)
+            assert fixture.owner is not prior_owner
+            assert fixture.kernel is not prior_kernel
+            recovered = fixture.owner.adopt(fixture.request)
+            after_recovery = (
+                fixture.lifecycle_journal.records(),
+                fixture.evidence_journal.records(),
+                fixture.resolution_journal.records(),
+                fixture.pin_journal.records(),
+                fixture.staging_journal.records(),
+                fixture.committed_sets.records(),
+                fixture.fence_journal.records(),
+                fixture.root_settlements.records(),
+            )
+            replay = fixture.owner.adopt(fixture.request)
+
+            assert recovered == replay, phase
+            assert recovered.disposition == "adopted", phase
+            assert recovered.receipt is not None
+            assert fixture.source_authority.authorize_calls == 1
+            assert fixture.source_authority.stream is not None
+            assert fixture.source_authority.stream.requests_started == 1
+            assert fixture.retention.physical_acquisitions == 1
+            assert fixture.root_staging.calls == 1
+            assert len(fixture.pin_journal.records()) == 1
+            assert len(fixture.staging_journal.records()) == 1
+            assert len(fixture.committed_sets.records()) == 1
+            assert len(fixture.root_settlements.records()) == 1
+            assert len(fixture.quarantine.attempt_names()) == 1
+            assert fixture.quarantine.total_residue_bytes() <= 256 * 1024
+            assert fixture.legacy_state.capture().evidence_id == (
+                fixture.request.legacy_state_evidence_id
+            )
+            assert fixture.product_projections.capture() == (
+                fixture.product_projection_before
+            )
+            assert after_recovery == (
+                fixture.lifecycle_journal.records(),
+                fixture.evidence_journal.records(),
+                fixture.resolution_journal.records(),
+                fixture.pin_journal.records(),
+                fixture.staging_journal.records(),
+                fixture.committed_sets.records(),
+                fixture.fence_journal.records(),
+                fixture.root_settlements.records(),
+            )
+            _assert_manifest_secret_absent(recovery_root, fixture.secret)
+    elif case_id in IMPLEMENTED_B4C4F_LINUX_ADOPTION_COMMITTED_CRASH_MANIFEST_CASES:
+        assert sys.platform.startswith("linux")
+        fixture = _manifest_native_adoption_fixture(
+            tmp_path,
+            case_id=case_id,
+            crash_after_committed=True,
+        )
+        with pytest.raises(_ManifestCrashAfterCommitted):
+            fixture.owner.adopt(fixture.request)
+        committed = fixture.kernel.status(fixture.request.operation_id)
+        assert committed is not None
+        assert (committed.phase, committed.disposition) == ("committed", "committed")
+        assert isinstance(fixture.commit, _ManifestCrashAfterCommittedCommitOwner)
+        crashed_commit = fixture.commit
+        assert crashed_commit.pre_crash_receipt is not None
+        after_crash = (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+
+        prior_owner = fixture.owner
+        prior_kernel = fixture.kernel
+        fixture = _restart_manifest_native_adoption_fixture(fixture)
+        assert fixture.owner is not prior_owner
+        assert fixture.kernel is not prior_kernel
+        recovered = fixture.owner.adopt(fixture.request)
+        replay = fixture.owner.adopt(fixture.request)
+
+        assert recovered == replay
+        assert recovered.disposition == "adopted"
+        assert recovered.code == "ok"
+        assert recovered.receipt is not None
+        assert recovered.receipt.publication == crashed_commit.pre_crash_receipt
+        assert recovered.receipt.publication.committed_set.root_ref.installation_id == (
+            "manifest-installation"
+        )
+        assert fixture.source_authority.authorize_calls == 1
+        assert fixture.source_authority.stream is not None
+        assert fixture.source_authority.stream.requests_started == 1
+        assert fixture.retention.physical_acquisitions == 1
+        pin = fixture.pin_journal.current_for_operation(fixture.request.operation_id)
+        assert pin is not None and pin.state == "acquired"
+        assert fixture.retention.receipts[fixture.request.operation_id] == pin
+        assert fixture.root_staging.calls == 1
+        assert len(fixture.staging_journal.records()) == 1
+        assert len(fixture.committed_sets.records()) == 1
+        assert len(fixture.root_settlements.records()) == 1
+        assert crashed_commit.calls == 1
+        assert fixture.legacy_state.capture().evidence_id == (
+            fixture.request.legacy_state_evidence_id
+        )
+        assert fixture.product_projections.capture() == (
+            fixture.product_projection_before
+        )
+        assert after_crash == (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+        assert fixture.secret not in repr((fixture.request, recovered, replay))
+        _assert_manifest_secret_absent(tmp_path, fixture.secret)
+    elif case_id in IMPLEMENTED_B4C4D_LINUX_ADOPTION_MANIFEST_CASES:
+        assert sys.platform.startswith("linux")
+        fixture = _manifest_native_adoption_fixture(tmp_path)
+
+        adopted = fixture.owner.adopt(fixture.request)
+        after_first = (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+        product_projection_after_first = fixture.product_projections.capture()
+        replay = fixture.owner.adopt(fixture.request)
+
+        assert adopted == replay
+        assert adopted.disposition == "adopted"
+        assert adopted.code == "ok"
+        assert adopted.receipt is not None
+        publication = adopted.receipt.publication
+        assert publication.operation_id == fixture.request.operation_id
+        assert publication.committed_set.root_ref.plugin_id == "acme.plugin"
+        assert publication.committed_set.root_ref.installation_id == (
+            "manifest-installation"
+        )
+        committed = fixture.kernel.status(fixture.request.operation_id)
+        assert committed is not None
+        assert committed.phase == "committed"
+        assert committed.disposition == "committed"
+        pin = fixture.pin_journal.current_for_operation(fixture.request.operation_id)
+        assert pin is not None and pin.state == "acquired"
+        assert fixture.retention.receipts[fixture.request.operation_id] == pin
+        assert fixture.retention.physical_acquisitions == 1
+        assert len(fixture.retention.calls) == 1
+        assert fixture.source_authority.authorize_calls == 1
+        assert fixture.source_authority.stream is not None
+        assert fixture.source_authority.stream.requests_started == 1
+        assert fixture.source_authority.stream.redirects_started == 0
+        assert fixture.resolver.calls == 0
+        assert fixture.root_targets.calls == 2
+        assert fixture.root_staging.calls == 1
+        assert len(fixture.staging_journal.records()) == 1
+        assert len(fixture.committed_sets.records()) == 1
+        assert len(fixture.root_settlements.records()) == 1
+        assert fixture.fence_reader.calls == 4
+        assert fixture.legacy_state.calls == 4
+        current_fence = fixture.fence_journal.current(fixture.request.store_id)
+        assert current_fence is not None
+        assert current_fence.fenced_root_identity == _manifest_directory_identity(
+            fixture.current_root
+        )
+        assert fixture.legacy_state.capture().evidence_id == (
+            fixture.request.legacy_state_evidence_id
+        )
+        for path, payload in fixture.product_files:
+            assert path.read_bytes() == payload
+        assert fixture.product_projection_before == product_projection_after_first
+        assert fixture.product_projection_before == (
+            fixture.product_projections.capture()
+        )
+        assert after_first == (
+            fixture.lifecycle_journal.records(),
+            fixture.evidence_journal.records(),
+            fixture.resolution_journal.records(),
+            fixture.pin_journal.records(),
+            fixture.staging_journal.records(),
+            fixture.committed_sets.records(),
+            fixture.fence_journal.records(),
+            fixture.root_settlements.records(),
+        )
+        assert fixture.secret not in repr((fixture.request, adopted, replay))
+        _assert_manifest_secret_absent(tmp_path, fixture.secret)
+    elif case_id in IMPLEMENTED_B4A_COMMIT_ADMISSION_MANIFEST_CASES:
+        fixture = _manifest_commit_admission_fixture(tmp_path)
+        current = fixture.kernel.status("manifest-operation")
+        committed_record = fixture.committed_sets.current("manifest-operation")
+        assert current is not None and current.phase == "set_published"
+        assert committed_record is not None
+        if case_id == "B-PUB-UNCOMMITTED":
+            admission_request = PackageCommitAdmissionRequestV1.create(
+                operation_id=current.operation_id,
+                request_fingerprint=current.request_fingerprint,
+                product_id="coding",
+                scope_id="workspace:manifest",
+                installation_id="manifest-installation",
+                plugin_id="acme.plugin",
+                claimed_root_ref=committed_record.committed_set.root_ref,
+                committed_set_id=committed_record.committed_set.set_id,
+                closure_lock_digest=committed_record.closure_lock.lock_digest,
+                publication_receipt=None,
+            )
+        else:
+            publication = fixture.commit_owner.commit("manifest-operation")
+            if case_id == "B-ADMISSION-DEPENDENCY":
+                changes: dict[str, object] = {
+                    "claimed_root_ref": committed_record.committed_set.dependency_refs[
+                        0
+                    ]
+                }
+            elif case_id == "B-ADMISSION-WRONG-SET":
+                other_root = PluginRevisionRefV1.create(
+                    store_identity="manifest-plugin-store",
+                    store_revision="manifest-plugin-revision:other",
+                    installation_id="manifest-installation",
+                    plugin_id="acme.plugin",
+                    distribution="acme",
+                    version="1.0",
+                    artifact_digest="d" * 64,
+                    extraction_tree_digest="e" * 64,
+                )
+                changes = {
+                    "claimed_root_ref": other_root,
+                    "committed_set_id": "0" * 64,
+                }
+            elif case_id == "B-ADMISSION-WRONG-REQUEST":
+                changes = {"request_fingerprint": "0" * 64}
+            elif case_id == "B-ADMISSION-WRONG-OPERATION":
+                changes = {"operation_id": "manifest-operation-other"}
+            elif case_id == "B-ADMISSION-WRONG-SCOPE":
+                changes = {"scope_id": "workspace:other"}
+            elif case_id == "B-ADMISSION-WRONG-PLUGIN":
+                changes = {"plugin_id": "other.plugin"}
+            else:
+                assert case_id == "B-ADMISSION-DIGEST-TAMPER"
+                changes = {"closure_lock_digest": "0" * 64}
+            admission_request = _manifest_admission_request(
+                publication,
+                **changes,
+            )
+        lifecycle_before = fixture.kernel.journal.records()
+        committed_before = fixture.committed_sets.records()
+        pins_before = fixture.pin_journal.records()
+
+        result = fixture.admission_owner.admit(admission_request)
+
+        assert result.code == "package_commit_admission_denied"
+        assert result.disposition == "rejected"
+        assert result.receipt is None
+        assert result.failure is not None
+        assert fixture.kernel.journal.records() == lifecycle_before
+        assert fixture.committed_sets.records() == committed_before
+        assert fixture.pin_journal.records() == pins_before
+        assert fixture.pin_journal.current_for_operation("manifest-operation") == (
+            fixture.pin_receipt
+        )
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id in IMPLEMENTED_B4B_RETENTION_HANDOFF_MANIFEST_CASES:
+        fixture = _manifest_retention_handoff_fixture(
+            tmp_path,
+            desired_inventory_revision=(
+                1 if case_id == "B-HANDOFF-DESIRED-REJECT" else 0
+            ),
+        )
+        request = fixture.request
+        if case_id == "B-HANDOFF-BEFORE-DESIRED":
+            fixture.desired.interruptions = 1
+            result = fixture.owner.execute(request)
+            assert result.disposition == "retryable_failure"
+            assert result.code == "package_retention_handoff_interrupted"
+            assert result.receipt is not None
+            assert result.receipt.state == "dependency_pinned"
+            assert result.failure is not None and result.failure.retryable
+            assert fixture.desired.physical_commits == 0
+            assert (
+                fixture.pin_journal.current_for_operation(request.operation_id)
+                == request.transaction_pin_receipt
+            )
+            result = fixture.owner.execute(request)
+            assert result.disposition == "settled"
+        elif case_id == "B-HANDOFF-AFTER-DESIRED":
+            fixture.retention.settle_interruptions = 1
+            result = fixture.owner.execute(request)
+            assert result.disposition == "retryable_failure"
+            assert result.code == "package_retention_handoff_interrupted"
+            assert result.receipt is not None
+            assert result.receipt.state == "desired_committed"
+            assert fixture.desired.physical_commits == 1
+            dependency = fixture.retention.current(request)
+            assert dependency is not None and dependency.dependency_pins_live
+            assert (
+                fixture.pin_journal.current_for_operation(request.operation_id)
+                == request.transaction_pin_receipt
+            )
+            result = fixture.owner.execute(request)
+            assert result.disposition == "settled"
+        elif case_id == "B-HANDOFF-AFTER-SETTLEMENT":
+            fixture.retention.settle_postcommit_crashes = 1
+            with pytest.raises(_ManifestProcessCrash):
+                fixture.owner.execute(request)
+            interrupted_head = fixture.journal.current(request.handoff_id)
+            assert interrupted_head is not None
+            assert interrupted_head.state == "desired_committed"
+            dependency = fixture.retention.current(request)
+            assert dependency is not None and dependency.state == "settled"
+            assert (
+                fixture.pin_journal.current_for_operation(request.operation_id).state
+                == "released"
+            )  # type: ignore[union-attr]
+            records_before = fixture.journal.records()
+            result = fixture.owner.execute(request)
+            assert result.disposition == "settled"
+            assert len(fixture.journal.records()) == len(records_before) + 1
+            settled_records = fixture.journal.records()
+            calls_before = (
+                fixture.retention.acquire_calls,
+                fixture.retention.abort_calls,
+                fixture.retention.settle_calls,
+                fixture.desired.calls,
+            )
+            replay = fixture.owner.execute(request)
+            assert replay == result
+            assert fixture.journal.records() == settled_records
+            assert (
+                fixture.retention.acquire_calls,
+                fixture.retention.abort_calls,
+                fixture.retention.settle_calls,
+                fixture.desired.calls,
+            ) == calls_before
+        elif case_id == "B-HANDOFF-DESIRED-REJECT":
+            result = fixture.owner.execute(request)
+            assert result.disposition == "rejected"
+            assert result.code == "package_desired_revision_conflict"
+            assert result.receipt is not None and result.receipt.state == "aborted"
+            dependency = fixture.retention.current(request)
+            assert dependency is not None
+            assert dependency.state == "aborted"
+            assert not dependency.dependency_pins_live
+            assert dependency.transaction_pin_receipt == (
+                request.transaction_pin_receipt
+            )
+            assert fixture.desired.physical_commits == 0
+            assert fixture.retention.physical_aborts == 1
+            records_before = fixture.journal.records()
+            assert fixture.owner.execute(request) == result
+            assert fixture.journal.records() == records_before
+        elif case_id == "B-HANDOFF-STALE-RECEIPT":
+            fixture.desired.interruptions = 1
+            interrupted = fixture.owner.execute(request)
+            assert interrupted.receipt is not None
+            assert interrupted.receipt.state == "dependency_pinned"
+            opened = next(
+                record.receipt
+                for record in fixture.journal.records()
+                if record.receipt is not None and record.receipt.state == "opened"
+            )
+            assert isinstance(opened, PackageRetentionHandoffReceiptV1)
+            records_before = fixture.journal.records()
+            calls_before = (
+                fixture.retention.acquire_calls,
+                fixture.retention.abort_calls,
+                fixture.retention.settle_calls,
+                fixture.desired.calls,
+            )
+            result = fixture.owner.execute(request, expected_receipt=opened)
+            assert result.disposition == "rejected"
+            assert result.code == "package_retention_handoff_stale"
+            assert result.receipt == interrupted.receipt
+            assert fixture.journal.records() == records_before
+            assert (
+                fixture.retention.acquire_calls,
+                fixture.retention.abort_calls,
+                fixture.retention.settle_calls,
+                fixture.desired.calls,
+            ) == calls_before
+        else:
+            assert case_id == "B-HANDOFF-CONCURRENT-REPLAY"
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                results = tuple(
+                    executor.map(
+                        lambda _index: fixture.owner.execute(request), range(16)
+                    )
+                )
+            assert len(set(results)) == 1
+            result = results[0]
+            assert result.disposition == "settled"
+            assert fixture.retention.physical_acquisitions == 1
+            assert fixture.retention.physical_settlements == 1
+            assert fixture.desired.physical_commits == 1
+
+        dependency = fixture.retention.current(request)
+        assert dependency is not None
+        assert dependency.request.target_ref_ids == (
+            request.dependency_pin_request.target_ref_ids
+        )
+        assert len(dependency.pin_ids) == len(
+            request.dependency_pin_request.target_ref_ids
+        )
+        assert not fixture.retention.zero_pin_observed
+        assert PackageRetentionHandoffRequestV1.from_dict(request.to_dict()) == request
+        assert PackageRetentionHandoffResultV1.from_dict(result.to_dict()) == result
+        extended = request.to_dict()
+        extended["reopenPath"] = "/tmp/forged"
+        with pytest.raises(ValueError, match="versioned schema"):
+            PackageRetentionHandoffRequestV1.from_dict(extended)
+        forged = request.to_dict()
+        forged["handoffId"] = "0" * 64
+        with pytest.raises(ValueError, match="does not match"):
+            PackageRetentionHandoffRequestV1.from_dict(forged)
+        assert (
+            PackageRetentionHandoffJournal(fixture.journal.path).records()
+            == fixture.journal.records()
+        )
+        serialized = repr((result, fixture.journal.records())).lower()
+        for forbidden in ("password", "credential", "token", "reopen", "handle"):
+            assert forbidden not in serialized
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id in IMPLEMENTED_B4C3C_LINUX_OFFLINE_RESTORE_MANIFEST_CASES:
+        assert sys.platform.startswith("linux")
+        fixture = _manifest_linux_offline_restore_fixture(tmp_path)
+        journal_before = fixture.journal.path.read_bytes()
+        b_before = (fixture.current_b_root / "epoch-b.json").read_bytes()
+        source_before = (fixture.source / "legacy-state.json").read_bytes()
+
+        result = fixture.owner.restore(fixture.request)
+        replay = fixture.owner.restore(fixture.request)
+
+        assert result == replay
+        assert result.disposition == "restored"
+        assert result.code == "ok"
+        assert result.failure is None
+        assert result.materialization is not None
+        assert result.activation is not None
+        assert result.materialization.legacy_snapshot_exact is True
+        assert result.materialization.b_namespace_unreachable is True
+        assert result.activation.exclusive_old_runtime is True
+        restored = (
+            fixture.restore_root
+            / fixture.request.restore_namespace_id
+            / "payload"
+            / "legacy-state.json"
+        )
+        assert restored.read_bytes() == source_before
+        assert (fixture.activation_root / "active-runtime.json").is_file()
+        assert fixture.journal.path.read_bytes() == journal_before
+        assert (fixture.current_b_root / "epoch-b.json").read_bytes() == b_before
+        assert fixture.coordination.calls == 2
+        assert fixture.snapshots.calls == 2
+        serialized = repr(result).lower()
+        for forbidden in (
+            "password",
+            "credential",
+            "token",
+            "handle",
+            str(tmp_path).lower(),
+        ):
+            assert forbidden not in serialized
+
+        fixture.activation.deactivate(result.activation)
+        fixture.materializer.discard(result.materialization)
+        assert not (
+            fixture.restore_root / fixture.request.restore_namespace_id
+        ).exists()
+        assert not (fixture.activation_root / "active-runtime.json").exists()
+    elif case_id in IMPLEMENTED_B4C5_WINDOWS_OFFLINE_RESTORE_MANIFEST_CASES:
+        assert os.name == "nt"
+        fixture = _manifest_windows_offline_restore_fixture(tmp_path)
+        journal_before = fixture.journal.path.read_bytes()
+        b_before = (fixture.current_b_root / "epoch-b.json").read_bytes()
+        source_before = (fixture.source / "legacy-state.json").read_bytes()
+
+        result = fixture.owner.restore(fixture.request)
+        replay = fixture.owner.restore(fixture.request)
+
+        assert result == replay
+        assert result.disposition == "restored"
+        assert result.code == "ok"
+        assert result.failure is None
+        assert result.materialization is not None
+        assert result.activation is not None
+        assert result.materialization.legacy_snapshot_exact is True
+        assert result.materialization.b_namespace_unreachable is True
+        assert result.activation.exclusive_old_runtime is True
+        restored = (
+            fixture.restore_root
+            / fixture.request.restore_namespace_id
+            / "payload"
+            / "legacy-state.json"
+        )
+        assert restored.read_bytes() == source_before
+        assert (fixture.activation_root / "active-runtime.json").is_file()
+        assert fixture.journal.path.read_bytes() == journal_before
+        assert (fixture.current_b_root / "epoch-b.json").read_bytes() == b_before
+        assert fixture.coordination.calls == 2
+        assert fixture.snapshots.calls == 2
+        serialized = repr(result).lower()
+        for forbidden in (
+            "password",
+            "credential",
+            "token",
+            "handle",
+            str(tmp_path).lower(),
+        ):
+            assert forbidden not in serialized
+
+        fixture.activation.deactivate(result.activation)
+        fixture.materializer.discard(result.materialization)
+        assert not (
+            fixture.restore_root / fixture.request.restore_namespace_id
+        ).exists()
+        assert not (fixture.activation_root / "active-runtime.json").exists()
+    elif case_id in IMPLEMENTED_B4C1_POSIX_EPOCH_CUTOVER_MANIFEST_CASES:
+        assert os.name == "posix"
+        pre_fence_live = case_id == "B-COMPAT-PREFENCE-LIVE-POSIX"
+        fixture = _manifest_posix_epoch_cutover_fixture(
+            tmp_path,
+            pre_fence_live=pre_fence_live,
+        )
+        legacy_before = (fixture.legacy / "state.json").read_bytes()
+
+        result = fixture.owner.cutover(fixture.request)
+
+        if pre_fence_live:
+            assert result.disposition == "rejected"
+            assert result.code == "package_runtime_epoch_unsupported"
+            assert result.failure is not None
+            assert result.failure.barrier == "pre_fence"
+            assert result.failure.operator_action == "upgrade_runtime"
+            assert result.failure.evidence_ref == "f" * 64
+            assert result.fence is None
+            assert result.switch_receipt is None
+            assert fixture.snapshots.calls == 0
+            assert fixture.journal.records() == ()
+            assert tuple(fixture.epochs.iterdir()) == ()
+        else:
+            assert result.disposition == "fenced"
+            assert result.code == "ok"
+            assert result.failure is None
+            assert result.fence is not None
+            assert result.switch_receipt is not None
+            assert result.fence.request.namespace_id == fixture.request.namespace_id
+            assert result.fence.request.root_switch_receipt_id == (
+                result.switch_receipt.switch_receipt_id
+            )
+            assert result.fence == fixture.journal.current(fixture.request.store_id)
+            assert len(fixture.journal.records()) == 1
+            assert fixture.snapshots.calls == 1
+            replay = fixture.owner.cutover(fixture.request)
+            assert replay == result
+            assert fixture.coordination.calls == 1
+            assert fixture.snapshots.calls == 1
+            assert (fixture.epochs / fixture.request.namespace_id).is_dir()
+            assert not (fixture.authority / "active-root").exists()
+            detached = tmp_path / "manifest-package-epoch-detached"
+            fixture.authority.rename(detached)
+            detached.rename(fixture.authority)
+            detached_epoch = tmp_path / "manifest-detached-epoch"
+            (fixture.epochs / fixture.request.namespace_id).rename(detached_epoch)
+            detached_epoch.rmdir()
+        assert fixture.coordination.calls == 1
+        assert (fixture.legacy / "state.json").read_bytes() == legacy_before
+        assert (
+            PackagePosixEpochCutoverRequestV1.from_dict(fixture.request.to_dict())
+            == fixture.request
+        )
+        assert PackagePosixEpochCutoverResultV1.from_dict(result.to_dict()) == result
+        serialized = repr((fixture.request, result)).lower()
+        for forbidden in (
+            "password",
+            "credential",
+            "token",
+            "handle",
+            str(tmp_path).lower(),
+        ):
+            assert forbidden not in serialized
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id in IMPLEMENTED_B4C2_WINDOWS_EPOCH_CUTOVER_MANIFEST_CASES:
+        assert os.name == "nt"
+        pre_fence_live = case_id == "B-COMPAT-PREFENCE-LIVE-WINDOWS"
+        fixture = _manifest_windows_epoch_cutover_fixture(
+            tmp_path,
+            pre_fence_live=pre_fence_live,
+        )
+        legacy_before = (fixture.legacy / "state.json").read_bytes()
+
+        result = fixture.owner.cutover(fixture.request)
+
+        if pre_fence_live:
+            assert result.disposition == "rejected"
+            assert result.code == "package_runtime_epoch_unsupported"
+            assert result.failure is not None
+            assert result.failure.barrier == "pre_fence"
+            assert result.failure.operator_action == "upgrade_runtime"
+            assert result.failure.evidence_ref == "f" * 64
+            assert result.fence is None
+            assert result.switch_receipt is None
+            assert fixture.snapshots.calls == 0
+            assert fixture.journal.records() == ()
+            assert tuple(fixture.epochs.iterdir()) == ()
+        else:
+            assert result.disposition == "fenced"
+            assert result.code == "ok"
+            assert result.failure is None
+            assert result.fence is not None
+            assert result.switch_receipt is not None
+            assert result.fence.request.namespace_id == fixture.request.namespace_id
+            assert result.fence.request.root_switch_receipt_id == (
+                result.switch_receipt.switch_receipt_id
+            )
+            assert result.fence == fixture.journal.current(fixture.request.store_id)
+            assert len(fixture.journal.records()) == 1
+            assert fixture.snapshots.calls == 1
+            replay = fixture.owner.cutover(fixture.request)
+            assert replay == result
+            assert fixture.coordination.calls == 1
+            assert fixture.snapshots.calls == 1
+            assert (fixture.epochs / fixture.request.namespace_id).is_dir()
+            assert not (fixture.authority / "active-root").exists()
+            detached = tmp_path / "manifest-package-epoch-detached"
+            fixture.authority.rename(detached)
+            detached.rename(fixture.authority)
+            detached_epoch = tmp_path / "manifest-detached-epoch"
+            (fixture.epochs / fixture.request.namespace_id).rename(detached_epoch)
+            detached_epoch.rmdir()
+        assert fixture.coordination.calls == 1
+        assert (fixture.legacy / "state.json").read_bytes() == legacy_before
+        assert (
+            PackageWindowsEpochCutoverRequestV1.from_dict(fixture.request.to_dict())
+            == fixture.request
+        )
+        assert PackageWindowsEpochCutoverResultV1.from_dict(result.to_dict()) == result
+        serialized = repr((fixture.request, result)).lower()
+        for forbidden in (
+            "password",
+            "credential",
+            "token",
+            "handle",
+            str(tmp_path).lower(),
+        ):
+            assert forbidden not in serialized
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id in IMPLEMENTED_B4C0_EPOCH_ADMISSION_MANIFEST_CASES:
+        mixed_epoch = case_id == "B-COMPAT-MIXED"
+        fixture = _manifest_epoch_admission_fixture(
+            tmp_path,
+            mixed_epoch=mixed_epoch,
+        )
+        records_before = fixture.journal.records()
+
+        result = fixture.owner.admit(fixture.request)
+
+        assert result.disposition == "rejected"
+        assert result.code == "package_runtime_epoch_unsupported"
+        assert result.receipt is None
+        assert result.failure is not None
+        assert result.failure.operator_action == (
+            "offline_restore" if mixed_epoch else "upgrade_runtime"
+        )
+        assert fixture.leases.calls == (1 if mixed_epoch else 0)
+        assert fixture.journal.records() == records_before
+        assert (
+            PackageEpochRuntimeAdmissionRequestV1.from_dict(fixture.request.to_dict())
+            == fixture.request
+        )
+        assert PackageEpochRuntimeAdmissionResultV1.from_dict(result.to_dict()) == (
+            result
+        )
+        serialized = repr((fixture.request, result, records_before)).lower()
+        for forbidden in ("password", "credential", "token", "path", "handle"):
+            assert forbidden not in serialized
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+    elif case_id in IMPLEMENTED_B2_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(tmp_path, case_id=case_id, secret=secret)
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/acme.whl"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        execution = PackageArtifactExecutionRequestV1(
+            operation_id=classified.operation_id,
+            request_fingerprint=classified.request_fingerprint,
+            expected_attempt_epoch=classified.attempt_epoch,
+            wheel_filename="acme-1.0-py3-none-any.whl",
+            credential_reference=f"opaque:{secret}",
+        )
+        before_outside = tmp_path / "outside-sentinel"
+        before_outside.write_bytes(b"preserve")
+
+        result = artifact_owner.execute(execution)
+
+        expected = {
+            "B-ACQ-AUTH": (
+                "acquiring",
+                "rejected",
+                "package_source_unauthorized",
+            ),
+            "B-ACQ-PROVENANCE": (
+                "acquiring",
+                "rejected",
+                "package_source_provenance_changed",
+            ),
+            "B-ACQ-BYTES": (
+                "acquiring",
+                "retryable_failure",
+                "package_acquisition_limit_exceeded",
+            ),
+            "B-ACQ-REDIRECT": (
+                "acquiring",
+                "retryable_failure",
+                "package_acquisition_limit_exceeded",
+            ),
+            "B-ACQ-TIMEOUT": (
+                "acquiring",
+                "retryable_failure",
+                "package_operation_timed_out",
+            ),
+            "B-ACQ-DIGEST": (
+                "acquired",
+                "rejected",
+                "package_acquisition_digest_mismatch",
+            ),
+        }[case_id]
+        assert (
+            result.status.phase,
+            result.status.disposition,
+            result.status.failure.code if result.status.failure is not None else None,
+        ) == expected
+        assert result.candidate is None
+        assert result.cleanup_status is None
+        assert source_authority.authorize_calls == 1
+        evidence = evidence_journal.records()
+        expected_evidence_kinds = (
+            ()
+            if case_id in {"B-ACQ-AUTH", "B-ACQ-PROVENANCE"}
+            else ("authenticated_source",)
+        )
+        assert tuple(record.evidence_kind for record in evidence) == (
+            expected_evidence_kinds
+        )
+        assert cleanup_journal.records() == ()
+        assert store.attempt_names() == ()
+        assert store.total_residue_bytes() == 0
+        assert before_outside.read_bytes() == b"preserve"
+        records = journal.records()
+        replay = artifact_owner.execute(execution)
+        assert replay.status == result.status
+        assert replay.candidate is None
+        assert journal.records() == records
+        assert source_authority.authorize_calls == 1
+        assert secret not in repr(result)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id == "B-ACQ-IDENTITY":
+        secret = f"manifest-secret-{case_id.lower()}"
+        payload = _wheel_bytes()
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            payload=payload,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        inspecting, candidate, execution = _land_artifact_phase(
+            kernel=kernel,
+            artifact_owner=artifact_owner,
+            evidence_journal=evidence_journal,
+            classified=classified,
+            target_phase="inspecting",
+            secret=secret,
+        )
+        assert candidate is not None
+        candidate.suspend_for_recovery()
+        attempt = store.root / store.attempt_names()[0]
+        artifact = next(path for path in attempt.iterdir() if path.is_file())
+        original = artifact.read_bytes()
+        artifact.unlink()
+        artifact.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+        evidence_before = evidence_journal.records()
+
+        result = artifact_owner.execute(execution)
+
+        assert result.status.phase == inspecting.phase
+        assert result.status.disposition == "rejected"
+        assert result.status.failure is not None
+        assert result.status.failure.code == "package_artifact_identity_changed"
+        assert result.candidate is None
+        assert result.cleanup_status is None
+        assert evidence_journal.records() == evidence_before
+        assert len(evidence_before) == 2
+        assert source_authority.authorize_calls == 1
+        assert cleanup_journal.records() == ()
+        assert store.attempt_names() == ()
+        assert outside.read_bytes() == b"preserve"
+        records = journal.records()
+        assert artifact_owner.execute(execution).status == result.status
+        assert journal.records() == records
+        assert source_authority.authorize_calls == 1
+        assert secret not in repr(result)
+    elif case_id in IMPLEMENTED_B3D_LIMIT_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        root_source = f"https://packages.example.test/{WHEEL_FILENAME}"
+        dependency_source = (
+            "https://packages.example.test/dependency-2.0-py3-none-any.whl"
+        )
+        root_payload = _package_wheel_bytes(
+            "acme-plugin",
+            "1.0",
+            requires_dist=("dependency==2",),
+        )
+        dependency_payload = _package_wheel_bytes("dependency", "2.0")
+        resolver = _ManifestResolver(
+            {
+                "dependency": _ManifestSelection(
+                    version="2.0",
+                    source=dependency_source,
+                    filename="dependency-2.0-py3-none-any.whl",
+                    digest=sha256(dependency_payload).hexdigest(),
+                )
+            }
+        )
+        (
+            kernel,
+            _artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            _resolver,
+        ) = _b3d_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            root_payload=root_payload,
+            payloads={
+                root_source: root_payload,
+                dependency_source: dependency_payload,
+            },
+            resolver=resolver,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        budgets = {
+            "B-LIMIT-GRAPH": PackageClosureBudgetV1(max_nodes=1),
+            "B-LIMIT-SOLVER": PackageClosureBudgetV1(max_solver_steps=0),
+            "B-LIMIT-REQUESTS": PackageClosureBudgetV1(max_total_requests=1),
+        }[case_id]
+        execution = PackageClosureExecutionRequestV2(
+            artifact=_artifact_execution(classified, secret=secret),
+            resolution_environment=environment,
+            budgets=budgets,
+        )
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+
+        result = closure_owner.execute(execution)
+
+        assert result.status.phase == "resolving_closure"
+        assert result.status.disposition == "rejected"
+        assert result.status.failure is not None
+        assert result.status.failure.code == "package_resource_limit_exceeded"
+        assert result.candidate is None
+        assert result.cleanup_status is None
+        assert source_authority.authorize_calls == 1
+        assert resolver.calls == ([] if case_id == "B-LIMIT-SOLVER" else ["dependency"])
+        assert tuple(
+            record.evidence_kind for record in resolution_journal.records()
+        ) == (
+            ("resolution_basis",)
+            if case_id == "B-LIMIT-SOLVER"
+            else ("resolution_basis", "selection")
+        )
+        assert tuple(record.evidence_kind for record in evidence_journal.records()) == (
+            "authenticated_source",
+            "bounded_acquisition",
+            "verified_wheel",
+        )
+        assert cleanup_journal.records() == ()
+        assert store.attempt_names() == ()
+        assert outside.read_bytes() == b"preserve"
+        lifecycle_records = journal.records()
+        resolution_records = resolution_journal.records()
+        evidence_records = evidence_journal.records()
+        replay = closure_owner.execute(execution)
+        assert replay.status == result.status
+        assert journal.records() == lifecycle_records
+        assert resolution_journal.records() == resolution_records
+        assert evidence_journal.records() == evidence_records
+        assert source_authority.authorize_calls == 1
+        assert secret not in repr(result)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id in IMPLEMENTED_B3D_INTEGRITY_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        root_source = f"https://packages.example.test/{WHEEL_FILENAME}"
+        dependency_source_1 = (
+            "https://packages.example.test/dependency-1.0-py3-none-any.whl"
+        )
+        dependency_source_2 = (
+            "https://packages.example.test/dependency-2.0-py3-none-any.whl"
+        )
+        root_requirements: tuple[str, ...] = ()
+        root_requires_python: str | None = None
+        dependency_requirements: tuple[str, ...] = ()
+        selections: dict[str | tuple[str, str], _ManifestSelection] = {}
+        payloads: dict[str, bytes] = {}
+        legacy_builder: _LegacyClosureBuilder | None = None
+
+        if case_id == "B-CLOSURE-MISSING":
+            root_requirements = ("missing==1",)
+        elif case_id in {"B-CLOSURE-DIGEST", "B-CLOSURE-ORIGIN"}:
+            root_requirements = ("dependency==2",)
+        elif case_id == "B-CLOSURE-MARKER":
+            root_requires_python = ">=4"
+        elif case_id == "B-CLOSURE-NAME":
+            root_requirements = ("dependency==1", "dependency==2")
+        elif case_id == "B-CLOSURE-CYCLE":
+            root_requirements = ("dependency==2",)
+            dependency_requirements = ("acme-plugin==1",)
+        elif case_id == "B-CLOSURE-V1":
+            legacy_builder = _LegacyClosureBuilder()
+
+        root_payload = _package_wheel_bytes(
+            "acme-plugin",
+            "1.0",
+            requires_dist=root_requirements,
+            requires_python=root_requires_python,
+        )
+        dependency_payload_1 = _package_wheel_bytes("dependency", "1.0")
+        dependency_payload_2 = _package_wheel_bytes(
+            "dependency",
+            "2.0",
+            requires_dist=dependency_requirements,
+        )
+        payloads[root_source] = root_payload
+        payloads[dependency_source_1] = dependency_payload_1
+        payloads[dependency_source_2] = dependency_payload_2
+
+        if case_id in {"B-CLOSURE-DIGEST", "B-CLOSURE-ORIGIN"}:
+            selections["dependency"] = _ManifestSelection(
+                version="2.0",
+                source=dependency_source_2,
+                filename="dependency-2.0-py3-none-any.whl",
+                digest=(
+                    "f" * 64
+                    if case_id == "B-CLOSURE-DIGEST"
+                    else sha256(dependency_payload_2).hexdigest()
+                ),
+            )
+        elif case_id == "B-CLOSURE-NAME":
+            selections[("dependency", "==1")] = _ManifestSelection(
+                version="1.0",
+                source=dependency_source_1,
+                filename="dependency-1.0-py3-none-any.whl",
+                digest=sha256(dependency_payload_1).hexdigest(),
+            )
+            selections[("dependency", "==2")] = _ManifestSelection(
+                version="2.0",
+                source=dependency_source_2,
+                filename="dependency-2.0-py3-none-any.whl",
+                digest=sha256(dependency_payload_2).hexdigest(),
+            )
+        elif case_id == "B-CLOSURE-CYCLE":
+            selections["dependency"] = _ManifestSelection(
+                version="2.0",
+                source=dependency_source_2,
+                filename="dependency-2.0-py3-none-any.whl",
+                digest=sha256(dependency_payload_2).hexdigest(),
+            )
+            selections["acme-plugin"] = _ManifestSelection(
+                version="1.0",
+                source=root_source,
+                filename=WHEEL_FILENAME,
+                digest=sha256(root_payload).hexdigest(),
+            )
+
+        resolver = _ManifestResolver(selections)
+        (
+            kernel,
+            _artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            _resolver,
+        ) = _b3d_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            root_payload=root_payload,
+            payloads=payloads,
+            resolver=resolver,
+            closure_builder=legacy_builder,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        execution = PackageClosureExecutionRequestV2(
+            artifact=_artifact_execution(classified, secret=secret),
+            resolution_environment=environment,
+            budgets=PackageClosureBudgetV1(),
+        )
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+
+        result = closure_owner.execute(execution)
+
+        expected_code = {
+            "B-CLOSURE-MISSING": "package_closure_artifact_invalid",
+            "B-CLOSURE-DIGEST": "package_closure_artifact_invalid",
+            "B-CLOSURE-ORIGIN": "package_closure_artifact_invalid",
+            "B-CLOSURE-MARKER": "package_closure_conflict",
+            "B-CLOSURE-NAME": "package_closure_conflict",
+            "B-CLOSURE-CYCLE": "package_closure_conflict",
+            "B-CLOSURE-V1": "package_closure_evidence_unsupported",
+        }[case_id]
+        expected_resolver_calls = {
+            "B-CLOSURE-MISSING": ["missing"],
+            "B-CLOSURE-DIGEST": ["dependency"],
+            "B-CLOSURE-ORIGIN": ["dependency"],
+            "B-CLOSURE-MARKER": [],
+            "B-CLOSURE-NAME": ["dependency", "dependency"],
+            "B-CLOSURE-CYCLE": ["dependency", "acme-plugin"],
+            "B-CLOSURE-V1": [],
+        }[case_id]
+        expected_source_calls = {
+            "B-CLOSURE-MISSING": 1,
+            "B-CLOSURE-DIGEST": 2,
+            "B-CLOSURE-ORIGIN": 2,
+            "B-CLOSURE-MARKER": 1,
+            "B-CLOSURE-NAME": 2,
+            "B-CLOSURE-CYCLE": 2,
+            "B-CLOSURE-V1": 1,
+        }[case_id]
+        expected_selection_count = {
+            "B-CLOSURE-MISSING": 0,
+            "B-CLOSURE-DIGEST": 1,
+            "B-CLOSURE-ORIGIN": 1,
+            "B-CLOSURE-MARKER": 0,
+            "B-CLOSURE-NAME": 2,
+            "B-CLOSURE-CYCLE": 2,
+            "B-CLOSURE-V1": 0,
+        }[case_id]
+        expected_dependency_evidence = case_id in {
+            "B-CLOSURE-DIGEST",
+            "B-CLOSURE-NAME",
+            "B-CLOSURE-CYCLE",
+        }
+        assert result.status.phase == "resolving_closure"
+        assert result.status.disposition == "rejected"
+        assert result.status.failure is not None
+        assert result.status.failure.code == expected_code
+        assert result.candidate is None
+        assert result.cleanup_status is None
+        assert resolver.calls == expected_resolver_calls
+        assert source_authority.authorize_calls == expected_source_calls
+        assert (
+            tuple(record.evidence_kind for record in resolution_journal.records())
+            == ("resolution_basis",) + ("selection",) * expected_selection_count
+        )
+        expected_evidence_kinds = (
+            "authenticated_source",
+            "bounded_acquisition",
+            "verified_wheel",
+        )
+        assert tuple(
+            record.evidence_kind for record in evidence_journal.records()
+        ) == expected_evidence_kinds * (2 if expected_dependency_evidence else 1)
+        assert cleanup_journal.records() == ()
+        assert store.attempt_names() == ()
+        assert store.total_residue_bytes() == 0
+        assert outside.read_bytes() == b"preserve"
+        assert not (tmp_path / "published").exists()
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+        lifecycle_records = journal.records()
+        resolution_records = resolution_journal.records()
+        evidence_records = evidence_journal.records()
+        replay = closure_owner.execute(execution)
+        assert replay.status == result.status
+        assert journal.records() == lifecycle_records
+        assert resolution_journal.records() == resolution_records
+        assert evidence_journal.records() == evidence_records
+        assert resolver.calls == expected_resolver_calls
+        assert source_authority.authorize_calls == expected_source_calls
+        if legacy_builder is not None:
+            assert legacy_builder.calls == 1
+        assert secret not in repr(result)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id in IMPLEMENTED_B3E_PIN_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        (
+            kernel,
+            _artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            resolver,
+        ) = _b3d_owner(tmp_path, case_id=case_id, secret=secret)
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        closure_execution = PackageClosureExecutionRequestV2(
+            artifact=_artifact_execution(classified, secret=secret),
+            resolution_environment=environment,
+            budgets=PackageClosureBudgetV1(),
+        )
+        closure_result = closure_owner.execute(closure_execution)
+        assert closure_result.candidate is not None
+        assert closure_result.status.phase == "closure_verified"
+        retention = _TransactionPinRetentionOwner()
+        pin_journal = PackageTransactionPinJournal(
+            tmp_path / "package-transaction-pins.jsonl"
+        )
+        pin_owner = PackageTransactionPinLifecycleOwner(
+            kernel=kernel,
+            closure_plans=resolution_journal,
+            retention=retention,
+            pin_journal=pin_journal,
+        )
+        recovery_identity = "manifest-recovery-transaction-pinned"
+
+        pinned = pin_owner.pin(
+            closure_result.candidate,
+            recovery_identity=recovery_identity,
+        )
+
+        assert pinned.status.phase == "transaction_pinned"
+        assert pinned.status.disposition == "active"
+        assert pinned.receipt is not None
+        closure_result.candidate.suspend_for_recovery()
+        evidence_before = evidence_journal.records()
+        resolution_before = resolution_journal.records()
+        lifecycle_before = journal.records()
+        source_calls = source_authority.authorize_calls
+        interrupted = kernel.interrupt(
+            pinned.status.operation_id,
+            expected_phase="transaction_pinned",
+            expected_journal_revision=pinned.status.journal_revision,
+            expected_attempt_epoch=pinned.status.attempt_epoch,
+        )
+        restarted_kernel = PackageLifecycleOwner(
+            journal=PackageLifecycleJournal(journal.path),
+            classification_authority=_Authority(_facts("explicit_plugin_intent")),
+            enabled=True,
+        )
+        restarted_owner = PackageTransactionPinLifecycleOwner(
+            kernel=restarted_kernel,
+            closure_plans=PackageClosureResolutionJournal(resolution_journal.path),
+            retention=retention,
+            pin_journal=PackageTransactionPinJournal(pin_journal.path),
+        )
+
+        recovered = restarted_owner.recover(
+            pinned.status.operation_id,
+            recovery_identity=recovery_identity,
+        )
+
+        assert interrupted.phase == "transaction_pinned"
+        assert interrupted.disposition == "retryable_failure"
+        assert interrupted.failure is not None
+        assert interrupted.failure.code == "package_operation_interrupted"
+        assert recovered.status == interrupted
+        assert recovered.receipt == pinned.receipt
+        assert recovered.candidate is None
+        assert retention.receipts[pinned.status.operation_id] == pinned.receipt
+        assert retention.physical_acquisitions == 1
+        assert len(retention.calls) == 2
+        assert len(pin_journal.records()) == 1
+        assert len(journal.records()) == len(lifecycle_before) + 1
+        assert evidence_journal.records() == evidence_before
+        assert resolution_journal.records() == resolution_before
+        assert source_authority.authorize_calls == source_calls == 1
+        assert resolver.calls == 0
+        assert cleanup_journal.records() == ()
+        assert len(store.attempt_names()) == 1
+        assert not (tmp_path / "published").exists()
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+        assert secret not in repr(recovered)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id in IMPLEMENTED_B3E_STAGING_SET_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        (
+            kernel,
+            _artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            resolver,
+        ) = _b3d_owner(tmp_path, case_id=case_id, secret=secret)
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        closure_result = closure_owner.execute(
+            PackageClosureExecutionRequestV2(
+                artifact=_artifact_execution(classified, secret=secret),
+                resolution_environment=environment,
+                budgets=PackageClosureBudgetV1(),
+            )
+        )
+        assert closure_result.candidate is not None
+        retention = _TransactionPinRetentionOwner()
+        pin_journal = PackageTransactionPinJournal(
+            tmp_path / "package-transaction-pins.jsonl"
+        )
+        pin_owner = PackageTransactionPinLifecycleOwner(
+            kernel=kernel,
+            closure_plans=resolution_journal,
+            retention=retention,
+            pin_journal=pin_journal,
+        )
+        pinned = pin_owner.pin(
+            closure_result.candidate,
+            recovery_identity="manifest-recovery-staging-set",
+        )
+        assert pinned.status.phase == "transaction_pinned"
+        assert pinned.receipt is not None
+        lifecycle_before = journal.records()
+        evidence_before = evidence_journal.records()
+        resolution_before = resolution_journal.records()
+        source_calls = source_authority.authorize_calls
+        staging_journal = PackageArtifactStagingJournal(
+            tmp_path / "package-artifact-staging.jsonl"
+        )
+        committed_sets = PackageCommittedSetJournal(
+            tmp_path / "package-committed-sets.jsonl"
+        )
+        dependency_staging = _ManifestDependencyStagingOwner()
+        root_staging = _ManifestRootStagingOwner()
+        root_targets = _ManifestRootTargetAuthority()
+        crash_phase: PackageLifecyclePhase = (
+            "staging" if case_id == "B-CRASH-STAGING" else "set_published"
+        )
+        crash_kernel = _CrashAfterPhasePackageOwner(
+            journal=PackageLifecycleJournal(journal.path),
+            facts=_facts("explicit_plugin_intent"),
+            crash_after=crash_phase,
+        )
+        staging_owner = PackageStagingSetLifecycleOwner(
+            kernel=crash_kernel,
+            classification_recheck=_StableClassificationRecheck(),
+            closure_plans=PackageClosureResolutionJournal(resolution_journal.path),
+            pin_journal=PackageTransactionPinJournal(pin_journal.path),
+            root_targets=root_targets,
+            dependency_staging=dependency_staging,
+            root_staging=root_staging,
+            staging_journal=staging_journal,
+            committed_sets=committed_sets,
+        )
+
+        with pytest.raises(_ManifestCrashEdge, match=crash_phase):
+            staging_owner.stage_and_publish(closure_result.candidate)
+
+        crashed = crash_kernel.status(classified.operation_id)
+        assert crashed is not None and crashed.phase == crash_phase
+        interrupted = crash_kernel.interrupt(
+            crashed.operation_id,
+            expected_phase=crashed.phase,
+            expected_journal_revision=crashed.journal_revision,
+            expected_attempt_epoch=crashed.attempt_epoch,
+        )
+        restarted_kernel = PackageLifecycleOwner(
+            journal=PackageLifecycleJournal(journal.path),
+            classification_authority=_Authority(_facts("explicit_plugin_intent")),
+            enabled=True,
+        )
+        restarted_owner = PackageStagingSetLifecycleOwner(
+            kernel=restarted_kernel,
+            classification_recheck=_StableClassificationRecheck(),
+            closure_plans=PackageClosureResolutionJournal(resolution_journal.path),
+            pin_journal=PackageTransactionPinJournal(pin_journal.path),
+            root_targets=root_targets,
+            dependency_staging=dependency_staging,
+            root_staging=root_staging,
+            staging_journal=PackageArtifactStagingJournal(staging_journal.path),
+            committed_sets=PackageCommittedSetJournal(committed_sets.path),
+        )
+        recovered = restarted_owner.recover(classified.operation_id)
+
+        assert interrupted.phase == crash_phase
+        assert interrupted.disposition == "retryable_failure"
+        assert interrupted.failure is not None
+        assert interrupted.failure.code == "package_operation_interrupted"
+        assert recovered.status == interrupted
+        assert len(recovered.staging_receipts) == 1
+        assert recovered.staging_receipts == staging_journal.receipts(
+            classified.operation_id
+        )
+        if case_id == "B-CRASH-STAGING":
+            assert recovered.committed_set is None
+            assert committed_sets.records() == ()
+        else:
+            assert recovered.committed_set is not None
+            assert recovered.committed_set == committed_sets.records()[0].committed_set
+        assert root_targets.calls == 1
+        assert root_staging.physical_stages == 1
+        assert dependency_staging.physical_stages == 0
+        assert retention.receipts[classified.operation_id] == pinned.receipt
+        assert retention.physical_acquisitions == 1
+        assert len(pin_journal.records()) == 1
+        expected_lifecycle_growth = 2 if case_id == "B-CRASH-STAGING" else 3
+        assert (
+            len(journal.records()) == len(lifecycle_before) + expected_lifecycle_growth
+        )
+        assert evidence_journal.records() == evidence_before
+        assert resolution_journal.records() == resolution_before
+        assert source_authority.authorize_calls == source_calls == 1
+        assert resolver.calls == 0
+        assert cleanup_journal.records() == ()
+        assert len(store.attempt_names()) == 1
+        assert not (tmp_path / "published").exists()
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+        assert secret not in repr(recovered)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id in (
+        IMPLEMENTED_B3E3C1_POSIX_MANIFEST_CASES
+        + IMPLEMENTED_B3E3C2_WINDOWS_MANIFEST_CASES
+        + IMPLEMENTED_B3E3C3_SETTLEMENT_MANIFEST_CASES
+    ):
+        windows_case = case_id in IMPLEMENTED_B3E3C2_WINDOWS_MANIFEST_CASES
+        assert os.name == ("nt" if windows_case else "posix")
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        (
+            kernel,
+            _artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            quarantine,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            resolver,
+        ) = _b3d_owner(tmp_path, case_id=case_id, secret=secret)
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        closure_result = closure_owner.execute(
+            PackageClosureExecutionRequestV2(
+                artifact=_artifact_execution(classified, secret=secret),
+                resolution_environment=environment,
+                budgets=PackageClosureBudgetV1(),
+            )
+        )
+        assert closure_result.candidate is not None
+        retention = _TransactionPinRetentionOwner()
+        pin_journal = PackageTransactionPinJournal(
+            tmp_path / "package-transaction-pins.jsonl"
+        )
+        pin_owner = PackageTransactionPinLifecycleOwner(
+            kernel=kernel,
+            closure_plans=resolution_journal,
+            retention=retention,
+            pin_journal=pin_journal,
+        )
+        pinned = pin_owner.pin(
+            closure_result.candidate,
+            recovery_identity="manifest-recovery-native-materialization",
+        )
+        assert pinned.receipt is not None
+        assert pinned.status.classification is not None
+
+        dependency_root = tmp_path / "dependency-publication-store"
+        plugin_authority = tmp_path / "plugin-publication-authority"
+        plugin_root = plugin_authority / "plugin-revision-store"
+        dependency_root.mkdir(mode=0o700)
+        plugin_root.mkdir(parents=True, mode=0o700)
+        outside = tmp_path / "outside-publication-sentinel"
+        outside.write_bytes(b"preserve")
+        outside_target = tmp_path / "outside-publication-target"
+        outside_target.mkdir()
+        outside_target_sentinel = outside_target / "sentinel"
+        outside_target_sentinel.write_bytes(b"preserve")
+        root_targets = _ManifestRootTargetAuthority()
+        request = kernel.journal.request(classified.operation_id)
+        assert request is not None
+        target = root_targets.issue_target(request, pinned.status.classification)
+        root_staging_request = PackageArtifactStagingRequestV1.create(
+            closure_result.candidate.plan,
+            node_id=closure_result.candidate.plan.root_node_id,
+            request_fingerprint=pinned.status.request_fingerprint,
+            classification_fingerprint=pinned.status.classification.evidence_ref,
+            pin_receipt=pinned.receipt,
+            root_target=target,
+        )
+        precreated: Path | None = None
+        staging_path = plugin_root / (
+            f"staging-{root_staging_request.staging_request_id}"
+        )
+        detached_root = plugin_authority / "plugin-revision-store-detached"
+        detached_authority = tmp_path / "plugin-publication-authority-detached"
+        detached_entry = staging_path / "root_plugin-detached"
+        detached_staging = plugin_root / "staging-detached"
+        root_swapped = False
+        ancestor_swapped = False
+        entry_swapped = False
+        staging_swapped = False
+
+        if case_id == "B-PUB-PRECREATE":
+            precreated = plugin_root / (
+                f"staging-{root_staging_request.staging_request_id}"
+            )
+            precreated.mkdir(mode=0o700)
+            (precreated / "attacker-link").symlink_to(outside)
+
+        def commit_probe() -> None:
+            nonlocal root_swapped, ancestor_swapped, entry_swapped, staging_swapped
+            if case_id == "B-PUB-POSIX-ROOT-SWAP":
+                plugin_root.rename(detached_root)
+                plugin_root.mkdir(mode=0o700)
+                root_swapped = True
+            elif case_id == "B-PUB-POSIX-ANCESTOR-SWAP":
+                plugin_authority.rename(detached_authority)
+                plugin_root.mkdir(parents=True, mode=0o700)
+                ancestor_swapped = True
+            elif case_id == "B-PUB-POSIX-HANDLE-REJECT":
+                plugin_root.chmod(0o755)
+            elif case_id == "B-PUB-SWAP-WINDOWS":
+                (staging_path / "root_plugin").rename(detached_entry)
+                entry_swapped = True
+                (staging_path / "root_plugin").symlink_to(
+                    outside_target,
+                    target_is_directory=True,
+                )
+            elif case_id == "B-PUB-WIN-ROOT-ABA":
+                plugin_root.rename(detached_root)
+                root_swapped = True
+                shutil.copytree(detached_root, plugin_root)
+            elif case_id == "B-PUB-WIN-ANCESTOR-ABA":
+                plugin_authority.rename(detached_authority)
+                ancestor_swapped = True
+                plugin_authority.symlink_to(
+                    outside_target,
+                    target_is_directory=True,
+                )
+            elif case_id == "B-PUB-WIN-HANDLE-REJECT":
+                staging_path.rename(detached_staging)
+                staging_swapped = True
+                staging_path.symlink_to(outside_target, target_is_directory=True)
+
+        handle_success = case_id in {
+            "B-PUB-POSIX-HANDLE-SUCCESS",
+            "B-PUB-WIN-HANDLE-SUCCESS",
+            "B-PUB-REUSE",
+        }
+        active_probe = (
+            None if case_id == "B-PUB-PRECREATE" or handle_success else commit_probe
+        )
+        dependency_settlements = PackageStoreSettlementJournal(
+            tmp_path / "dependency-store-settlements.jsonl"
+        )
+        plugin_settlements = PackageStoreSettlementJournal(
+            tmp_path / "plugin-store-settlements.jsonl"
+        )
+        if windows_case:
+            dependency_staging = WindowsPackageDependencyMaterializationStore(
+                dependency_root,
+                store_identity="manifest-dependency-store",
+                settlement_journal=dependency_settlements,
+            )
+            native_root_store = WindowsPackagePluginRootMaterializationStore(
+                plugin_root,
+                store_identity="manifest-plugin-revision-store",
+                settlement_journal=plugin_settlements,
+                commit_probe=active_probe,
+            )
+        else:
+            dependency_staging = PosixPackageDependencyMaterializationStore(
+                dependency_root,
+                store_identity="manifest-dependency-store",
+                settlement_journal=dependency_settlements,
+            )
+            native_root_store = PosixPackagePluginRootMaterializationStore(
+                plugin_root,
+                store_identity="manifest-plugin-revision-store",
+                settlement_journal=plugin_settlements,
+                commit_probe=active_probe,
+            )
+        preexisting_receipt: PackageArtifactStagingReceiptV1 | None = None
+        if case_id in IMPLEMENTED_B3E3C3_SETTLEMENT_MANIFEST_CASES:
+            assert not windows_case
+            root_candidate = next(
+                candidate
+                for candidate in closure_result.candidate.candidates
+                if candidate.evidence.node_id
+                == closure_result.candidate.plan.root_node_id
+            )
+            preexisting_receipt = native_root_store.stage_root(
+                root_staging_request,
+                root_candidate,
+            )
+            if case_id == "B-PUB-COLLISION":
+                published = plugin_root / (
+                    f"revision-{preexisting_receipt.stable_ref.ref_id}"
+                )
+                detached = tmp_path / "detached-published-revision"
+                published.rename(detached)
+                shutil.copytree(detached, published)
+            native_root_store = PosixPackagePluginRootMaterializationStore(
+                plugin_root,
+                store_identity="manifest-plugin-revision-store",
+                settlement_journal=PackageStoreSettlementJournal(
+                    plugin_settlements.path
+                ),
+            )
+        root_staging = _ManifestNativeRootStagingOwner(
+            native_root_store,
+            verify_reuse=handle_success,
+        )
+        staging_journal = PackageArtifactStagingJournal(
+            tmp_path / "package-artifact-staging.jsonl"
+        )
+        committed_sets = PackageCommittedSetJournal(
+            tmp_path / "package-committed-sets.jsonl"
+        )
+        staging_owner = PackageStagingSetLifecycleOwner(
+            kernel=kernel,
+            classification_recheck=_StableClassificationRecheck(),
+            closure_plans=resolution_journal,
+            pin_journal=pin_journal,
+            root_targets=root_targets,
+            dependency_staging=dependency_staging,
+            root_staging=root_staging,
+            staging_journal=staging_journal,
+            committed_sets=committed_sets,
+        )
+
+        result = staging_owner.stage_and_publish(closure_result.candidate)
+
+        if root_swapped:
+            if windows_case:
+                if plugin_root.exists():
+                    shutil.rmtree(plugin_root)
+                detached_root.rename(plugin_root)
+            else:
+                replacement = plugin_authority / "plugin-revision-store-replacement"
+                plugin_root.rename(replacement)
+                detached_root.rename(plugin_root)
+                replacement.rmdir()
+        if ancestor_swapped:
+            if windows_case:
+                if plugin_authority.is_symlink():
+                    plugin_authority.unlink()
+                detached_authority.rename(plugin_authority)
+            else:
+                replacement_authority = (
+                    tmp_path / "plugin-publication-authority-replacement"
+                )
+                plugin_authority.rename(replacement_authority)
+                detached_authority.rename(plugin_authority)
+                (replacement_authority / "plugin-revision-store").rmdir()
+                replacement_authority.rmdir()
+        if entry_swapped:
+            if (staging_path / "root_plugin").is_symlink():
+                (staging_path / "root_plugin").unlink()
+            shutil.rmtree(staging_path)
+        if staging_swapped:
+            if staging_path.is_symlink():
+                staging_path.unlink()
+            shutil.rmtree(detached_staging)
+        if case_id == "B-PUB-POSIX-HANDLE-REJECT":
+            plugin_root.chmod(0o700)
+
+        if handle_success:
+            assert result.status.phase == "set_published"
+            assert result.status.disposition == "active"
+            assert result.committed_set is not None
+            assert len(result.staging_receipts) == 1
+            assert root_staging.same_receipt is True
+            if preexisting_receipt is not None:
+                assert result.staging_receipts == (preexisting_receipt,)
+                assert len(plugin_settlements.records()) == 1
+            committed = kernel.advance(
+                result.status.operation_id,
+                next_phase="committed",
+                expected_phase="set_published",
+                expected_journal_revision=result.status.journal_revision,
+                expected_attempt_epoch=result.status.attempt_epoch,
+            )
+            assert committed.phase == "committed"
+            assert committed.disposition == "committed"
+            assert len(committed_sets.records()) == 1
+            assert len(staging_journal.records()) == 1
+            if case_id == "B-PUB-REUSE":
+                assert preexisting_receipt is not None
+                restarted_store = PosixPackagePluginRootMaterializationStore(
+                    plugin_root,
+                    store_identity="manifest-plugin-revision-store",
+                    settlement_journal=PackageStoreSettlementJournal(
+                        plugin_settlements.path
+                    ),
+                )
+                settlement_count = len(plugin_settlements.records())
+                assert (
+                    restarted_store.validate_root_receipt(preexisting_receipt)
+                    == preexisting_receipt
+                )
+                assert len(plugin_settlements.records()) == settlement_count == 1
+            assert (
+                len(
+                    tuple(
+                        entry
+                        for entry in plugin_root.iterdir()
+                        if entry.name.startswith("revision-")
+                    )
+                )
+                == 1
+            )
+        else:
+            assert result.status.phase == "staging"
+            assert result.status.disposition == "rejected"
+            assert result.status.failure is not None
+            expected_failure = (
+                "package_publication_collision"
+                if case_id == "B-PUB-COLLISION"
+                else "package_publication_root_untrusted"
+            )
+            assert result.status.failure.code == expected_failure
+            assert result.staging_receipts == ()
+            assert staging_journal.records() == ()
+            assert committed_sets.records() == ()
+            if case_id == "B-PUB-COLLISION":
+                assert preexisting_receipt is not None
+                assert len(plugin_settlements.records()) == 1
+            else:
+                assert not any(
+                    entry.name.startswith("revision-")
+                    for entry in plugin_root.iterdir()
+                )
+
+        assert (
+            pin_journal.current_for_operation(classified.operation_id) == pinned.receipt
+        )
+        assert retention.receipts[classified.operation_id] == pinned.receipt
+        assert source_authority.authorize_calls == 1
+        assert resolver.calls == 0
+        assert cleanup_journal.records() == ()
+        assert len(quarantine.attempt_names()) == 1
+        assert outside.read_bytes() == b"preserve"
+        assert outside_target_sentinel.read_bytes() == b"preserve"
+        assert not (tmp_path / "binding.json").exists()
+        assert not (tmp_path / "desired.json").exists()
+        moved_root = plugin_authority / "plugin-revision-store-moved"
+        plugin_root.rename(moved_root)
+        moved_root.rename(plugin_root)
+        if precreated is not None:
+            (precreated / "attacker-link").unlink()
+            precreated.rmdir()
+        assert secret not in repr(result)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id in IMPLEMENTED_B3D_RECOVERY_MANIFEST_CASES:
+        secret = f"manifest-secret-{case_id.lower()}"
+        environment = _closure_environment()
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+            closure_owner,
+            resolution_journal,
+            resolver,
+        ) = _b3d_owner(tmp_path, case_id=case_id, secret=secret)
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                ),
+                environment_fingerprint=environment.fingerprint,
+            )
+        )
+        artifact_execution = _artifact_execution(classified, secret=secret)
+        execution = PackageClosureExecutionRequestV2(
+            artifact=artifact_execution,
+            resolution_environment=environment,
+            budgets=PackageClosureBudgetV1(),
+        )
+        if case_id == "B-CRASH-RESOLVING":
+            request = kernel.journal.request(classified.operation_id)
+            assert request is not None
+            resolution_journal.bind_basis(
+                PackageClosureResolutionBasisV1(
+                    operation_id=classified.operation_id,
+                    attempt_epoch=classified.attempt_epoch,
+                    request_fingerprint=classified.request_fingerprint,
+                    policy_revision=request.policy_revision,
+                    quota_profile_revision=request.quota_profile_revision,
+                    resolution_environment=environment,
+                    budgets=execution.budgets,
+                )
+            )
+            artifact_result = artifact_owner.execute(artifact_execution)
+            assert artifact_result.candidate is not None
+            current = kernel.advance(
+                classified.operation_id,
+                next_phase="resolving_closure",
+                expected_phase="extracted",
+                expected_journal_revision=artifact_result.status.journal_revision,
+                expected_attempt_epoch=artifact_result.status.attempt_epoch,
+            )
+            artifact_result.candidate.suspend_for_recovery()
+            expected_resolution_kinds = ("resolution_basis",)
+        else:
+            closure_result = closure_owner.execute(execution)
+            assert closure_result.candidate is not None
+            current = closure_result.status
+            closure_result.candidate.suspend_for_recovery()
+            expected_resolution_kinds = (
+                "resolution_basis",
+                "verified_plan",
+            )
+        assert current.phase == (
+            "resolving_closure"
+            if case_id == "B-CRASH-RESOLVING"
+            else "closure_verified"
+        )
+        evidence_before = evidence_journal.records()
+        resolution_before = resolution_journal.records()
+        lifecycle_before = journal.records()
+        source_calls = source_authority.authorize_calls
+
+        interrupted = kernel.interrupt(
+            current.operation_id,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+
+        assert interrupted.disposition == "retryable_failure"
+        assert interrupted.failure is not None
+        assert interrupted.failure.code == "package_operation_interrupted"
+        assert interrupted.failure.retry_domain == "operation"
+        assert (
+            tuple(record.evidence_kind for record in resolution_before)
+            == expected_resolution_kinds
+        )
+        assert len(journal.records()) == len(lifecycle_before) + 1
+        replay = closure_owner.execute(execution)
+        assert replay.status == interrupted
+        assert replay.candidate is None
+        assert evidence_journal.records() == evidence_before
+        assert resolution_journal.records() == resolution_before
+        assert source_authority.authorize_calls == source_calls == 1
+        assert resolver.calls == 0
+        assert cleanup_journal.records() == ()
+        assert len(store.attempt_names()) == 1
+        assert store.total_residue_bytes() <= 512 * 1024
+        assert secret not in repr(interrupted)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id.startswith("B-CRASH-") and case_id not in {
+        "B-CRASH-ACCEPTED",
+        "B-CRASH-CLASSIFIED",
+    }:
+        target_phase = {
+            "B-CRASH-ACQUIRING": "acquiring",
+            "B-CRASH-ACQUIRED": "acquired",
+            "B-CRASH-INSPECTING": "inspecting",
+            "B-CRASH-EXTRACTED": "extracted",
+        }[case_id]
+        secret = f"manifest-secret-{case_id.lower()}"
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            payload=_wheel_bytes(),
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        current, candidate, execution = _land_artifact_phase(
+            kernel=kernel,
+            artifact_owner=artifact_owner,
+            evidence_journal=evidence_journal,
+            classified=classified,
+            target_phase=target_phase,
+            secret=secret,
+        )
+        if candidate is not None:
+            candidate.suspend_for_recovery()
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+        evidence_before = evidence_journal.records()
+        records_before = journal.records()
+        source_calls = source_authority.authorize_calls
+
+        interrupted = kernel.interrupt(
+            current.operation_id,
+            expected_phase=current.phase,
+            expected_journal_revision=current.journal_revision,
+            expected_attempt_epoch=current.attempt_epoch,
+        )
+
+        assert interrupted.phase == target_phase
+        assert interrupted.disposition == "retryable_failure"
+        assert interrupted.request_fingerprint == current.request_fingerprint
+        assert interrupted.attempt_epoch == current.attempt_epoch
+        assert interrupted.failure is not None
+        assert interrupted.failure.code == "package_operation_interrupted"
+        assert interrupted.failure.retry_domain == "operation"
+        assert interrupted.failure.operator_action == "retry"
+        assert evidence_journal.records() == evidence_before
+        assert len(journal.records()) == len(records_before) + 1
+        record_count = len(journal.records())
+        assert (
+            kernel.interrupt(
+                current.operation_id,
+                expected_phase=current.phase,
+                expected_journal_revision=current.journal_revision,
+                expected_attempt_epoch=current.attempt_epoch,
+            )
+            == interrupted
+        )
+        assert len(journal.records()) == record_count
+        assert artifact_owner.execute(execution).status == interrupted
+        assert source_authority.authorize_calls == source_calls
+        assert cleanup_journal.records() == ()
+        assert len(store.attempt_names()) <= 1
+        assert store.total_residue_bytes() <= 512 * 1024
+        assert outside.read_bytes() == b"preserve"
+        assert secret not in repr(interrupted)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    elif case_id == "B-STATE-REJECT-CLEANUP":
+        secret = f"manifest-secret-{case_id.lower()}"
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            payload=b"not-a-wheel",
+            cleanup_debt=True,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/rejected.whl"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        execution = _artifact_execution(classified, secret=secret)
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+
+        result = artifact_owner.execute(execution)
+
+        assert result.status.phase == "inspecting"
+        assert result.status.disposition == "rejected"
+        assert result.status.failure is not None
+        assert result.status.failure.code == "package_archive_malformed"
+        assert result.cleanup_status is not None
+        assert result.cleanup_status.disposition == "cleanup_retryable"
+        assert result.cleanup_status.failure is not None
+        assert (
+            result.cleanup_status.failure.code == "package_quarantine_cleanup_retryable"
+        )
+        assert result.cleanup_status.failure.retry_domain == "cleanup"
+        assert result.cleanup_status.failure.operator_action == "repair"
+        assert len(evidence_journal.records()) == 2
+        assert len(cleanup_journal.records()) == 1
+        assert len(store.attempt_names()) == 1
+        assert store.total_residue_bytes() <= 512 * 1024
+        assert outside.read_bytes() == b"preserve"
+        operation_records = journal.records()
+        cleanup_records = cleanup_journal.records()
+        replay = artifact_owner.execute(execution)
+        assert replay.status == result.status
+        assert replay.cleanup_status is None
+        assert journal.records() == operation_records
+        assert cleanup_journal.records() == cleanup_records
+        repaired = PackageQuarantineCleanupOwner(
+            journal=cleanup_journal,
+            store=store,
+        ).repair(
+            result.cleanup_status.target.cleanup_id,
+            expected_cleanup_revision=result.cleanup_status.cleanup_revision,
+        )
+        assert repaired.disposition == "cleanup_complete"
+        assert store.attempt_names() == ()
+        assert source_authority.authorize_calls == 1
+        assert secret not in repr(result)
+    elif case_id == "B-TYPE-HARDLINK":
+        if os.name != "posix":
+            pytest.skip("hardlink normalization requires a native POSIX filesystem")
+        secret = f"manifest-secret-{case_id.lower()}"
+        payload, source_first, source_second, archive_names = _hardlinked_source_wheel(
+            tmp_path
+        )
+        first_source_stat = source_first.stat()
+        second_source_stat = source_second.stat()
+        assert (first_source_stat.st_dev, first_source_stat.st_ino) == (
+            second_source_stat.st_dev,
+            second_source_stat.st_ino,
+        )
+        assert first_source_stat.st_nlink >= 2
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            infos = tuple(archive.getinfo(name) for name in archive_names)
+            assert all(info.create_system == 3 for info in infos)
+            assert all(
+                stat.S_IFMT(info.external_attr >> 16) == stat.S_IFREG for info in infos
+            )
+            assert all(info.extra == b"" for info in infos)
+            assert archive.read(archive_names[0]) == archive.read(archive_names[1])
+
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(
+            tmp_path / "runtime",
+            case_id=case_id,
+            secret=secret,
+            payload=payload,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/{WHEEL_FILENAME}"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+
+        result = artifact_owner.execute(_artifact_execution(classified, secret=secret))
+
+        assert result.status.phase == "extracted"
+        assert result.status.disposition == "active"
+        assert result.status.failure is None
+        assert result.candidate is not None
+        tree = result.candidate._acquired._attempt._attempt_path / "tree"
+        extracted = tuple(
+            tree.joinpath(*name.split("/")).stat() for name in archive_names
+        )
+        assert all(stat.S_ISREG(metadata.st_mode) for metadata in extracted)
+        assert extracted[0].st_ino != extracted[1].st_ino
+        assert all(metadata.st_nlink == 1 for metadata in extracted)
+        assert len(evidence_journal.records()) == 3
+        assert cleanup_journal.records() == ()
+        assert source_authority.authorize_calls == 1
+        assert outside.read_bytes() == b"preserve"
+        assert secret not in repr(result)
+        operation_records = journal.records()
+        result.candidate.cleanup()
+        assert store.attempt_names() == ()
+        assert journal.records() == operation_records
+    elif case_id in (
+        IMPLEMENTED_B2H_MANIFEST_CASES + IMPLEMENTED_B2I_WINDOWS_MANIFEST_CASES
+    ):
+        fixture = _inspection_fixture(case_id)
+        secret = f"manifest-secret-{case_id.lower()}"
+        (
+            kernel,
+            artifact_owner,
+            journal,
+            evidence_journal,
+            cleanup_journal,
+            store,
+            source_authority,
+        ) = _b2_owner(
+            tmp_path,
+            case_id=case_id,
+            secret=secret,
+            payload=fixture.payload,
+            inspection_budgets=fixture.budgets,
+            wheel_verifier=fixture.verifier,
+            supported_tags=fixture.supported_tags,
+        )
+        classified = kernel.submit(
+            _request(
+                source=(
+                    f"https://user:{secret}@packages.example.test/hostile.whl"
+                    f"?token={secret}#{secret}"
+                )
+            )
+        )
+        execution = PackageArtifactExecutionRequestV1(
+            operation_id=classified.operation_id,
+            request_fingerprint=classified.request_fingerprint,
+            expected_attempt_epoch=classified.attempt_epoch,
+            wheel_filename=fixture.wheel_filename,
+            credential_reference=f"opaque:{secret}",
+        )
+        outside = tmp_path / "outside-sentinel"
+        outside.write_bytes(b"preserve")
+        process_marker = tmp_path / "artifact-process-marker"
+
+        result = artifact_owner.execute(execution)
+
+        if case_id.startswith("B-ARCH-"):
+            expected_code = "package_archive_malformed"
+        elif case_id in {
+            "B-PATH-ABSOLUTE",
+            "B-PATH-TRAVERSAL",
+            "B-PATH-EMPTY",
+            "B-PATH-COLLISION-SEP",
+            "B-PATH-WIN-ROOT",
+            "B-PATH-WIN-ADS",
+            "B-PATH-WIN-RESERVED",
+            "B-PATH-WIN-TRAILING",
+        }:
+            expected_code = "package_archive_path_rejected"
+        elif case_id in {
+            "B-PATH-COLLISION-UNICODE",
+            "B-PATH-COLLISION-CASE",
+        }:
+            expected_code = "package_archive_name_collision"
+        elif case_id.startswith("B-TYPE-"):
+            expected_code = "package_archive_entry_type_rejected"
+        elif case_id.startswith("B-LIMIT-"):
+            expected_code = "package_resource_limit_exceeded"
+        elif case_id in {"B-WHEEL-SDIST", "B-WHEEL-ZIP", "B-WHEEL-TAGS"}:
+            expected_code = "package_artifact_type_rejected"
+        elif case_id == "B-WHEEL-METADATA":
+            expected_code = "package_wheel_metadata_invalid"
+        else:
+            expected_code = "package_wheel_record_invalid"
+        expected_phase = (
+            "extracted" if case_id.startswith("B-WHEEL-RECORD-") else "inspecting"
+        )
+        assert result.status.phase == expected_phase
+        assert result.status.disposition == "rejected"
+        assert result.status.failure is not None
+        assert result.status.failure.code == expected_code
+        assert result.candidate is None
+        assert result.cleanup_status is None
+        assert source_authority.authorize_calls == 1
+        assert source_authority.stream is not None
+        assert source_authority.stream.requests_started == 1
+        assert source_authority.stream.writes_started == 1
+        evidence = evidence_journal.records()
+        assert tuple(record.evidence_kind for record in evidence) == (
+            "authenticated_source",
+            "bounded_acquisition",
+        )
+        assert cleanup_journal.records() == ()
+        assert store.attempt_names() == ()
+        assert store.total_residue_bytes() == 0
+        assert outside.read_bytes() == b"preserve"
+        assert not process_marker.exists()
+        assert "acme_plugin" not in sys.modules
+        records = journal.records()
+        replay = artifact_owner.execute(execution)
+        assert replay.status == result.status
+        assert replay.candidate is None
+        assert journal.records() == records
+        assert source_authority.authorize_calls == 1
+        assert secret not in repr(result)
+        for path in tmp_path.rglob("*"):
+            if path.is_file():
+                assert secret.encode() not in path.read_bytes()
+    else:  # pragma: no cover - the parametrization is deliberately closed
+        raise AssertionError(f"Unhandled PLC9B manifest case: {case_id}")
+
+    if case_id in IMPLEMENTED_B1_MANIFEST_CASES:
+        _assert_no_capability_side_effect(tmp_path)
+
+
+def _assert_classification(status: object, *, decision: str, code: str | None) -> None:
+    assert getattr(status, "phase") == "classified"
+    classification = getattr(status, "classification")
+    assert classification is not None
+    assert classification.decision == decision
+    failure = getattr(status, "failure")
+    if code is None:
+        assert getattr(status, "disposition") == "active"
+        assert failure is None
+    else:
+        assert getattr(status, "disposition") == "rejected"
+        assert failure is not None
+        assert failure.code == code
+
+
+def _assert_replay_is_single_owner(
+    owner: PackageLifecycleOwner,
+    journal: PackageLifecycleJournal,
+) -> None:
+    current = journal.status("manifest-operation")
+    records = journal.records()
+    assert owner.submit(_request()) == current
+    assert journal.records() == records
+
+
+def _assert_no_capability_side_effect(tmp_path: Path) -> None:
+    names = {path.name for path in tmp_path.rglob("*") if path.is_file()}
+    assert names <= {
+        "package-lifecycle.jsonl",
+        "package-lifecycle.jsonl.lock",
+    }

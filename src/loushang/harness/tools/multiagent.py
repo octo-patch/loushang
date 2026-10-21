@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
-from dataclasses import asdict
+import json
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import asdict, dataclass
 from typing import Any, Protocol, cast
 
 from loushang.agent.types import AgentToolResult, TextPart
+from loushang.ai.types import ToolCall
 from loushang.harness.multiagent import (
     AgentCaller,
     AgentPath,
     AgentRecord,
+    AgentRef,
     ControlCaller,
 )
-from loushang.harness.multiagent.types import AgentMessageKind
+from loushang.harness.multiagent.types import AgentCompletionNotice, AgentMessageKind
 from loushang.harness.tools.contribution import ToolPackDefinition
 from loushang.harness.tools.core import ToolDefinition
+from loushang.harness.tools.execution import DirectExecution, DirectToolContext
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 
 MULTIAGENT_TOOL_NAMES = (
     "spawn_agent",
     "send_message",
     "wait_agent",
+    "get_agent_result",
     "list_agents",
     "interrupt_agent",
     "close_agent",
@@ -61,6 +66,14 @@ class LiveMultiAgentRuntime(Protocol):
         timeout: float | None = None,
     ) -> object: ...
 
+    def read_completion_notice(
+        self,
+        *,
+        caller: AgentCaller,
+        ref: AgentRef,
+        round_id: int,
+    ) -> AgentCompletionNotice: ...
+
     def list_agents(self, *, caller: ControlCaller) -> tuple[AgentRecord, ...]: ...
 
     async def interrupt_agent(
@@ -86,6 +99,7 @@ class MultiAgentToolPack:
         *,
         runtime: LiveMultiAgentRuntime,
         caller: AgentCaller,
+        agent_type_options: Mapping[str, str] | None = None,
         default_wait_seconds: float = 30.0,
         maximum_wait_seconds: float = 3600.0,
     ) -> None:
@@ -97,6 +111,11 @@ class MultiAgentToolPack:
             )
         self._runtime = runtime
         self._caller = caller
+        self._agent_type_options = (
+            tuple(agent_type_options.items())
+            if agent_type_options is not None
+            else None
+        )
         self._default_wait_seconds = default_wait_seconds
         self._maximum_wait_seconds = maximum_wait_seconds
         self._wait_sequence = 0
@@ -106,6 +125,7 @@ class MultiAgentToolPack:
             self._spawn(),
             self._send(),
             self._wait(),
+            self._result(),
             self._list(),
             self._interrupt(),
             self._close(),
@@ -129,6 +149,21 @@ class MultiAgentToolPack:
         return registry
 
     def _spawn(self) -> ToolDefinition:
+        agent_type_schema = _string()
+        if self._agent_type_options:
+            agent_type_schema["enum"] = [
+                name for name, _description in self._agent_type_options
+            ]
+            choices = ", ".join(
+                f"{name} ({description})" if description else name
+                for name, description in self._agent_type_options
+            )
+            agent_type_schema["description"] = f"Choose an admitted type: {choices}."
+        else:
+            agent_type_schema["description"] = (
+                "Choose an admitted type from the collaboration instructions."
+            )
+
         async def execute(
             _call_id: str,
             params: dict[str, Any],
@@ -152,9 +187,18 @@ class MultiAgentToolPack:
                 "call returns its canonical path; a failed call creates no child."
             ),
             properties={
-                "name": _string(),
-                "agent_type": _string(),
-                "prompt": _string(),
+                "name": {
+                    **_string(),
+                    "description": (
+                        "Unique new child task name; use lowercase letters, digits, "
+                        "underscores, or hyphens."
+                    ),
+                },
+                "agent_type": agent_type_schema,
+                "prompt": {
+                    **_string(),
+                    "description": "Complete standalone task instructions for the child agent.",
+                },
             },
             required=("name", "agent_type", "prompt"),
             execute=execute,
@@ -259,6 +303,68 @@ class MultiAgentToolPack:
             execute=execute,
         )
 
+    def _result(self) -> ToolDefinition:
+        async def execute(
+            _call_id: str,
+            params: dict[str, Any],
+            _signal: object | None,
+            _update: object | None,
+        ) -> AgentToolResult[dict[str, object]]:
+            ref = AgentRef(
+                AgentPath.parse(str(params["path"])),
+                _bounded_integer(params["incarnation"], "incarnation", minimum=1),
+            )
+            round_id = _bounded_integer(params["round_id"], "round_id", minimum=1)
+            offset = _bounded_integer(params.get("offset", 0), "offset", minimum=0)
+            limit = _bounded_integer(
+                params.get("limit", 4000), "limit", minimum=1, maximum=8000
+            )
+            notice = self._runtime.read_completion_notice(
+                caller=self._caller, ref=ref, round_id=round_id
+            )
+            full_text = notice.terminal.final_message
+            if offset > len(full_text):
+                raise ValueError("offset exceeds result length")
+            next_position = min(offset + limit, len(full_text))
+            details: dict[str, object] = {
+                "path": str(ref.path),
+                "incarnation": ref.incarnation,
+                "round_id": round_id,
+                "status": notice.terminal.status,
+                "offset": offset,
+                "chunk": full_text[offset:next_position],
+                "next_offset": (
+                    next_position if next_position < len(full_text) else None
+                ),
+                "total_chars": len(full_text),
+            }
+            return _result(json.dumps(details, ensure_ascii=False), details)
+
+        return _definition(
+            name="get_agent_result",
+            label="Get agent result",
+            description=(
+                "Read a completed child report by its exact path, incarnation, "
+                "and round. Use offset and limit to retrieve long reports in "
+                "bounded chunks without starting a new agent turn. Results "
+                "remain available after the child closes until this session ends."
+            ),
+            properties={
+                "path": _string(),
+                "incarnation": {"type": "integer", "minimum": 1},
+                "round_id": {"type": "integer", "minimum": 1},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 8000,
+                    "default": 4000,
+                },
+            },
+            required=("path", "incarnation", "round_id"),
+            execute=execute,
+        )
+
     def _list(self) -> ToolDefinition:
         async def execute(
             _call_id: str,
@@ -338,12 +444,29 @@ class MultiAgentToolPack:
 
 def _result(
     text: str,
-    details: dict[str, object],
+    details: Mapping[str, object],
 ) -> AgentToolResult[dict[str, object]]:
     return AgentToolResult(
         content=[TextPart(type="text", text=text)],
-        details=details,
+        details=dict(details),
     )
+
+
+def _bounded_integer(
+    value: object,
+    name: str,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    if (
+        type(value) is not int
+        or value < minimum
+        or (maximum is not None and value > maximum)
+    ):
+        limit = f" and at most {maximum}" if maximum is not None else ""
+        raise ValueError(f"{name} must be an integer of at least {minimum}{limit}")
+    return value
 
 
 def _record(record: AgentRecord) -> dict[str, object]:
@@ -383,6 +506,23 @@ ToolExecute = Callable[
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class _MultiAgentDirectHandler:
+    execute: ToolExecute
+
+    async def __call__(
+        self,
+        call: ToolCall,
+        context: DirectToolContext,
+    ) -> AgentToolResult[Any]:
+        return await self.execute(
+            call.id,
+            dict(call.arguments),
+            context.signal,
+            context.on_update,
+        )
+
+
 def _definition(
     *,
     name: str,
@@ -402,7 +542,7 @@ def _definition(
             "required": list(required),
             "additionalProperties": False,
         },
-        execute=execute,
+        execution=DirectExecution(_MultiAgentDirectHandler(execute)),
         execution_mode="sequential",
     )
 

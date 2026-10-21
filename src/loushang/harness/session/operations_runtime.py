@@ -10,29 +10,46 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any, TypeAlias
 
 from loushang.agent import Agent
 from loushang.ai.types import AssistantMessage
-from loushang.ai.utils import is_context_overflow
-from loushang.harness.events import CompactionReason
+from loushang.foundation.json import JSONValue
+from loushang.foundation.observability import get_log
 from loushang.harness.extensions.context import (
+    SessionBeforeTreeResult,
     SessionShutdownEvent,
 )
 from loushang.harness.runtime import CancellationSignal
+from loushang.harness.runtime._owned_tasks import _await_cancellation_atomic
 from loushang.harness.session.composition import (
     SessionComposition,
+    SessionExtensionCompositionPort,
+    apply_agent_session_model_selection,
+    supports_prepare_model_call,
 )
 from loushang.harness.transcript import (
     BranchSummaryOutput,
-    CompactionHookDecision,
-    CompactionHookRequest,
-    CompactionPreparation,
     CompactionResult,
     CompactionStatus,
+    ProductTranscriptSession,
     TranscriptNavigationPlan,
     TranscriptNavigationResult,
     normalize_branch_summary_output,
+)
+from loushang.harness.transcript.model_input_timing import (
+    PhaseTimer,
+    PhaseTimingSnapshot,
+)
+
+BeforeTreeHookResult: TypeAlias = (
+    tuple[str | None, bool, str | None, BranchSummaryOutput | None, bool]
+    | SessionBeforeTreeResult
+    | None
+)
+_SESSION_NAVIGATION_PERFORMANCE_LOG = get_log(__name__).bind(
+    component="SessionNavigation"
 )
 
 
@@ -42,21 +59,15 @@ class SessionOperationsPorts:
 
     composition: SessionComposition
     agent: Agent
-    session_manager: object
-    extension_runner: object | None
-    execute_compaction: Callable[..., Awaitable[object]]
+    session_manager: ProductTranscriptSession[Any, Any]
+    extension_runner: SessionExtensionCompositionPort | None
     execute_branch_summary: Callable[..., Awaitable[BranchSummaryOutput]]
-    before_tree: Callable[..., Awaitable[object | None]]
-    before_compaction: Callable[
-        [CompactionHookRequest], Awaitable[CompactionHookDecision | None]
-    ]
-    after_compaction: Callable[[CompactionResult, str, bool], Awaitable[None]]
+    before_tree: Callable[..., Awaitable[BeforeTreeHookResult]]
     dispose_runtime_profile: Callable[[], object | None]
     finalize_shutdown: Callable[[], None]
     invalidate_extension_contexts: Callable[[str], None]
     sync_extension_diagnostics: Callable[..., None]
     close_approvals: Callable[[], None]
-    continue_run: Callable[[], Awaitable[None]]
 
 
 class SessionOperations:
@@ -66,28 +77,22 @@ class SessionOperations:
         self.ports = ports
         self.composition = ports.composition
 
-    async def dispatch_event(self, event: object, *, source_record_id: str | None = None) -> None:
+    async def dispatch_event(
+        self, event: object, *, source_record_id: str | None = None
+    ) -> None:
         await self.composition.session_runtime.dispatch_event(
             event,
             source_record_id=source_record_id,
         )
 
-    async def bind_extension_runtime(self, *, reason: str) -> None:
-        await self.composition.extension_runtime_controller.bind(reason=reason)
-
-    def bind_extension_runtime_bindings(self) -> None:
-        self.composition.extension_runtime_controller.bind_bindings()
-
-    async def refresh_extension_runtime(self, *, reason: str) -> None:
-        await self.composition.extension_runtime_controller.refresh(reason=reason)
-
-    def refresh_extension_runtime_bindings(self) -> None:
-        self.composition.extension_runtime_controller.refresh_bindings()
-
-    async def set_active_tools(self, tool_names: list[str], *, emit_refresh: bool) -> None:
+    async def set_active_tools(
+        self, tool_names: list[str], *, emit_refresh: bool
+    ) -> None:
         self.composition.tool_controller.apply_active_tools(tool_names)
         if emit_refresh:
-            await self.refresh_extension_runtime(reason="active_tools_changed")
+            await self.composition.extension_bridge.refresh(
+                reason="active_tools_changed"
+            )
 
     def apply_active_tools(self, tool_names: list[str]) -> None:
         self.composition.tool_controller.apply_active_tools(tool_names)
@@ -99,48 +104,32 @@ class SessionOperations:
         emit_refresh: bool,
         source: str = "set",
     ) -> None:
-        resolved = self.composition.selection_runtime.resolve_model(model)
-        previous = self.ports.agent.model
-        endpoint_id = getattr(model, "endpoint_id", None) if _is_model_selection(model) else None
-        await self.composition.selection_runtime.apply_model(
-            resolved,
-            endpoint_id=endpoint_id,
-        )
-        if emit_refresh:
-            await self.refresh_extension_runtime(reason="model_selection_changed")
-        if self.ports.extension_runner is not None and previous != resolved:
-            emit_event = getattr(self.ports.extension_runner, "emit_event", None)
-            if callable(emit_event):
-                await emit_event(
-                    {
-                        "type": "model_select",
-                        "model": resolved,
-                        "previous_model": previous,
-                        "source": source,
-                    },
-                    cwd=self.ports.session_manager.get_cwd(),
-                )
+        async def refresh_extension_runtime(reason: str) -> None:
+            if emit_refresh:
+                await self.composition.extension_bridge.refresh(reason=reason)
 
-    async def compact_manual(self, custom_instructions: str | None = None) -> CompactionResult:
-        self.composition.session_runtime.abort()
-        await self.composition.session_runtime.wait_for_idle()
-        result = await self.composition.compaction_runtime.compact(
-            reason="manual",
-            will_retry=False,
-            raise_on_error=True,
-            custom_instructions=custom_instructions,
+        await apply_agent_session_model_selection(
+            self.composition.selection_runtime,
+            model,
+            self.ports.agent,
+            self.composition.session_runtime,
+            self.ports.extension_runner,
+            refresh_extension_runtime,
+            self.ports.session_manager.get_cwd,
+            source=source,
         )
-        assert result is not None
-        return result
 
     async def maybe_compact_after_turn(
         self, assistant_message: AssistantMessage
     ) -> CompactionResult | None:
-        return await self._check_auto_compaction(assistant_message)
+        result = await self.composition.session_runtime.check_auto_compaction(
+            assistant_message
+        )
+        return result
 
     def get_compaction_status(self) -> CompactionStatus:
-        return CompactionStatus(
-            is_compacting=self.composition.compaction_runtime.is_compacting,
+        return replace(
+            self.composition.compaction_runtime.get_status(),
             is_branch_summarizing=self.composition.navigation_runtime.is_summarizing,
         )
 
@@ -153,60 +142,80 @@ class SessionOperations:
         replace_instructions: bool = False,
         label: str | None = None,
     ) -> TranscriptNavigationResult:
-        navigation = self.composition.navigation_runtime
-        plan = navigation.prepare(target_id)
-        if plan is None:
-            return TranscriptNavigationResult(cancelled=False)
-        summary_override: BranchSummaryOutput | None = None
-        if self.ports.extension_runner is not None:
-            (
-                custom_instructions,
-                replace_instructions,
-                label,
-                summary_override,
-                cancelled,
-            ) = await self._apply_before_tree_hook(
-                plan,
-                summarize=summarize,
-                custom_instructions=custom_instructions,
-                replace_instructions=replace_instructions,
-                label=label,
-            )
-            if cancelled:
-                return TranscriptNavigationResult(cancelled=True)
-        result = await navigation.navigate(
-            plan,
-            summarize=summarize,
-            label=label,
-            summary_override=summary_override,
-            summary_runner=(
-                self._branch_summary_runner(
-                    custom_instructions=custom_instructions,
-                    replace_instructions=replace_instructions,
+        timer = PhaseTimer()
+        outcome = "failed"
+        try:
+            navigation = self.composition.navigation_runtime
+            with timer.phase("prepare"):
+                plan = navigation.prepare(target_id)
+            if plan is None:
+                outcome = "noop"
+                return TranscriptNavigationResult(cancelled=False)
+            summary_override: BranchSummaryOutput | None = None
+            if self.ports.extension_runner is not None:
+                with timer.phase("before_tree_hook"):
+                    (
+                        custom_instructions,
+                        replace_instructions,
+                        label,
+                        summary_override,
+                        cancelled,
+                    ) = await self._apply_before_tree_hook(
+                        plan,
+                        summarize=summarize,
+                        custom_instructions=custom_instructions,
+                        replace_instructions=replace_instructions,
+                        label=label,
+                    )
+                if cancelled:
+                    outcome = "cancelled"
+                    return TranscriptNavigationResult(cancelled=True)
+            with timer.phase("navigate"):
+                result = await navigation.navigate(
+                    plan,
+                    summarize=summarize,
+                    label=label,
+                    summary_override=summary_override,
+                    summary_runner=(
+                        self._branch_summary_runner(
+                            custom_instructions=custom_instructions,
+                            replace_instructions=replace_instructions,
+                        )
+                        if summarize
+                        else None
+                    ),
                 )
-                if summarize
-                else None
-            ),
-        )
-        if not summarize and self.ports.extension_runner is not None:
-            await self.ports.extension_runner.emit_event(
-                {
-                    "type": "session_tree",
-                    "new_leaf_id": self.ports.session_manager.get_leaf_id(),
-                    "old_leaf_id": plan.old_leaf_id,
-                    "summary_entry": None,
-                    "from_extension": False,
-                },
-                cwd=self.ports.session_manager.get_cwd(),
+            if not summarize and self.ports.extension_runner is not None:
+                with timer.phase("extension_event"):
+                    await self.ports.extension_runner.emit_agent_event(
+                        {
+                            "type": "session_tree",
+                            "new_leaf_id": self.ports.session_manager.get_leaf_id(),
+                            "old_leaf_id": plan.old_leaf_id,
+                            "summary_entry": None,
+                            "from_extension": False,
+                        },
+                        cwd=self.ports.session_manager.get_cwd(),
+                    )
+            outcome = "cancelled" if result.cancelled else "completed"
+            return result
+        finally:
+            _emit_navigation_timing(
+                timer,
+                target_id=target_id,
+                summarize=summarize,
+                outcome=outcome,
             )
-        return result
 
     def abort_branch_summary(self) -> None:
         self.composition.navigation_runtime.abort()
 
-    async def dispose(self, session_shutdown_event: SessionShutdownEvent | None = None) -> None:
+    async def dispose(
+        self, session_shutdown_event: SessionShutdownEvent | None = None
+    ) -> None:
         try:
             await self.composition.resource_watch_controller.stop()
+            await self.composition.resource_refresh_runtime.close(cancel=True)
             if self.ports.extension_runner is not None:
                 await self.ports.extension_runner.emit_session_shutdown(
                     session_shutdown_event or SessionShutdownEvent(reason="quit")
@@ -220,79 +229,37 @@ class SessionOperations:
         await self._dispose_runtime()
 
     async def _dispose_runtime(self) -> None:
+        task = asyncio.create_task(self._dispose_runtime_cancellation_atomic())
+        await _await_cancellation_atomic(task)
+
+    async def _dispose_runtime_cancellation_atomic(self) -> None:
         try:
             await self.composition.session_runtime.dispose()
         finally:
             try:
-                result = self.ports.dispose_runtime_profile()
-                if asyncio.iscoroutine(result):
-                    await result
+                await asyncio.gather(
+                    self.composition.compaction_runtime.cancel_and_wait(),
+                    self.composition.navigation_runtime.cancel_and_wait(),
+                )
             finally:
-                self.composition.capability_runtime.dispose()
-                self.ports.finalize_shutdown()
-
-    async def check_auto_compaction(
-        self, assistant_message: AssistantMessage
-    ) -> CompactionResult | None:
-        return await self._check_auto_compaction(assistant_message)
-
-    async def compact_before_prompt(self) -> CompactionResult | None:
-        assistant_message = self._last_assistant_message()
-        if assistant_message is None:
-            return None
-        return await self._check_auto_compaction(assistant_message)
-
-    async def compact_internal(
-        self,
-        *,
-        reason: CompactionReason,
-        will_retry: bool,
-        raise_on_error: bool,
-        custom_instructions: str | None = None,
-    ) -> CompactionResult | None:
-        return await self.composition.compaction_runtime.compact(
-            reason=reason,
-            will_retry=will_retry,
-            raise_on_error=raise_on_error,
-            custom_instructions=custom_instructions,
-        )
-
-    async def execute_selected_compaction(
-        self,
-        preparation: CompactionPreparation,
-        custom_instructions: str | None,
-    ) -> CompactionResult:
-        result = await self._execute_compaction_with(
-            preparation,
-            custom_instructions,
-        )
-        assert isinstance(result, CompactionResult)
-        return result
-
-    async def _execute_compaction_with(
-        self,
-        preparation: CompactionPreparation,
-        custom_instructions: str | None,
-    ) -> object:
-        kwargs: dict[str, object] = {
-            "preparation": preparation,
-            "model": self.ports.agent.model,
-            "headers": None,
-            "signal": self.ports.agent.signal,
-        }
-        if custom_instructions is not None:
-            kwargs["custom_instructions"] = custom_instructions
-        return await self.ports.execute_compaction(**kwargs)
-
-    async def _check_auto_compaction(
-        self, assistant_message: AssistantMessage
-    ) -> CompactionResult | None:
-        return await self.composition.compaction_runtime.maybe_compact_after_turn(
-            assistant_message,
-            compact_internal_fn=self.compact_internal,
-            continue_run_fn=self.ports.continue_run,
-            is_context_overflow_fn=is_context_overflow,
-        )
+                try:
+                    extension_runtime = self.ports.extension_runner
+                    dispose_generation = getattr(
+                        extension_runtime,
+                        "dispose_runtime_generation",
+                        None,
+                    )
+                    if callable(dispose_generation):
+                        generation_result = dispose_generation()
+                        if asyncio.iscoroutine(generation_result):
+                            await generation_result
+                finally:
+                    try:
+                        result = self.ports.dispose_runtime_profile()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    finally:
+                        self.ports.finalize_shutdown()
 
     async def _apply_before_tree_hook(
         self,
@@ -314,17 +281,20 @@ class SessionOperations:
             return decision
         if decision is None:
             return custom_instructions, replace_instructions, label, None, False
-        if getattr(decision, "cancel", False):
+        if decision.cancel:
             self.ports.sync_extension_diagnostics(phase="runtime")
             return custom_instructions, replace_instructions, label, None, True
         return (
-            getattr(decision, "custom_instructions", None) or custom_instructions,
-            getattr(decision, "replace_instructions", None)
-            if getattr(decision, "replace_instructions", None) is not None
+            decision.custom_instructions or custom_instructions,
+            decision.replace_instructions
+            if decision.replace_instructions is not None
             else replace_instructions,
-            getattr(decision, "label", None) or label,
-            normalize_branch_summary_output(getattr(decision, "summary", None), from_hook=True)
-            if getattr(decision, "summary", None) is not None
+            decision.label or label,
+            normalize_branch_summary_output(
+                decision.summary,
+                from_hook=True,
+            )
+            if decision.summary is not None
             else None,
             False,
         )
@@ -334,30 +304,64 @@ class SessionOperations:
         *,
         custom_instructions: str | None,
         replace_instructions: bool,
-    ) -> Callable[[Sequence[object], CancellationSignal], Awaitable[BranchSummaryOutput]]:
+    ) -> Callable[
+        [Sequence[object], CancellationSignal], Awaitable[BranchSummaryOutput]
+    ]:
         async def run(
             entries: Sequence[object],
             signal: CancellationSignal,
         ) -> BranchSummaryOutput:
-            return await self.ports.execute_branch_summary(
-                entries,
-                model=self.ports.agent.model,
-                signal=signal,
-                custom_instructions=custom_instructions,
-                replace_instructions=replace_instructions,
-            )
+            kwargs: dict[str, object] = {
+                "model": self.ports.agent.model,
+                "signal": signal,
+                "custom_instructions": custom_instructions,
+                "replace_instructions": replace_instructions,
+            }
+            if supports_prepare_model_call(self.ports.execute_branch_summary):
+                kwargs["prepare_model_call"] = self.ports.agent.prepare_model_call
+            return await self.ports.execute_branch_summary(entries, **kwargs)
 
         return run
 
-    def _last_assistant_message(self) -> AssistantMessage | None:
-        for message in reversed(self.ports.agent.state.messages):
-            if isinstance(message, AssistantMessage):
-                return message
-        return None
+
+def _emit_navigation_timing(
+    timer: PhaseTimer,
+    *,
+    target_id: str,
+    summarize: bool,
+    outcome: str,
+) -> None:
+    try:
+        snapshot = timer.snapshot()
+        measured_ns = sum(item.total_ns for item in snapshot.phases.values())
+        _SESSION_NAVIGATION_PERFORMANCE_LOG.debug_event(
+            "session.navigation.performance",
+            "navigate",
+            target_id=target_id,
+            summarize=summarize,
+            outcome=outcome,
+            total_ms=_timing_milliseconds(snapshot.total_ns),
+            unattributed_ms=_timing_milliseconds(
+                max(0, snapshot.total_ns - measured_ns)
+            ),
+            phases=_timing_phase_data(snapshot),
+        )
+    except Exception:
+        return
 
 
-def _is_model_selection(value: object) -> bool:
-    return value.__class__.__name__ == "ModelSelection"
+def _timing_phase_data(snapshot: PhaseTimingSnapshot) -> dict[str, JSONValue]:
+    return {
+        name: {
+            "total_ms": _timing_milliseconds(measurement.total_ns),
+            "count": measurement.count,
+        }
+        for name, measurement in snapshot.phases.items()
+    }
+
+
+def _timing_milliseconds(duration_ns: int) -> float:
+    return round(duration_ns / 1_000_000, 3)
 
 
 __all__ = ["SessionOperations", "SessionOperationsPorts"]

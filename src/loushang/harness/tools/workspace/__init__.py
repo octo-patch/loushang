@@ -1,9 +1,11 @@
-from .authorization import (
-    AuthorizedWorkspaceAction,
-    WorkspaceActionExecutor,
-    WorkspaceActionObservation,
-    execute_workspace_tool_action,
+from loushang.harness.tools.authoring import (
+    ToolContext,
+    ToolContextProvider,
+    ToolEventSink,
+    authorized_tool,
+    direct_tool,
 )
+
 from .bash import (
     BashOperations,
     BashSpawnContext,
@@ -15,7 +17,6 @@ from .bash import (
     create_bash_tool_definition,
     create_local_bash_operations,
 )
-from .context import ToolContext, ToolContextProvider, ToolEventSink
 from .edit import (
     EditToolDetails,
     EditToolInput,
@@ -63,6 +64,7 @@ from .factory import (
     create_read_only_tool_definitions,
     create_read_only_tools,
     create_read_tool,
+    create_shell_tool,
     create_tool,
     create_tool_definition,
     create_write_tool,
@@ -81,6 +83,11 @@ from .grep import (
     GrepToolMatch,
     GrepToolOptions,
     create_grep_tool_definition,
+)
+from .image_payload import (
+    PillowReadImageResizer,
+    ReadImageResizer,
+    ReadImageResizeResult,
 )
 from .ls import LsToolDetails, LsToolInput, LsToolOptions, create_ls_tool_definition
 from .operations import (
@@ -106,9 +113,6 @@ from .presentation import (
     render_tool_result_text,
 )
 from .read import (
-    PillowReadImageResizer,
-    ReadImageResizer,
-    ReadImageResizeResult,
     ReadToolDetails,
     ReadToolInput,
     ReadToolOptions,
@@ -123,8 +127,20 @@ from .runtime import (
     raise_if_tool_aborted,
     resolve_maybe_awaitable,
 )
+from .shell import (
+    WORKSPACE_COMMAND_CAPABILITY,
+    ShellResolver,
+    ShellResolverFactory,
+    ShellToolInput,
+    ShellToolOptions,
+    create_shell_tool_definition,
+)
 from .types import ToolDefinition, ToolTruncationDetails
-from .wrapper import wrap_tool_definition, wrap_tool_definitions
+from .wrapper import (
+    create_workspace_tool_execution_host,
+    wrap_tool_definition,
+    wrap_tool_definitions,
+)
 from .write import (
     WriteToolDetails,
     WriteToolInput,
@@ -142,7 +158,6 @@ __all__ = [
     "BashToolDetails",
     "BashToolInput",
     "BashToolOptions",
-    "AuthorizedWorkspaceAction",
     "DownloadingExternalToolResolver",
     "ExternalToolDownloadTransport",
     "EditEntry",
@@ -179,6 +194,10 @@ __all__ = [
     "ReadToolDetails",
     "ReadToolInput",
     "ReadToolOptions",
+    "ShellResolver",
+    "ShellResolverFactory",
+    "ShellToolInput",
+    "ShellToolOptions",
     "ToolContext",
     "ToolContextProvider",
     "ToolDefinition",
@@ -195,8 +214,7 @@ __all__ = [
     "WorkspaceToolRegistry",
     "WorkspaceToolProfile",
     "WorkspaceToolRuntimeSettings",
-    "WorkspaceActionExecutor",
-    "WorkspaceActionObservation",
+    "WORKSPACE_COMMAND_CAPABILITY",
     "WriteOperations",
     "EditOperations",
     "FindOperations",
@@ -204,6 +222,7 @@ __all__ = [
     "LsOperations",
     "UrllibExternalToolDownloadTransport",
     "apply_text_edits",
+    "authorized_tool",
     "build_unified_diff",
     "create_all_tool_definitions",
     "create_all_tools",
@@ -223,6 +242,8 @@ __all__ = [
     "create_read_only_tool_definitions",
     "create_read_only_tools",
     "create_read_tool",
+    "create_shell_tool",
+    "create_shell_tool_definition",
     "create_profiled_workspace_tool_definition",
     "create_profiled_workspace_tool_definitions",
     "create_profiled_workspace_tools",
@@ -231,11 +252,12 @@ __all__ = [
     "create_tool_definition",
     "create_write_tool",
     "create_write_tool_definition",
+    "create_workspace_tool_execution_host",
     "default_external_tools_dir",
+    "direct_tool",
     "emit_tool_update",
     "enforce_tool_policy",
     "ensure_external_tool",
-    "execute_workspace_tool_action",
     "get_managed_external_tool_install",
     "get_tool_text_output",
     "is_tool_aborted",

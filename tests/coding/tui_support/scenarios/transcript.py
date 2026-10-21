@@ -51,8 +51,11 @@ _CODING_TRANSCRIPT_FIXTURES = TranscriptScenarioFixtures(
     long_transcript_anchor="›",
     tool_preview_visible=(
         "  └ line 1",
+        "    line 2",
         "    line 3",
-        "    ... (6 hidden lines)",
+        "    … +6 lines (ctrl + t to view transcript)",
+        "    line 10",
+        "    line 11",
         "    line 12",
     ),
     tool_preview_hidden=("    line 4", "    line 9"),
@@ -76,9 +79,9 @@ def _run_transcript_reader_copy_command() -> object:
     controller = build_coding_ui_controller(session=session)
 
     result = playback.run(
-        (0.00, "\x0f"),
+        (0.00, "\x14"),
         (0.01, "\x02"),
-        (0.02, "\x0f"),
+        (0.02, "\x14"),
         (0.03, "/copy 2\r"),
         (0.05, ""),
         handle_prompt=coding_screen_prompt_handler(
@@ -91,7 +94,7 @@ def _run_transcript_reader_copy_command() -> object:
 
     result.assert_exit_code(0)
     result.assert_text_contains("Transcript window")
-    result.assert_text_contains("Ctrl+O/q/Esc close")
+    result.assert_text_contains("Ctrl+T/q/Esc close")
     result.assert_text_contains("Copied /copy 2 from structured source.")
     result.assert_no_clear_screen()
     assert session.commands == [("copy", "2")]

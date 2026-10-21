@@ -16,6 +16,10 @@ endif
 BINARY_NAME := loushang$(EXE_EXT)
 DIST_BINARY := dist/$(BINARY_NAME)
 AI_OFFLINE_ENV := env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_OAUTH_TOKEN -u ANTHROPIC_BASE_URL -u ARK_API_KEY -u BAIDU_QIANFAN_API_KEY -u COPILOT_GITHUB_TOKEN -u DASHSCOPE_API_KEY -u DEEPSEEK_API_KEY -u GH_TOKEN -u GITHUB_TOKEN -u HUNYUAN_API_KEY -u MINIMAX_API_KEY -u MOONSHOT_API_KEY -u OPENAI_API_KEY -u QIANFAN_API_KEY -u STEPFUN_API_KEY -u STEP_API_KEY -u ZAI_API_KEY
+AI_TARGETED_DESELECTS := \
+	--deselect=tests/ai/test_auth_api.py::test_login_returns_session_without_opening_browser \
+	--deselect=tests/ai/test_auth_oauth_lifecycle.py::test_real_authlib_login_store_resolve_refresh_lifecycle
+PYTEST_RUNNER := python scripts/dev/run_pytest.py
 
 HARNESSTUI_SHARED_SOURCES := \
 	src/loushang/harness/commands \
@@ -102,22 +106,343 @@ CODING_TUI_PRODUCT_TEST_PATHS := \
 	tests/coding/test_ui_model.py \
 	tests/coding/test_coding_settings_presentation.py \
 	tests/coding/test_ui_session_view.py
+HARNESS_SOURCES := src/loushang/harness
+HARNESS_RUNTIME_SUPPORT_SOURCES := \
+	src/loushang/coding/_product_worker_canary.py \
+	src/loushang/foundation/platform_paths.py \
+	src/loushang/foundation/runtime_scope.py \
+	scripts/dev/run_pytest.py \
+	scripts/dev/verify_plc9c5_manifest.py \
+	scripts/run_tui_native_tests.py \
+	scripts/run_tui_platform_tests.py
+HARNESS_TEST_PATHS := \
+	tests/harness \
+	tests/dev/test_run_pytest.py \
+	tests/dev/test_verify_plc9c5_manifest.py \
+	tests/foundation/test_runtime_scope.py \
+	tests/coding/test_agent_session_model_input.py \
+	tests/architecture/test_import_boundaries.py \
+	tests/architecture/test_capability_runtime_convergence_pr0.py \
+	tests/architecture/test_resource_catalog_rcp5_contract.py \
+	tests/architecture/test_composition_lifecycle_authority_cla0.py \
+	tests/architecture/test_plugin_lifecycle_plc9_baseline.py \
+	tests/architecture/test_plugin_lifecycle_plc9a1_contract.py \
+	tests/architecture/test_plugin_lifecycle_plc9a2_contract.py \
+	tests/architecture/test_plugin_lifecycle_plc9b_contract.py \
+	tests/architecture/test_plugin_lifecycle_plc9c0_baseline.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c50_baseline.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c51_contract.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c52_linux_native.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c53_windows_mechanics.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c54_linux_product.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c55_windows_containment.py \
+	tests/architecture/test_hosting_h65_windows_lpac_design.py \
+	tests/architecture/test_session_model_call_closure_contract.py
+HOSTING_SOURCES := \
+	src/loushang/hosting \
+	src/loushang/harness/workspace/process/hosting_compat.py \
+	src/loushang/harness/worker/__init__.py \
+	src/loushang/harness/worker/_native_profile_bridge.py \
+	src/loushang/harness/worker/hosting_adapter.py \
+	src/loushang/harness/worker/owner_selection.py \
+	src/loushang/harness/worker/session.py \
+	src/loushang/harness/worker/supervisor.py
+HOSTING_TEST_PATHS := \
+	tests/hosting \
+	tests/harness/workspace/process/test_hosting_compat.py \
+	tests/harness/worker/test_hosting_adapter.py \
+	tests/architecture/test_hosting_h0_contract.py \
+	tests/architecture/test_hosting_h1_process_lifetime.py \
+	tests/architecture/test_hosting_h2_platform_contract.py \
+	tests/architecture/test_hosting_h3_endpoint.py \
+	tests/architecture/test_hosting_h4_child_session.py \
+	tests/architecture/test_hosting_h5_worker_adapter.py \
+	tests/architecture/test_hosting_h6_launch_preparation.py \
+	tests/architecture/test_hosting_h6_harness_parity.py \
+	tests/architecture/test_hosting_h6_posix_native.py \
+	tests/architecture/test_hosting_h6_windows_native.py \
+	tests/architecture/test_hosted_product_runtime_v1_baseline.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c50_baseline.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c52_linux_native.py \
+	tests/architecture/test_plugin_lifecycle_plc9c5_c53_windows_mechanics.py \
+	tests/architecture/test_hosting_h65_windows_lpac_design.py \
+	tests/architecture/test_hosting_architecture_baseline.py
+APPHOST_SOURCES := \
+	src/loushang/coding/cli/hosted_client.py \
+	src/loushang/tui/ui_parts/text_pager.py \
+	src/loushang/tui/terminal_session.py \
+	src/loushang/tui/composer_edit_buffer.py \
+	src/loushang/tui/ui_parts/composer.py \
+	src/loushang/foundation/observability/identity.py \
+	src/loushang/coding/cli/hosted.py \
+	src/loushang/coding/cli/mux.py \
+	src/loushang/coding/hosted_bootstrap.py \
+	src/loushang/coding/hosted_local.py \
+	src/loushang/coding/hosted_catalog.py \
+	src/loushang/coding/hosted_session.py \
+	src/loushang/coding/hosted_execution.py \
+	src/loushang/coding/_hosted_execution_work.py \
+	src/loushang/apphost \
+	src/loushang/appserver \
+	src/loushang/appservice \
+	src/loushang/coding/_apphost_canary_child.py \
+	src/loushang/coding/_apphost_canary_control.py \
+	src/loushang/coding/_product_worker_canary.py \
+	src/loushang/coding/apphost_canary.py \
+	src/loushang/coding/apphost_composition.py \
+	src/loushang/coding/apphost_product.py \
+	src/loushang/coding/appservice_adapter.py \
+	src/loushang/coding/hosted_application.py \
+	src/loushang/coding/hosted_continuity.py \
+	src/loushang/harnesstui/mux \
+	src/loushang/coding/cli/apphost.py
+APPHOST_TEST_PATHS := \
+	tests/dev/test_hosted_fixture_stdin.py \
+	tests/dev/test_hosted_debt_cleanup.py \
+	tests/dev/test_hosted_darwin_scenario.py \
+	tests/dev/test_hosted_darwin_observer.py \
+	tests/dev/test_hosted_darwin_witness.py \
+	tests/dev/test_hosted_darwin_api.py \
+	tests/dev/test_evidence_observation.py \
+	tests/dev/test_hosted_windows_observer.py \
+	tests/coding/test_hosted_legacy_evidence.py \
+	tests/coding/test_hosted_entry_evidence.py \
+	tests/dev/test_evidence_process.py \
+	tests/coding/test_hosted_workflow_terminal.py \
+	tests/dev/test_run_g17_installed_evidence.py \
+	tests/coding/test_hosted_client_terminal.py \
+	tests/coding/test_hosted_client.py \
+	tests/dev/test_run_g16_installed_evidence.py \
+	tests/architecture/test_detachable_local_workspace_g16_evidence.py \
+	tests/tui/test_text_pager.py \
+	tests/harnesstui/test_hosted_mux_details.py \
+	tests/harnesstui/test_hosted_mux_editors.py \
+	tests/harnesstui/test_hosted_session_picker.py \
+	tests/tui/test_terminal_session.py \
+	tests/tui/test_composer_edit_buffer.py \
+	tests/harnesstui/test_hosted_mux_shell.py \
+	tests/harnesstui/test_hosted_mux_terminal.py \
+	tests/harnesstui/test_hosted_mux_settlement.py \
+	tests/foundation/observability/test_identity.py \
+	tests/coding/test_hosted_command.py \
+	tests/coding/test_hosted_discovery_command.py \
+	tests/coding/test_hosted_discovery_subprocess.py \
+	tests/coding/test_hosted_bootstrap.py \
+	tests/coding/test_hosted_local_discovery.py \
+	tests/coding/test_hosted_local_discovery_subprocess.py \
+	tests/coding/test_hosted_local_ownership.py \
+	tests/coding/test_mux_command.py \
+	tests/coding/test_hosted_subprocess.py \
+	tests/coding/test_hosted_catalog.py \
+	tests/coding/test_hosted_session.py \
+	tests/coding/test_hosted_execution.py \
+	tests/coding/test_scoped_hosted_session.py \
+	tests/coding/test_hosted_session_metadata.py \
+	tests/apphost \
+	tests/appserver \
+	tests/appservice \
+	tests/coding/test_apphost_canary.py \
+	tests/coding/test_apphost_canary_control.py \
+	tests/coding/test_apphost_composition.py \
+	tests/coding/test_apphost_product.py \
+	tests/coding/test_appservice_adapter.py \
+	tests/coding/test_hosted_application.py \
+	tests/coding/test_cli_apphost.py \
+	tests/harnesstui/test_hosted_mux_profile.py \
+	tests/harnesstui/test_hosted_mux_interaction.py \
+	tests/dev/test_verify_evidence_manifest.py \
+	tests/architecture/test_apphost_a0_contract.py \
+	tests/architecture/test_apphost_a02_architecture.py \
+	tests/architecture/test_apphost_a03_a04_architecture.py \
+	tests/architecture/test_hosted_product_runtime_g8_join.py \
+	tests/architecture/test_hosted_product_runtime_g9_closure.py \
+	tests/architecture/test_hosted_product_runtime_v1_baseline.py \
+	tests/architecture/test_hosted_product_g10_explicit_canary_design.py \
+	tests/architecture/test_hosted_product_g10_explicit_canary.py \
+	tests/architecture/test_hosted_application_g11_design.py \
+	tests/architecture/test_hosted_application_g11.py \
+	tests/architecture/test_foreground_hosted_application_g12_design.py \
+	tests/architecture/test_foreground_hosted_application_g12.py \
+	tests/architecture/test_durable_hosted_application_continuity_g13_design.py \
+	tests/architecture/test_durable_hosted_application_continuity_g13.py
+APPHOST_TARGETED_TEST_PATHS := \
+	tests/coding/test_hosted_local.py \
+	tests/coding/test_mux_product_terminal.py \
+	tests/coding/test_mux_subprocess.py \
+	tests/coding/test_mux_terminal_process.py
+APPHOST_LINT_SUPPORT := \
+	tests/coding/_hosted_windows_api.py \
+	tests/coding/_hosted_windows_observer.py \
+	tests/coding/_hosted_windows_witness.py \
+	tests/coding/test_hosted_windows_evidence.py \
+	tests/coding/_hosted_recovery_cancel.py \
+	tests/coding/test_hosted_installed_evidence.py \
+	tests/coding/_hosted_start_cancel.py \
+	tests/dev/_evidence_branch_fixture.py \
+	scripts/dev/_evidence_process.py \
+	scripts/dev/_evidence_posix.py \
+	scripts/dev/_evidence_windows.py \
+	scripts/dev/run_g17_installed_evidence.py \
+	tests/coding/_hosted_terminal.py \
+	tests/coding/_hosted_client_debt.py \
+	scripts/dev/run_g16_installed_evidence.py \
+	tests/coding/test_mux_native_evidence.py \
+	tests/coding/test_mux_installed_evidence.py \
+	tests/coding/_local_product_child.py \
+	tests/coding/_hosted_product_child.py \
+	src/loushang/coding/cli/__main__.py \
+	src/loushang/coding/cli/application.py \
+	src/loushang/harness/machine_resources/control_plane.py \
+	scripts/dev/run_g10_installed_canary.py \
+	scripts/dev/verify_evidence_manifest.py \
+	tests/harness/worker/test_coding_product_worker_canary.py
+APPSERVICE_SOURCES := \
+	src/loushang/coding/cli/hosted_client.py \
+	src/loushang/tui/ui_parts/text_pager.py \
+	src/loushang/tui/terminal_session.py \
+	src/loushang/tui/composer_edit_buffer.py \
+	src/loushang/tui/ui_parts/composer.py \
+	src/loushang/foundation/observability/identity.py \
+	src/loushang/coding/cli/hosted.py \
+	src/loushang/coding/cli/mux.py \
+	src/loushang/coding/hosted_bootstrap.py \
+	src/loushang/coding/hosted_local.py \
+	src/loushang/apphost/foreground.py \
+	src/loushang/apphost/launcher.py \
+	src/loushang/apphost/local.py \
+	src/loushang/apphost/continuity.py \
+	src/loushang/coding/hosted_catalog.py \
+	src/loushang/coding/hosted_session.py \
+	src/loushang/coding/hosted_execution.py \
+	src/loushang/coding/_hosted_execution_work.py \
+	src/loushang/harness/transcript/jsonl_file.py \
+	src/loushang/harness/transcript/lifecycle.py \
+	src/loushang/harness/transcript/session_factory.py \
+	src/loushang/harness/transcript/product_session.py \
+	src/loushang/apphost/application.py \
+	src/loushang/appserver \
+	src/loushang/appservice \
+	src/loushang/coding/appservice_adapter.py \
+	src/loushang/coding/hosted_application.py \
+	src/loushang/coding/hosted_continuity.py \
+	src/loushang/harnesstui/mux
+APPSERVICE_TEST_PATHS := \
+	tests/dev/test_g18_provenance.py \
+	tests/dev/test_g18_recovery.py \
+	tests/dev/test_g18_slot.py \
+	tests/dev/test_g18_bytecode.py \
+	tests/dev/test_g18_checkpoint.py \
+	tests/dev/test_g18_comparison.py \
+	tests/dev/test_measure_g18_startup.py \
+	tests/dev/test_measure_g18_native.py \
+	tests/dev/test_interactive_startup_probe.py \
+	tests/dev/test_interactive_campaign.py \
+	tests/dev/test_hosted_fixture_stdin.py \
+	tests/dev/test_hosted_debt_cleanup.py \
+	tests/dev/test_hosted_darwin_scenario.py \
+	tests/dev/test_hosted_darwin_observer.py \
+	tests/dev/test_hosted_darwin_witness.py \
+	tests/dev/test_hosted_darwin_api.py \
+	tests/dev/test_evidence_observation.py \
+	tests/dev/test_hosted_windows_observer.py \
+	tests/coding/test_hosted_legacy_evidence.py \
+	tests/coding/test_hosted_entry_evidence.py \
+	tests/dev/test_evidence_process.py \
+	tests/coding/test_hosted_workflow_terminal.py \
+	tests/dev/test_run_g17_installed_evidence.py \
+	tests/coding/test_hosted_client_terminal.py \
+	tests/coding/test_hosted_client.py \
+	tests/apphost/test_launcher.py \
+	tests/dev/test_run_g16_installed_evidence.py \
+	tests/dev/test_verify_evidence_manifest.py \
+	tests/architecture/test_detachable_local_workspace_g16_evidence.py \
+	tests/tui/test_text_pager.py \
+	tests/harnesstui/test_hosted_mux_details.py \
+	tests/harnesstui/test_hosted_mux_editors.py \
+	tests/harnesstui/test_hosted_session_picker.py \
+	tests/tui/test_terminal_session.py \
+	tests/tui/test_composer_edit_buffer.py \
+	tests/harnesstui/test_hosted_mux_shell.py \
+	tests/harnesstui/test_hosted_mux_terminal.py \
+	tests/harnesstui/test_hosted_mux_settlement.py \
+	tests/coding/test_mux_terminal_process.py \
+	tests/coding/test_mux_product_terminal.py \
+	tests/foundation/observability/test_identity.py \
+	tests/coding/test_hosted_command.py \
+	tests/coding/test_hosted_bootstrap.py \
+	tests/coding/test_hosted_discovery_command.py \
+	tests/coding/test_hosted_discovery_subprocess.py \
+	tests/coding/test_hosted_local.py \
+	tests/coding/test_hosted_local_discovery.py \
+	tests/coding/test_hosted_local_discovery_subprocess.py \
+	tests/coding/test_hosted_local_ownership.py \
+	tests/coding/test_mux_command.py \
+	tests/coding/test_mux_subprocess.py \
+	tests/coding/test_hosted_subprocess.py \
+	tests/apphost/test_foreground.py \
+	tests/apphost/test_foreground_discovery.py \
+	tests/apphost/test_local.py \
+	tests/apphost/test_client_scopes.py \
+	tests/apphost/test_application.py \
+	tests/coding/test_hosted_catalog.py \
+	tests/coding/test_hosted_discovery.py \
+	tests/coding/test_hosted_discovery_workflow.py \
+	tests/coding/test_hosted_session.py \
+	tests/coding/test_hosted_execution.py \
+	tests/coding/test_scoped_hosted_session.py \
+	tests/coding/test_hosted_session_metadata.py \
+	tests/harness/transcript/test_session_factory.py \
+	tests/harness/transcript/test_product_session.py \
+	tests/harness/transcript/test_discovery_reads.py \
+	tests/architecture/test_hosted_session_workflow_g17_design.py \
+	tests/architecture/test_foreground_stdio_hosted_app_g14.py \
+	tests/architecture/test_foreground_stdio_hosted_app_g14_design.py \
+	tests/architecture/test_foreground_hosted_tui_g15_design.py \
+	tests/architecture/test_detachable_local_workspace_g16_design.py \
+	tests/architecture/test_detachable_local_workspace_g16.py \
+	tests/apphost/test_continuity.py \
+	tests/appserver \
+	tests/appservice \
+	tests/coding/test_appservice_adapter.py \
+	tests/coding/test_hosted_application.py \
+	tests/harnesstui/test_hosted_mux_profile.py \
+	tests/harnesstui/test_hosted_mux_interaction.py \
+	tests/architecture/test_hosted_application_g11_design.py \
+	tests/architecture/test_hosted_application_g11.py \
+	tests/architecture/test_foreground_hosted_application_g12_design.py \
+	tests/architecture/test_foreground_hosted_application_g12.py \
+	tests/architecture/test_durable_hosted_application_continuity_g13_design.py \
+	tests/architecture/test_durable_hosted_application_continuity_g13.py
 
-.PHONY: bootstrap test test-ai check-ai test-tui test-tui-render-contract lint-ai fmt-ai typecheck-ai typecheck-tui build-binary install-binary clean-binary vendor-ai-moonshot-anthropic-stream vendor-ai-moonshot-anthropic-complete vendor-ai-moonshot-anthropic-tools vendor-ai-moonshot-openai-stream vendor-ai-moonshot-openai-complete vendor-ai-moonshot-openai-tools vendor-ai-dashscope-openai-responses-stream vendor-ai-dashscope-openai-responses-tools example-ai-model-lookup example-ai-complete example-ai-stream example-ai-tools example-ai-typed-context example-ai-advanced-faux-stream example-ai-advanced-context-tools example-ai-advanced-tool-result-roundtrip example-ai-kimi-anthropic-stream example-ai-kimi-anthropic-complete example-ai-kimi-anthropic-tools example-ai-kimi-openai-stream example-ai-kimi-openai-complete example-ai-kimi-openai-tools example-ai-dashscope-openai-responses-stream example-ai-dashscope-openai-responses-tools example-ai-custom-base-url-openai-advanced example-ai-faux-stream example-ai-context-tools-minimal example-ai-tool-result-roundtrip
+.PHONY: bootstrap test test-ai check-ai test-tui test-tui-render-contract test-tui-terminal-platform test-tui-native test-tui-tmux lint-ai fmt-ai typecheck-ai typecheck-tui build-binary install-binary clean-binary vendor-ai-moonshot-anthropic-stream vendor-ai-moonshot-anthropic-complete vendor-ai-moonshot-anthropic-tools vendor-ai-moonshot-openai-stream vendor-ai-moonshot-openai-complete vendor-ai-moonshot-openai-tools vendor-ai-dashscope-openai-responses-stream vendor-ai-dashscope-openai-responses-tools example-ai-model-lookup example-ai-complete example-ai-stream example-ai-tools example-ai-typed-context example-ai-advanced-faux-stream example-ai-advanced-context-tools example-ai-advanced-tool-result-roundtrip example-ai-kimi-anthropic-stream example-ai-kimi-anthropic-complete example-ai-kimi-anthropic-tools example-ai-kimi-openai-stream example-ai-kimi-openai-complete example-ai-kimi-openai-tools example-ai-dashscope-openai-responses-stream example-ai-dashscope-openai-responses-tools example-ai-custom-base-url-openai-advanced example-ai-faux-stream example-ai-context-tools-minimal example-ai-tool-result-roundtrip
+.PHONY: test-sandbox test-host-runtime
+.PHONY: test-tui-input-playback
 .PHONY: check-ai-catalog check-ai-examples check-ai-imports check-ai-coverage
+.PHONY: check-harness lint-harness typecheck-harness test-harness check-plc9c5-c51-contract test-plc9c5-c51-contract check-plc9c5-c52-linux-native test-plc9c5-c52-linux-native check-plc9c5-c53-windows-mechanics test-plc9c5-c53-windows-mechanics check-plc9c5-c55b-windows-lpac-native test-plc9c5-c55b-windows-lpac-native
+.PHONY: check-hosting lint-hosting typecheck-hosting test-hosting
+.PHONY: check-apphost lint-apphost typecheck-apphost test-apphost test-hosted-product-g8-evidence test-hosted-product-g9-linux-evidence test-hosted-product-g10-linux-evidence
+.PHONY: check-appservice lint-appservice typecheck-appservice test-appservice
+.PHONY: check-architecture-docs
 .PHONY: check-harnesstui lint-harnesstui typecheck-harnesstui test-harnesstui
+.PHONY: lane-status
 
 bootstrap:
 	test -d .venv || uv venv .venv
 	. .venv/bin/activate && uv pip install -e .[dev]
 
 test:
-	. .venv/bin/activate && uv run pytest tests -q
+	. .venv/bin/activate && uv run $(PYTEST_RUNNER) tests -q
+
+test-sandbox:
+	. .venv/bin/activate && uv run $(PYTEST_RUNNER) tests --skip-host-runtime -q
+
+test-host-runtime:
+	. .venv/bin/activate && uv run $(PYTEST_RUNNER) tests -m requires_host_runtime -q
 
 test-ai:
-	. .venv/bin/activate && $(AI_OFFLINE_ENV) uv run pytest tests/ai tests/protocols tests/examples/test_ai_examples.py tests/examples/test_auth_examples.py -m "not live" -q
+	. .venv/bin/activate && $(AI_OFFLINE_ENV) uv run $(PYTEST_RUNNER) tests/ai tests/protocols tests/examples/test_ai_examples.py tests/examples/test_auth_examples.py $(AI_TARGETED_DESELECTS) -m "not live" -q
 
-check-ai: lint-ai typecheck-ai check-ai-catalog check-ai-imports check-ai-examples check-ai-coverage
+check-ai: lint-ai typecheck-ai check-ai-catalog check-ai-imports check-ai-coverage
 
 check-ai-catalog:
 	uv run python scripts/ai/check_catalog.py
@@ -125,14 +450,158 @@ check-ai-catalog:
 check-ai-imports:
 	uv run python scripts/ai/check_import_boundaries.py
 
-check-ai-examples:
-	$(AI_OFFLINE_ENV) uv run python scripts/ai/check_examples.py
-	$(AI_OFFLINE_ENV) uv run pytest tests/examples -q
-
 check-ai-coverage:
 	mkdir -p .artifacts/ai
-	. .venv/bin/activate && $(AI_OFFLINE_ENV) uv run pytest tests/ai tests/protocols tests/examples/test_ai_examples.py -m "not live" --cov=src/loushang/ai --cov-report=term-missing:skip-covered --cov-report=xml:.artifacts/ai/coverage.xml --cov-fail-under=90 -q
+	. .venv/bin/activate && $(AI_OFFLINE_ENV) uv run $(PYTEST_RUNNER) tests/ai tests/protocols tests/examples/test_ai_examples.py tests/examples/test_auth_examples.py -m "not live" --cov=src/loushang/ai --cov-report=term-missing:skip-covered --cov-report=xml:.artifacts/ai/coverage.xml --cov-fail-under=90 -q
 	uv run python scripts/ai/check_coverage_targets.py .artifacts/ai/coverage.xml
+
+check-harness: lint-harness typecheck-harness test-harness
+
+lint-harness:
+	uv --cache-dir .uv-cache run --extra dev ruff check $(HARNESS_SOURCES) $(HARNESS_RUNTIME_SUPPORT_SOURCES) $(HARNESS_TEST_PATHS)
+
+typecheck-harness:
+	uv --cache-dir .uv-cache run --extra dev mypy --follow-imports=silent $(HARNESS_SOURCES) $(HARNESS_RUNTIME_SUPPORT_SOURCES)
+
+test-harness:
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) $(HARNESS_TEST_PATHS) -q
+
+test-plc9c5-c51-contract:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/harness/worker/test_product_activation.py -q --junitxml=.artifacts/plc9c5-c51-contract.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c51-contract.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.1-CONTRACT .artifacts/plc9c5-c51-contract.xml
+
+check-plc9c5-c51-contract: test-plc9c5-c51-contract
+
+test-plc9c5-c52-linux-native:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/harness/worker/test_native_profile_bridge.py -q --junitxml=.artifacts/plc9c5-c52-linux-native.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c52-linux-native.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.2-LINUX-NATIVE .artifacts/plc9c5-c52-linux-native.xml
+
+check-plc9c5-c52-linux-native: test-plc9c5-c52-linux-native
+
+test-plc9c5-c53-windows-mechanics:
+	mkdir -p .artifacts
+	LOUSHANG_PLC9C5_C53_REPORT=1 uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/hosting/test_plc9c5_c53_windows_mechanics.py -q --junitxml=.artifacts/plc9c5-c53-windows-mechanics.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c53-windows-mechanics.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.3-WINDOWS-MECHANICS .artifacts/plc9c5-c53-windows-mechanics.xml
+
+check-plc9c5-c53-windows-mechanics: test-plc9c5-c53-windows-mechanics
+
+test-plc9c5-c55b-windows-lpac-native:
+	mkdir -p .artifacts
+	LOUSHANG_PLC9C5_C55B_REPORT=1 uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/hosting/test_plc9c5_c55b_windows_lpac_native.py -q --junitxml=.artifacts/plc9c5-c55b-windows-lpac-native.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c55b-windows-lpac-native.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.5B-WINDOWS-LPAC-NATIVE .artifacts/plc9c5-c55b-windows-lpac-native.xml
+
+check-plc9c5-c55b-windows-lpac-native: test-plc9c5-c55b-windows-lpac-native
+
+test-plc9c5-c55c-windows-product:
+	mkdir -p .artifacts
+	LOUSHANG_PLC9C5_C55C_REPORT=1 uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/harness/worker/test_coding_product_worker_windows_canary.py -q --junitxml=.artifacts/plc9c5-c55c-windows-product.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c55c-windows-product.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.5C-WINDOWS-PRODUCT .artifacts/plc9c5-c55c-windows-product.xml
+
+check-plc9c5-c55c-windows-product: test-plc9c5-c55c-windows-product
+
+test-plc9c5-c54-linux-product:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/harness/worker/test_coding_product_worker_canary.py -q --junitxml=.artifacts/plc9c5-c54-linux-product.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/plc9c5-c54-linux-product.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_plc9c5_manifest.py docs/internals/architecture/harness/plugin/plugin-lifecycle-plc9c5-evidence-manifest.json PLC9C5-C5.4-LINUX-PRODUCT .artifacts/plc9c5-c54-linux-product.xml
+
+check-plc9c5-c54-linux-product: test-plc9c5-c54-linux-product
+
+check-plc9c5-c55-windows-containment-design:
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/architecture/test_plugin_lifecycle_plc9c5_c55_windows_containment.py tests/architecture/test_hosting_h65_windows_lpac_design.py -q
+
+check-hosting: lint-hosting typecheck-hosting test-hosting
+
+lint-hosting:
+	uv --cache-dir .uv-cache run --extra dev ruff check $(HOSTING_SOURCES) $(HOSTING_TEST_PATHS)
+
+typecheck-hosting:
+	uv --cache-dir .uv-cache run --extra dev mypy --follow-imports=silent $(HOSTING_SOURCES)
+
+test-hosting:
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) $(HOSTING_TEST_PATHS) -q
+
+check-apphost: lint-apphost typecheck-apphost test-apphost test-hosted-product-g8-evidence test-hosted-product-g9-linux-evidence test-hosted-product-g10-linux-evidence
+
+lint-apphost:
+	uv --cache-dir .uv-cache run --extra dev ruff check $(APPHOST_SOURCES) $(APPHOST_TEST_PATHS) $(APPHOST_TARGETED_TEST_PATHS) $(APPHOST_LINT_SUPPORT)
+
+typecheck-apphost:
+	uv --cache-dir .uv-cache run --extra dev mypy --follow-imports=silent $(APPHOST_SOURCES)
+
+test-apphost:
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) $(APPHOST_TEST_PATHS) $(APPHOST_TARGETED_TEST_PATHS) -q
+
+test-hosted-product-g8-evidence:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/coding/test_apphost_product.py tests/harness/worker/test_coding_product_worker_canary.py::test_product_normal_close_retires_exact_attempt_without_global_rollback -q --junitxml=.artifacts/hosted-product-g8.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g8.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g8-evidence-manifest.json HOSTED-PRODUCT-G8-JOIN .artifacts/hosted-product-g8.xml
+
+test-hosted-product-g9-linux-evidence:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/coding/test_apphost_composition.py -q --junitxml=.artifacts/hosted-product-g9-linux.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g9-linux.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g9-evidence-manifest.json HOSTED-PRODUCT-G9-LINUX .artifacts/hosted-product-g9-linux.xml
+
+test-hosted-product-g10-linux-evidence:
+	mkdir -p .artifacts
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/coding/test_apphost_canary_control.py tests/coding/test_apphost_canary.py tests/coding/test_cli_apphost.py tests/architecture/test_hosted_product_g10_explicit_canary.py -k G10 -q --junitxml=.artifacts/hosted-product-g10-linux.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g10-linux.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g10-evidence-manifest.json HOSTED-PRODUCT-G10-LINUX .artifacts/hosted-product-g10-linux.xml
+	uv --cache-dir .uv-cache run --extra dev python scripts/dev/run_g10_installed_canary.py --expected-backend posix-process-group-v1
+
+check-appservice: lint-appservice typecheck-appservice test-appservice
+
+lint-appservice:
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_provenance.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_recovery.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_slot.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_bytecode.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_checkpoint.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_g18_comparison.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/measure_g18_startup.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/measure_g18_native.py tests/coding/_g18_native_probe.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_hosted_darwin_observer.py tests/coding/test_hosted_darwin_evidence.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_hosted_darwin_witness.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_hosted_darwin_api.py tests/coding/_hosted_owned_group.py tests/coding/_hosted_primitive_child.py tests/coding/test_hosted_darwin_primitives.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_evidence_process.py scripts/dev/_evidence_observation.py scripts/dev/_evidence_posix.py scripts/dev/_evidence_windows.py tests/dev/_evidence_branch_fixture.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/run_g17_installed_evidence.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_hosted_client_debt.py tests/coding/_hosted_start_cancel.py tests/coding/_hosted_recovery_cancel.py tests/coding/test_hosted_installed_evidence.py tests/coding/_hosted_terminal.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_hosted_windows_api.py tests/coding/_hosted_windows_observer.py tests/coding/_hosted_windows_witness.py tests/coding/test_hosted_windows_evidence.py
+	uv --cache-dir .uv-cache run --extra dev ruff check $(APPSERVICE_SOURCES) $(APPSERVICE_TEST_PATHS) tests/coding/_hosted_product_child.py tests/coding/_local_product_child.py scripts/dev/run_g16_installed_evidence.py scripts/dev/verify_evidence_manifest.py tests/coding/test_mux_native_evidence.py tests/coding/test_mux_installed_evidence.py
+	uv --cache-dir .uv-cache run --extra dev ruff check tests/coding/_interactive_startup_probe.py tests/coding/_interactive_model_child.py tests/coding/_interactive_seed.py
+	uv --cache-dir .uv-cache run --extra dev ruff check scripts/dev/_interactive_campaign.py
+
+typecheck-appservice:
+	uv --cache-dir .uv-cache run --extra dev mypy --follow-imports=silent $(APPSERVICE_SOURCES)
+
+test-appservice:
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) $(APPSERVICE_TEST_PATHS) -q
+
+check-architecture-docs:
+	.venv/bin/ruff check scripts/architecture/render_current_package_dependencies.py tests/architecture/test_architecture_documentation.py
+	.venv/bin/python scripts/dev/run_pytest.py tests/architecture/test_architecture_documentation.py -q
+
+.PHONY: check-changed plan-checks check-docs-light check-agent
+check-changed:
+	.venv/bin/python scripts/ci/check_changed.py
+
+plan-checks:
+	python3 scripts/ci/check_changed.py --plan-only
+
+check-docs-light:
+	python3 scripts/ci/check_docs.py
+
+check-agent:
+	.venv/bin/python scripts/ci/run_checks.py agent
 
 check-harnesstui: lint-harnesstui typecheck-harnesstui test-harnesstui
 
@@ -143,13 +612,28 @@ typecheck-harnesstui:
 	uv --cache-dir .uv-cache run --extra dev mypy --follow-imports=silent $(HARNESSTUI_SHARED_SOURCES) $(HARNESSTUI_CODING_ADAPTERS) $(CODING_TUI_PRODUCT_SOURCES)
 
 test-harnesstui:
-	uv --cache-dir .uv-cache run --extra dev pytest $(HARNESSTUI_TEST_PATHS) $(CODING_TUI_PRODUCT_TEST_PATHS) -m "not tui_render_contract" -q
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) $(HARNESSTUI_TEST_PATHS) $(CODING_TUI_PRODUCT_TEST_PATHS) -m "not tui_render_contract" -q
 
 test-tui:
-	. .venv/bin/activate && python -m pytest tests/tui -q
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/tui --skip-host-runtime -q
 
 test-tui-render-contract:
-	uv --cache-dir .uv-cache run --extra dev pytest tests/tui tests/harnesstui tests/coding -m tui_render_contract -q
+	uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/tui tests/harnesstui tests/coding -m tui_render_contract -q
+
+test-tui-terminal-platform:
+	uv --cache-dir .uv-cache run --extra dev python scripts/run_tui_platform_tests.py current -q
+
+test-tui-input-playback:
+	uv --cache-dir .uv-cache run --extra dev python scripts/run_tui_playback.py composer-selection-stress bracketed-paste-large-marker mouse-select-active-surface screen-loop-terminal-session-cleanup screen-loop-ctrl-c-abort-running
+
+test-tui-native:
+	uv --cache-dir .uv-cache run --extra dev python scripts/run_tui_native_tests.py current -q
+
+test-tui-tmux:
+	LOUSHANG_REQUIRE_TMUX=1 uv --cache-dir .uv-cache run --extra dev $(PYTEST_RUNNER) tests/coding/test_screen_coding_tui_pty_smoke.py -m tui_tmux_integration --strict-markers --strict-config -q
+
+lane-status:
+	uv run python scripts/dev/lane_status.py
 
 lint-ai:
 	. .venv/bin/activate && uv run ruff check src/loushang/ai examples/ai examples/auth tests/ai tests/protocols tests/examples/test_auth_examples.py scripts/ai
@@ -161,7 +645,7 @@ typecheck-ai:
 	. .venv/bin/activate && uv run mypy src/loushang/ai
 
 vendor-ai-moonshot-anthropic-stream:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_anthropic_stream_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_anthropic_stream_live.py -q -s
 
 typecheck-tui:
 	. .venv/bin/activate && mypy src/loushang/tui
@@ -170,25 +654,25 @@ example-ai-kimi-anthropic-stream:
 	uv run python examples/ai/kimi_anthropic_stream.py
 
 vendor-ai-moonshot-anthropic-complete:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_anthropic_complete_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_anthropic_complete_live.py -q -s
 
 vendor-ai-moonshot-anthropic-tools:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_anthropic_tools_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_anthropic_tools_live.py -q -s
 
 vendor-ai-moonshot-openai-complete:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_openai_complete_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_openai_complete_live.py -q -s
 
 vendor-ai-moonshot-openai-stream:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_openai_stream_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_openai_stream_live.py -q -s
 
 vendor-ai-moonshot-openai-tools:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/moonshot/test_kimi_openai_tools_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/moonshot/test_kimi_openai_tools_live.py -q -s
 
 vendor-ai-dashscope-openai-responses-stream:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/dashscope/test_openai_responses_stream_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/dashscope/test_openai_responses_stream_live.py -q -s
 
 vendor-ai-dashscope-openai-responses-tools:
-	LOUSHANG_AI_LIVE=1 uv run pytest tests/ai/vendors/dashscope/test_openai_responses_tools_live.py -q -s
+	LOUSHANG_AI_LIVE=1 uv run $(PYTEST_RUNNER) tests/ai/vendors/dashscope/test_openai_responses_tools_live.py -q -s
 
 .PHONY: example-ai-offline example-ai-provider-matrix example-ai-provider-smoke
 
@@ -230,7 +714,8 @@ example-ai-advanced-tool-result-roundtrip:
 
 build-binary: bootstrap
 	uv pip install --python .venv/bin/python pyinstaller
-	. .venv/bin/activate && uv run python -m PyInstaller --onefile --name loushang --collect-data loushang --paths src src/loushang/coding/cli/__main__.py
+	. .venv/bin/activate && uv run python -c "from PyInstaller.utils.hooks import collect_data_files, collect_submodules; assert callable(collect_data_files) and callable(collect_submodules); print('spec deps OK')"
+	. .venv/bin/activate && uv run python -m PyInstaller --clean loushang.spec
 
 install-binary: build-binary
 ifeq ($(DETECTED_OS),Windows)

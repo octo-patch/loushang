@@ -18,6 +18,7 @@ from loushang.tui import (
     PendingQueueView,
     PendingSection,
     StatusBar,
+    StatusField,
     WorkingLine,
 )
 
@@ -32,6 +33,7 @@ class ScreenFrameCopy:
     followup_label: str
     followup_hint: str
     interruption_marker: str = "■"
+    stopping_label: str = "Stopping…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,11 +50,13 @@ class ScreenFramePresentation:
             cwd=state.cwd,
             branch=state.branch,
             session_label=state.session_label,
+            session_id=state.session_id,
             running=state.running,
             permission_profile=state.permission_profile,
             pending_followups=len(state.pending_followups),
             pending_steers=len(state.pending_steers),
-            status_message=state.status_message,
+            status_message=state.presentation_status_message,
+            context_usage=state.context_usage,
         )
 
     def expanded_bottom_frame(
@@ -101,7 +105,9 @@ class ScreenFramePresentation:
         )
         component.pending_queue = self.pending_queue(state)
         component.status_bar = (
-            self.status_bar(state) if state.statusline_visible else None
+            self.status_bar(state)
+            if state.statusline_visible or state.startup_pending
+            else None
         )
         return component
 
@@ -114,7 +120,9 @@ class ScreenFramePresentation:
         if not state.running:
             return None
         return WorkingLine(
-            label=self.copy.working_label,
+            label=(
+                self.copy.stopping_label if state.stopping else self.copy.working_label
+            ),
             elapsed_seconds=elapsed_seconds,
         )
 
@@ -150,6 +158,16 @@ class ScreenFramePresentation:
         return PendingQueueView(sections=tuple(sections))
 
     def status_bar(self, state: ScreenConversationState) -> StatusBar:
+        if state.startup_pending:
+            return StatusBar(
+                (
+                    StatusField(
+                        state.status_message or "Loading session",
+                        priority=100,
+                        token="message",
+                    ),
+                )
+            )
         settings = state.statusline_settings
         return StatusBar(
             status_line_fields(

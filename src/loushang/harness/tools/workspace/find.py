@@ -6,13 +6,15 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from loushang.agent.types import AgentToolResult, TextPart
-from loushang.harness.approval import ApprovalResolver
+from loushang.harness.tools.authoring import (
+    FilesystemActionAdapter,
+    ToolContext,
+    authorized_tool,
+    tool,
+)
 from loushang.harness.workspace.operations import FindOperations, resolve_operation
 
-from .authoring import tool
-from .authorization import AuthorizedWorkspaceAction, execute_workspace_tool_action
 from .builtin_renderers import render_find_call, render_find_or_ls_result
-from .context import ToolContext, context_approval_resolver
 from .external_tools import (
     ExternalToolDownloader,
     ExternalToolPolicy,
@@ -25,13 +27,11 @@ from .external_tools import (
     resolve_external_tool,
 )
 from .ignore import load_ignore_matcher
-from .normalize import tool_to_definition
 from .operations import (
     normalize_find_operations,
     raise_if_operation_aborted,
 )
 from .path_utils import resolve_tool_path
-from .policy import ToolPolicyEvaluator
 from .process import run_external_process
 from .runtime import coerce_int_parameter, pi_truncation_details, prepare_tool_arguments
 from .truncate import truncate_head, truncation_details
@@ -77,15 +77,11 @@ class FindToolOptions:
     external_tool_policy: ExternalToolPolicy | None = None
     allow_external_tool_downloads: bool = False
     require_external_tool: bool = False
-    policy_engine: ToolPolicyEvaluator | None = None
-    approval_resolver: ApprovalResolver | None = None
 
 
 def create_find_tool_definition(
     *,
     operations: FindOperations | None = None,
-    policy_engine: ToolPolicyEvaluator | None = None,
-    approval_resolver: ApprovalResolver | None = None,
     options: FindToolOptions | None = None,
 ) -> ToolDefinition:
     selected_operations = operations or (
@@ -114,12 +110,6 @@ def create_find_tool_definition(
         selected_operations is None
         and external_tools_enabled_for_policy(external_tool_policy)
     )
-    resolved_policy_engine = policy_engine or (
-        options.policy_engine if options is not None else None
-    )
-    resolved_approval_resolver = approval_resolver or (
-        options.approval_resolver if options is not None else None
-    )
 
     @tool(
         name="find",
@@ -140,18 +130,29 @@ def create_find_tool_definition(
     ) -> AgentToolResult[dict[str, Any]]:
         raise_if_operation_aborted(ctx.signal)
         resolved_root = resolve_tool_path(path or ".", cwd=ctx.cwd)
+        active_operations = (
+            normalize_find_operations(
+                ctx.operation_binding
+                if ctx.operation_binding is not None
+                else ops
+            )
+            if selected_operations is None
+            else ops
+        )
+        active_external_tools = use_external_tools
 
-        async def execute(
-            _action: AuthorizedWorkspaceAction,
-        ) -> AgentToolResult[dict[str, Any]]:
-            root = await _require_directory(resolved_root, operations=ops)
+        async def execute() -> AgentToolResult[dict[str, Any]]:
+            root = await _require_directory(
+                resolved_root,
+                operations=active_operations,
+            )
             effective_limit = _effective_limit(limit)
             matches, result_limit_reached = await _walk_matching_paths(
                 root,
                 pattern=pattern,
                 limit=effective_limit,
-                operations=ops,
-                use_external_tools=use_external_tools,
+                operations=active_operations,
+                use_external_tools=active_external_tools,
                 external_tool_resolver=external_tool_resolver,
                 require_external_tool=require_external_tool,
                 signal=ctx.signal,
@@ -161,9 +162,7 @@ def create_find_tool_definition(
             truncation = truncate_head(raw_output)
             visible_matches = _visible_find_matches(matches, truncation.content)
             rendered = (
-                truncation.content
-                if matches
-                else "No files found matching pattern"
+                truncation.content if matches else "No files found matching pattern"
             )
             if matches:
                 rendered = _append_find_notices(
@@ -180,9 +179,7 @@ def create_find_tool_definition(
                     **truncation_details(truncation),
                     "truncated": result_limit_reached or truncation.truncated,
                     "result_limit_reached": result_limit_reached,
-                    "result_limit": (
-                        effective_limit if result_limit_reached else None
-                    ),
+                    "result_limit": (effective_limit if result_limit_reached else None),
                     "truncation": (
                         pi_truncation_details(truncation)
                         if truncation.truncated
@@ -191,32 +188,23 @@ def create_find_tool_definition(
                 },
             )
 
-        return await execute_workspace_tool_action(
-            resolved_policy_engine,
-            tool_name="find",
-            arguments={"path": str(resolved_root), "pattern": pattern},
-            executor=execute,
-            cwd=ctx.cwd,
-            approval_resolver=context_approval_resolver(
-                ctx,
-                resolved_approval_resolver,
-            ),
-            tool_call_id=ctx.tool_call_id,
-            audit_sink=ctx.event_sink,
-            execution_profile_ceiling=getattr(
-                ctx.exec_service,
-                "execution_profile",
-                None,
-            ),
-        )
+        return await execute()
 
     return replace(
-        tool_to_definition(find),
+        authorized_tool(
+            find,
+            action=FilesystemActionAdapter(
+                "read",
+                default_path=".",
+                authorization_fields=("pattern",),
+            ),
+        ),
         prepare_arguments=lambda value: prepare_tool_arguments(
             value, aliases=(("file_path", "path"),)
         ),
         render_call=render_find_call,
         render_result=render_find_or_ls_result,
+        operation_binding_key="find_operations",
     )
 
 

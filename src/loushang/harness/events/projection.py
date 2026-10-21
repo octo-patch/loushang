@@ -12,13 +12,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, TypeAlias
 
+from loushang.foundation.json import JSONValue, require_json_mapping
 from loushang.harness.events.json import snake_case_json_keys
 from loushang.harness.events.types import (
     RuntimeEvent,
     _require_optional_text,
     _require_text,
 )
-from loushang.protocol import JSONValue, require_json_mapping
 
 RuntimeEventDeliveryHint: TypeAlias = Literal["immediate", "coalesce", "final_only"]
 
@@ -91,6 +91,9 @@ def project_runtime_event(
 ) -> RuntimeEventView:
     """Bind a Product JSON projection to one common runtime envelope."""
 
+    normalized_payload = snake_case_json_keys(dict(payload))
+    if not isinstance(normalized_payload, Mapping):
+        raise TypeError("runtime event projection must remain a mapping")
     return RuntimeEventView(
         event_id=event.event_id,
         kind=event.kind,
@@ -100,7 +103,7 @@ def project_runtime_event(
         event_type=event_type,
         view=view,
         payload=require_json_mapping(
-            dict(snake_case_json_keys(dict(payload))),
+            dict(normalized_payload),
             name="runtime_event_projection",
         ),
         delivery_hint=delivery_hint,

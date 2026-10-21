@@ -2,19 +2,24 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from loushang.agent.types import AgentToolResult
-from loushang.ai.model import ModelSelection
+from loushang.ai.model import Capabilities, Model, ModelSelection
 from loushang.ai.types import (
     AssistantMessage,
     TextPart,
     ToolCall,
     Usage,
     UserMessage,
+)
+from loushang.coding._tool_authority import (
+    CODING_ARCH_EXACT_OWNER_TOOL_NAMES,
+    CODING_LSP_EXACT_OWNER_TOOL_NAMES,
 )
 from loushang.coding.multiagent import (
     CodingSubagentFactory,
@@ -24,6 +29,8 @@ from loushang.coding.multiagent import (
     coding_recipe_context_plan,
     install_coding_multiagent_session,
 )
+from loushang.coding.tool_pack import coding_workspace_tool_profile
+from loushang.harness.environment import HostEnvironment
 from loushang.harness.multiagent import (
     AgentInputMessage,
     AgentPath,
@@ -42,8 +49,33 @@ from loushang.harness.multiagent import (
 from loushang.harness.runtime import HostInputQueue
 from loushang.harness.session.multiagent import SessionSubagentRequest
 from loushang.harness.tools.core import ToolDefinition
+from loushang.harness.tools.execution import direct_execution
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 from loushang.harness.transcript import ApplicationMessage
+
+_LINUX_HOST = HostEnvironment(
+    os_family="linux",
+    platform_name="linux",
+    architecture="x86_64",
+)
+_WINDOWS_HOST = HostEnvironment(
+    os_family="windows",
+    platform_name="win32",
+    architecture="amd64",
+)
+
+
+def _selected_exact_tool_names(
+    environment: HostEnvironment = _LINUX_HOST,
+    *,
+    include_arch: bool = True,
+    include_lsp: bool = True,
+) -> tuple[str, ...]:
+    return (
+        *coding_workspace_tool_profile(environment).builtin_tool_names,
+        *(CODING_LSP_EXACT_OWNER_TOOL_NAMES if include_lsp else ()),
+        *(CODING_ARCH_EXACT_OWNER_TOOL_NAMES if include_arch else ()),
+    )
 
 
 class _State:
@@ -132,7 +164,7 @@ class _FailingRuntime(_Runtime):
 
 
 class _UnusedFactory:
-    async def create_driver(self, request: SessionSubagentRequest):
+    async def create(self, request: SessionSubagentRequest):
         raise AssertionError(f"unexpected child construction: {request.record.path}")
 
 
@@ -216,6 +248,7 @@ def _assistant(
             )
         )
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=content,
         api="test",
@@ -248,7 +281,7 @@ def _tool_registry(*names: str) -> WorkspaceToolRegistry:
                 label=name,
                 description=f"Test {name}",
                 parameters={"type": "object", "properties": {}},
-                execute=unused_execute,
+                execution=direct_execution(unused_execute),
             )
         )
     return registry
@@ -278,7 +311,7 @@ def _request(
 
 def test_coding_analysis_agent_types_are_bounded_and_have_no_write_tools() -> None:
     registry = coding_read_only_agent_types(
-        default_model="provider/model",
+        default_model="provider:test-endpoint:model",
         maximum_children=2,
     )
 
@@ -291,7 +324,7 @@ def test_coding_analysis_agent_types_are_bounded_and_have_no_write_tools() -> No
         "synthesizer",
     ]
     for spec in registry.values():
-        assert spec.default_model == "provider/model"
+        assert spec.default_model == "provider:test-endpoint:model"
         assert spec.allowed_tools == (
             ("bash", "read", "grep", "find", "ls")
             if spec.name == "explorer"
@@ -361,6 +394,16 @@ def test_coding_multiagent_prompt_names_the_admitted_roles_and_wait_discipline()
     assert "must not revert others' edits" in prompt
 
 
+def test_coding_multiagent_prompt_projects_platform_tool_names() -> None:
+    prompt = coding_multiagent_system_prompt(
+        coding_agent_types(),
+        host_environment=HostEnvironment("windows", "win32", "amd64"),
+    )
+
+    assert "tools: shell, read, grep, find, ls" in prompt
+    assert "tools: bash" not in prompt
+
+
 def test_coding_explorer_context_allows_investigative_bash_without_write_tools() -> (
     None
 ):
@@ -394,12 +437,14 @@ def test_factory_projects_explorer_bash_into_the_child_runtime(tmp_path: Path) -
     factory = CodingSubagentFactory(
         session_dir=tmp_path / "sessions",
         cwd=tmp_path,
-        tool_registry=_tool_registry("bash", "read", "grep", "find", "ls"),
+        tool_registry=_tool_registry(),
         runtime_builder=build_runtime,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
 
     async def scenario() -> None:
-        driver = await factory.create_driver(_request(spec=spec))
+        binding = await factory.create(_request(spec=spec))
+        driver = binding.driver
         await driver.dispose()
 
     asyncio.run(scenario())
@@ -409,7 +454,219 @@ def test_factory_projects_explorer_bash_into_the_child_runtime(tmp_path: Path) -
     assert captured["active_tool_names"] == expected
     assert [
         definition.name for definition in captured["tool_registry"].list_definitions()
-    ] == expected
+    ] == []
+
+
+def test_factory_maps_neutral_bash_intent_to_windows_shell(tmp_path: Path) -> None:
+    session = _Session(
+        responses=[_assistant("Exploration complete.", input_tokens=1, output_tokens=1)]
+    )
+    captured: dict[str, object] = {}
+
+    def build_runtime(**kwargs: object) -> _Runtime:
+        captured.update(kwargs)
+        return _Runtime(session)
+
+    spec = coding_read_only_agent_types().resolve("explorer")
+    assert spec is not None
+    factory = CodingSubagentFactory(
+        session_dir=tmp_path / "sessions",
+        cwd=tmp_path,
+        tool_registry=_tool_registry(),
+        runtime_builder=build_runtime,
+        host_environment=_WINDOWS_HOST,
+        selected_exact_tool_names=_selected_exact_tool_names(_WINDOWS_HOST),
+    )
+
+    binding = asyncio.run(factory.create(_request(spec=spec)))
+    asyncio.run(binding.driver.dispose())
+
+    expected = ["shell", "read", "grep", "find", "ls"]
+    assert captured["allowed_tool_names"] == expected
+    assert captured["active_tool_names"] == expected
+    delegated = captured["delegated_execution_profile"]
+    assert isinstance(delegated, DelegatedExecutionProfile)
+    assert delegated.allowed_tools == tuple(expected)
+    assert captured["tool_registry"].list_definitions() == []
+
+
+def test_factory_deduplicates_windows_shell_intent_after_platform_mapping(
+    tmp_path: Path,
+) -> None:
+    session = _Session(responses=[_assistant("Done.", input_tokens=1, output_tokens=1)])
+    captured: dict[str, object] = {}
+
+    def build_runtime(**kwargs: object) -> _Runtime:
+        captured.update(kwargs)
+        return _Runtime(session)
+
+    spec = AgentTypeSpec(name="reviewer", allowed_tools=("bash", "shell"))
+    factory = CodingSubagentFactory(
+        session_dir=tmp_path / "sessions",
+        cwd=tmp_path,
+        tool_registry=_tool_registry(),
+        runtime_builder=build_runtime,
+        host_environment=_WINDOWS_HOST,
+        selected_exact_tool_names=_selected_exact_tool_names(_WINDOWS_HOST),
+    )
+
+    binding = asyncio.run(factory.create(_request(spec=spec)))
+    asyncio.run(binding.driver.dispose())
+
+    assert captured["allowed_tool_names"] == ["shell"]
+    assert captured["active_tool_names"] == ["shell"]
+    delegated = captured["delegated_execution_profile"]
+    assert isinstance(delegated, DelegatedExecutionProfile)
+    assert delegated.allowed_tools == ("shell",)
+
+
+def test_factory_filters_all_exact_owner_tools_from_peer_registry(
+    tmp_path: Path,
+) -> None:
+    session = _Session(responses=[_assistant("Done.", input_tokens=1, output_tokens=1)])
+    captured: dict[str, object] = {}
+
+    def build_runtime(**kwargs: object) -> _Runtime:
+        captured.update(kwargs)
+        return _Runtime(session)
+
+    spec = AgentTypeSpec(
+        name="reviewer",
+        allowed_tools=(
+            "read",
+            "inspect_symbol",
+            "document_outline",
+            "inspect_import_graph",
+            "custom",
+        ),
+    )
+    factory = CodingSubagentFactory(
+        session_dir=tmp_path / "sessions",
+        cwd=tmp_path,
+        tool_registry=_tool_registry("custom"),
+        runtime_builder=build_runtime,
+        selected_exact_tool_names=_selected_exact_tool_names(),
+    )
+
+    binding = asyncio.run(factory.create(_request(spec=spec)))
+    asyncio.run(binding.driver.dispose())
+
+    assert captured["allowed_tool_names"] == list(spec.allowed_tools)
+    assert [
+        definition.name for definition in captured["tool_registry"].list_definitions()
+    ] == ["custom"]
+
+
+def test_factory_builds_arch_exact_tool_through_child_product_composition(
+    tmp_path: Path,
+) -> None:
+    from loushang.coding import bootstrap as coding_bootstrap
+    from loushang.coding.arch import INSPECT_IMPORT_GRAPH_TOOL_NAME
+    from loushang.coding.bootstrap import create_services
+    from loushang.coding.composition_sets import resolve_coding_composition_set
+    from loushang.coding.control import ControlConfig, SettingsManager
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    model = Model(
+        id="faux-model",
+        name="Faux",
+        provider="faux",
+        endpoint="anthropic-messages",
+        capabilities=Capabilities(
+            reasoning=True,
+            input=("text",),
+            context_window=128000,
+            max_tokens=4096,
+        ),
+    )
+    factory = CodingSubagentFactory(
+        session_dir=tmp_path / "sessions",
+        cwd=workspace,
+        tool_registry=_tool_registry(),
+        runtime_builder=partial(
+            coding_bootstrap._create_agent_session_runtime,
+            composition_set=resolve_coding_composition_set("coding-architecture"),
+        ),
+        default_model=model,
+        services=create_services(
+            settings_manager=SettingsManager(
+                ControlConfig(
+                    capabilities={
+                        "coding.arch": "always",
+                        "coding.lsp": "disabled",
+                    }
+                )
+            )
+        ),
+        selected_exact_tool_names=_selected_exact_tool_names(include_lsp=False),
+    )
+    spec = AgentTypeSpec(
+        name="reviewer",
+        allowed_tools=(INSPECT_IMPORT_GRAPH_TOOL_NAME,),
+    )
+
+    async def scenario() -> None:
+        binding = await factory.create(_request(spec=spec))
+        child = getattr(binding.driver, "_session")
+        try:
+            await child.prepare_model_call_runtime()
+            assembly = child._coding_capability_plugin_assembly
+            assert assembly is not None
+            assert frozenset(assembly.tool_owners) == {"coding.arch.default"}
+            assert [tool.name for tool in child.agent.tools] == [
+                INSPECT_IMPORT_GRAPH_TOOL_NAME
+            ]
+        finally:
+            disposed = await binding.driver.dispose()
+            assert disposed.dispose_error is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "selected_exact_tool_names"),
+    (
+        ("read", ()),
+        ("inspect_symbol", _selected_exact_tool_names(include_lsp=False)),
+        (
+            "inspect_import_graph",
+            _selected_exact_tool_names(include_arch=False),
+        ),
+        ("shell", _selected_exact_tool_names()),
+    ),
+)
+def test_factory_rejects_exact_owner_tools_not_selected_by_the_product(
+    tmp_path: Path,
+    tool_name: str,
+    selected_exact_tool_names: tuple[str, ...],
+) -> None:
+    runtime_built = False
+
+    def build_runtime(**_kwargs: object) -> _Runtime:
+        nonlocal runtime_built
+        runtime_built = True
+        return _Runtime(
+            _Session(responses=[_assistant("Unused.", input_tokens=0, output_tokens=0)])
+        )
+
+    spec = AgentTypeSpec(name="reviewer", allowed_tools=(tool_name,))
+    factory = CodingSubagentFactory(
+        session_dir=tmp_path / "sessions",
+        cwd=tmp_path,
+        tool_registry=_tool_registry(),
+        runtime_builder=build_runtime,
+        host_environment=_LINUX_HOST,
+        selected_exact_tool_names=selected_exact_tool_names,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"Coding child exact-owner tools are not selected: {tool_name}",
+    ):
+        asyncio.run(factory.create(_request(spec=spec)))
+
+    assert runtime_built is False
 
 
 def test_factory_binds_shared_approval_resolver_to_child_incarnation(
@@ -423,9 +680,7 @@ def test_factory_binds_shared_approval_resolver_to_child_incarnation(
         InteractiveApprovalResolver,
     )
 
-    session = _Session(
-        responses=[_assistant("Done.", input_tokens=1, output_tokens=1)]
-    )
+    session = _Session(responses=[_assistant("Done.", input_tokens=1, output_tokens=1)])
     captured: dict[str, object] = {}
 
     def build_runtime(**kwargs: object) -> _Runtime:
@@ -443,9 +698,11 @@ def test_factory_binds_shared_approval_resolver_to_child_incarnation(
         tool_registry=_tool_registry("read"),
         runtime_builder=build_runtime,
         approval_resolver=root_resolver,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
 
-    driver = asyncio.run(factory.create_driver(request))
+    binding = asyncio.run(factory.create(request))
+    driver = binding.driver
     bound = captured["approval_resolver"]
     assert isinstance(bound, ActorBoundApprovalResolver)
     assert bound.resolver is root_resolver
@@ -455,9 +712,7 @@ def test_factory_binds_shared_approval_resolver_to_child_incarnation(
     assert delegated.actor_ref == request.record.ref
     assert delegated.allowed_tools == ("read",)
     assert delegated.approval_actor_id == bound.actor_id
-    assert delegated.execution_profile_ceiling.readable_roots == (
-        tmp_path.resolve(),
-    )
+    assert delegated.execution_profile_ceiling.readable_roots == (tmp_path.resolve(),)
     assert delegated.execution_profile_ceiling.writable_roots == ()
     assert driver.delegated_execution_profile is delegated
     grant = root_resolver.grant_store.issue(
@@ -476,15 +731,159 @@ def test_factory_binds_shared_approval_resolver_to_child_incarnation(
 
     asyncio.run(driver.dispose())
 
-    assert root_resolver.grant_store.find(
-        ApprovalRequest(
-            tool_name="bash",
-            arguments={"command": "git push origin main"},
-            action_id="child-push-after-close",
-            actor_id=bound.actor_id,
-            session_grant=grant.proposal,
+    assert (
+        root_resolver.grant_store.find(
+            ApprovalRequest(
+                tool_name="bash",
+                arguments={"command": "git push origin main"},
+                action_id="child-push-after-close",
+                actor_id=bound.actor_id,
+                session_grant=grant.proposal,
+            )
         )
-    ) is None
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "release_mode",
+    (
+        "escape",
+        "interrupt_agent",
+        "close_agent",
+        "new",
+        "resume",
+        "session_exit",
+    ),
+)
+def test_pending_child_approval_is_cleared_by_every_lifecycle_exit(
+    tmp_path: Path,
+    release_mode: str,
+) -> None:
+    from loushang.harness.approval import (
+        ApprovalRequest,
+        HeadlessApprovalResolver,
+        InteractiveApprovalResolver,
+        resolve_approval,
+    )
+    from loushang.harness.multiagent import AgentCaller
+    from loushang.harness.session.multiagent import (
+        SessionMultiAgentRuntime,
+        compose_multiagent_before_release,
+    )
+
+    class PendingApprovalSession(_Session):
+        def __init__(self, approval_resolver: object) -> None:
+            super().__init__(responses=[])
+            self.approval_resolver = approval_resolver
+            self.effect_calls = 0
+
+        async def prompt(self, text: str, *, source: str | None = None) -> None:
+            del text, source
+            decision = await resolve_approval(
+                self.approval_resolver,  # type: ignore[arg-type]
+                ApprovalRequest(
+                    tool_name="bash",
+                    arguments={"command": "rm -r lifecycle-target"},
+                    reason="Filesystem content would be deleted",
+                ),
+            )
+            if decision.disposition != "allow":
+                raise PermissionError(decision.reason or decision.disposition)
+            self.effect_calls += 1
+
+    async def scenario() -> None:
+        presented = asyncio.Event()
+        payloads: list[dict[str, object]] = []
+        root_resolver = InteractiveApprovalResolver(
+            fallback=HeadlessApprovalResolver(mode="deny")
+        )
+
+        def present(payload: dict[str, object]) -> None:
+            payloads.append(dict(payload))
+            presented.set()
+
+        root_resolver.set_request_presenter(present)
+        sessions: list[PendingApprovalSession] = []
+        runtimes: list[_Runtime] = []
+
+        def build_runtime(**kwargs: object) -> _Runtime:
+            session = PendingApprovalSession(kwargs["approval_resolver"])
+            runtime = _Runtime(session)
+            sessions.append(session)
+            runtimes.append(runtime)
+            return runtime
+
+        spec = coding_read_only_agent_types(maximum_children=1).resolve("explorer")
+        assert spec is not None
+        control = MultiAgentControl(agent_types=AgentTypeRegistry((spec,)))
+        runtime = SessionMultiAgentRuntime(
+            control=control,
+            child_factory=CodingSubagentFactory(
+                session_dir=tmp_path / "sessions",
+                cwd=tmp_path,
+                tool_registry=_tool_registry(*spec.allowed_tools),
+                runtime_builder=build_runtime,
+                approval_resolver=root_resolver,
+                selected_exact_tool_names=_selected_exact_tool_names(),
+            ),
+        )
+        caller = AgentCaller(control.root_ref)
+        child = await runtime.spawn_child(
+            caller=caller,
+            parent_path=AgentPath.root(),
+            name="pending",
+            agent_type="explorer",
+            initial_prompt="Request the controlled deletion.",
+        )
+        await presented.wait()
+        assert len(root_resolver.permissions_snapshot().pending) == 1
+
+        if release_mode == "escape":
+            action_id = payloads[0]["action_id"]
+            assert isinstance(action_id, str)
+            assert await root_resolver.handle_result(
+                action_id,
+                outcome="abort",
+            )
+            record = await runtime.await_terminal(
+                caller=caller,
+                target=child.path,
+                timeout=1,
+            )
+            assert record.status == "failed"
+        elif release_mode == "interrupt_agent":
+            record = await runtime.interrupt_agent(
+                caller=caller,
+                target=child.path,
+            )
+            assert record.status == "interrupted"
+        elif release_mode == "close_agent":
+            result = await runtime.close_agent(caller=caller, target=child.path)
+            assert [record.status for record in result.closed] == ["closed"]
+        elif release_mode in {"new", "resume"}:
+            hook = compose_multiagent_before_release(
+                resolve_runtime=lambda _session: runtime,
+            )
+            await hook(
+                object(),
+                None,
+                SimpleNamespace(reason=release_mode),
+            )
+        else:
+            await runtime.dispose()
+
+        await asyncio.sleep(0)
+        assert root_resolver.permissions_snapshot().pending == ()
+        assert sessions[0].effect_calls == 0
+        current = control.registry.get(child.ref, include_closed=True)
+        assert current is not None
+        assert current.status != "running"
+
+        await runtime.dispose()
+        assert runtimes[0].dispose_calls == 1
+
+    asyncio.run(scenario())
 
 
 def test_coding_recipe_context_is_fresh_read_only_and_role_specific() -> None:
@@ -527,19 +926,21 @@ def test_factory_builds_a_non_persistent_child_and_uses_existing_session_rounds(
 
     spec = AgentTypeSpec(
         name="reviewer",
-        default_model="provider/model",
+        default_model="provider:test-endpoint:model",
         allowed_tools=("read", "grep", "find", "ls"),
     )
     factory = CodingSubagentFactory(
         session_dir=tmp_path / "sessions",
         cwd=tmp_path,
-        tool_registry=_tool_registry("read", "grep", "find", "ls"),
+        tool_registry=_tool_registry(),
         runtime_builder=build_runtime,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
 
     async def scenario() -> None:
         request = _request(spec=spec)
-        driver = await factory.create_driver(request)
+        binding = await factory.create(request)
+        driver = binding.driver
         initial = AgentInputMessage(
             message_id="initial",
             sender=HostCaller(),
@@ -573,12 +974,14 @@ def test_factory_builds_a_non_persistent_child_and_uses_existing_session_rounds(
 
     assert captured["persist"] is False
     assert captured["sandbox_workspace_writable"] is False
-    assert captured["model"] == ModelSelection(provider="provider", model_id="model")
+    assert captured["model"] == ModelSelection(
+        endpoint_id="test-endpoint", provider="provider", model_id="model"
+    )
     assert captured["allowed_tool_names"] == ["read", "grep", "find", "ls"]
     assert captured["active_tool_names"] == ["read", "grep", "find", "ls"]
     assert [
         definition.name for definition in captured["tool_registry"].list_definitions()
-    ] == ["read", "grep", "find", "ls"]
+    ] == []
     assert "independent read-only code reviewer" in str(captured["system_prompt"])
     assert runtime.create_cwds == [str(tmp_path.resolve())]
     assert session.prompt_calls == [("Review this design.", "multiagent:initial")]
@@ -599,7 +1002,7 @@ def test_factory_installs_forked_history_and_cannot_widen_tools(
     )
     plan = SubagentContextPlan(
         system_prompt="Bounded reviewer prompt",
-        model="provider/other",
+        model="provider:test-endpoint:other",
         history=history,
         allowed_tools=("read",),
     )
@@ -620,12 +1023,15 @@ def test_factory_installs_forked_history_and_cannot_widen_tools(
         cwd=tmp_path,
         tool_registry=_tool_registry("read", "grep"),
         runtime_builder=build_runtime,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
-    asyncio.run(factory.create_driver(_request(spec=spec, context_plan=plan)))
+    asyncio.run(factory.create(_request(spec=spec, context_plan=plan)))
 
     assert session.agent.state.messages == [history_message]
     assert captured["system_prompt"] == "Bounded reviewer prompt"
-    assert captured["model"] == ModelSelection(provider="provider", model_id="other")
+    assert captured["model"] == ModelSelection(
+        endpoint_id="test-endpoint", provider="provider", model_id="other"
+    )
     assert captured["allowed_tool_names"] == ["read"]
 
     widened = SubagentContextPlan(
@@ -635,7 +1041,7 @@ def test_factory_installs_forked_history_and_cannot_widen_tools(
         allowed_tools=("write",),
     )
     with pytest.raises(ValueError, match="non-admitted Coding tools: write"):
-        asyncio.run(factory.create_driver(_request(spec=spec, context_plan=widened)))
+        asyncio.run(factory.create(_request(spec=spec, context_plan=widened)))
 
 
 def test_failed_child_creation_disposes_the_non_persistent_runtime(
@@ -649,11 +1055,12 @@ def test_failed_child_creation_disposes_the_non_persistent_runtime(
         cwd=tmp_path,
         tool_registry=_tool_registry("read"),
         runtime_builder=lambda **_kwargs: runtime,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
     spec = AgentTypeSpec(name="reviewer", allowed_tools=("read",))
 
     with pytest.raises(RuntimeError, match="child session failed"):
-        asyncio.run(factory.create_driver(_request(spec=spec)))
+        asyncio.run(factory.create(_request(spec=spec)))
 
     assert runtime.dispose_calls == 1
 
@@ -685,12 +1092,14 @@ def test_factory_runs_isolated_types_in_a_lease_and_reports_changes(
         tool_registry=_tool_registry("read", "write"),
         runtime_builder=build_runtime,
         workspace_leases=workspace,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
 
     async def scenario() -> None:
         request = _request(spec=spec)
-        driver = await factory.create_driver(request)
-        assert driver.workspace_ref == "git-workspace:test"
+        binding = await factory.create(request)
+        driver = binding.driver
+        assert binding.workspace_ref == "git-workspace:test"
         driver.deliver(
             AgentInputMessage(
                 message_id="initial",
@@ -701,13 +1110,13 @@ def test_factory_runs_isolated_types_in_a_lease_and_reports_changes(
             )
         )
         result = await driver.run_round(round_id=1, mode="prompt")
-        await driver.dispose()
+        dispose_result = await driver.dispose()
 
         assert result.workspace_ref == "git-workspace:test"
         assert result.artifact_refs == ("git-artifact:test",)
         assert result.change_set_ref is None
-        assert driver.released_workspace is not None
-        assert driver.released_workspace.retained is True
+        assert dispose_result.released_workspace is not None
+        assert dispose_result.released_workspace.retained is True
 
     asyncio.run(scenario())
 
@@ -716,9 +1125,7 @@ def test_factory_runs_isolated_types_in_a_lease_and_reports_changes(
     delegated = captured["delegated_execution_profile"]
     assert isinstance(delegated, DelegatedExecutionProfile)
     assert delegated.workspace_ref == "git-workspace:test"
-    assert delegated.execution_profile_ceiling.writable_roots == (
-        isolated.resolve(),
-    )
+    assert delegated.execution_profile_ceiling.writable_roots == (isolated.resolve(),)
     assert workspace.acquired[0].agent_type == "implementation_worker"
     assert workspace.released == 1
 
@@ -744,12 +1151,14 @@ def test_factory_runs_shared_write_worker_in_the_exact_parent_worktree(
         tool_registry=_tool_registry(*spec.allowed_tools),
         runtime_builder=build_runtime,
         workspace_leases=None,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
 
     async def scenario() -> None:
         request = _request(spec=spec)
-        driver = await factory.create_driver(request)
-        assert driver.workspace_ref is None
+        binding = await factory.create(request)
+        driver = binding.driver
+        assert binding.workspace_ref is None
         driver.deliver(
             AgentInputMessage(
                 message_id="initial",
@@ -773,9 +1182,7 @@ def test_factory_runs_shared_write_worker_in_the_exact_parent_worktree(
     delegated = captured["delegated_execution_profile"]
     assert isinstance(delegated, DelegatedExecutionProfile)
     assert delegated.workspace_ref is None
-    assert delegated.execution_profile_ceiling.writable_roots == (
-        tmp_path.resolve(),
-    )
+    assert delegated.execution_profile_ceiling.writable_roots == (tmp_path.resolve(),)
     assert "sharing the parent Coding session's current worktree" in str(
         captured["system_prompt"]
     )
@@ -791,17 +1198,18 @@ def test_factory_rejects_an_admitted_tool_missing_from_the_product_registry(
         runtime_builder=lambda **_kwargs: _Runtime(
             _Session(responses=[_assistant("Unused.", input_tokens=0, output_tokens=0)])
         ),
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
     spec = AgentTypeSpec(
         name="reviewer",
-        allowed_tools=("read", "grep"),
+        allowed_tools=("read", "custom_lookup"),
     )
 
     with pytest.raises(
         ValueError,
-        match="Coding child tools are not registered and enabled: grep",
+        match="Coding child tools are not registered and enabled: custom_lookup",
     ):
-        asyncio.run(factory.create_driver(_request(spec=spec)))
+        asyncio.run(factory.create(_request(spec=spec)))
 
 
 def test_factory_releases_isolated_workspace_when_preflight_fails(
@@ -825,18 +1233,19 @@ def test_factory_releases_isolated_workspace_when_preflight_fails(
         tool_registry=_tool_registry("read"),
         runtime_builder=build_runtime,
         workspace_leases=workspace,
+        selected_exact_tool_names=_selected_exact_tool_names(),
     )
     spec = AgentTypeSpec(
         name="implementation_worker",
-        allowed_tools=("read", "write"),
+        allowed_tools=("read", "custom_write"),
         workspace_mode="isolated",
     )
 
     with pytest.raises(
         ValueError,
-        match="Coding child tools are not registered and enabled: write",
+        match="Coding child tools are not registered and enabled: custom_write",
     ):
-        asyncio.run(factory.create_driver(_request(spec=spec)))
+        asyncio.run(factory.create(_request(spec=spec)))
 
     assert workspace.released == 1
     assert runtime_built is False
@@ -865,6 +1274,32 @@ def test_installation_binds_root_input_to_the_existing_queue() -> None:
     assert payload.display is False
     assert session.multiagent_runtime is runtime
     assert session.multiagent_input.queue is session.runtime.queue.input_queue
+
+
+def test_coding_spawn_tool_describes_admitted_agent_types() -> None:
+    session = _RootSession()
+    registered = []
+    session.register_runtime_tools = lambda definitions, **_kwargs: registered.extend(
+        definitions
+    )
+    admitted = coding_agent_types()
+
+    install_coding_multiagent_session(
+        session,  # type: ignore[arg-type]
+        child_factory=_UnusedFactory(),
+        agent_types=admitted,
+        register_tools=True,
+    )
+
+    spawn = next(tool for tool in registered if tool.name == "spawn_agent")
+    agent_type = spawn.parameters["properties"]["agent_type"]
+    assert agent_type["enum"] == [spec.name for spec in admitted.values()]
+    assert "explorer (read-only investigation)" in agent_type["description"]
+    assert "reviewer (review)" in agent_type["description"]
+    assert (
+        "implementation_worker (implementation in an isolated worktree)"
+        in (agent_type["description"])
+    )
 
 
 def test_coding_completion_notice_uses_hidden_agent_mailbox() -> None:

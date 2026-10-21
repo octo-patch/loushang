@@ -4,14 +4,13 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-from loushang.harness.resources.loader import (
-    ProfiledResourceLoader,
-    ResourceLoader,
-    ResourceLoaderProfile,
+from loushang.harness.resources.packages.inventory import summarize_package_inventory
+from loushang.harness.resources.packages.manifest import (
+    project_plugin_diagnostics,
+    resolve_package_manifest,
 )
-from loushang.harness.resources.packages.manifest import resolve_package_manifest
 from loushang.harness.resources.packages.materializer import (
     PackageMaterializer,
 )
@@ -22,8 +21,14 @@ from loushang.harness.resources.packages.source import (
     package_source_match_key,
     remote_package_name,
 )
-from loushang.harness.resources.plugins.manager import PluginManager
+from loushang.harness.resources.plugins.authority import (
+    PluginResolutionAuthority,
+)
+from loushang.harness.resources.plugins.types import PluginSource
 from loushang.harness.resources.types import PackageResourceSummary
+
+if TYPE_CHECKING:
+    from loushang.harness.resources.loader import ResourceLoaderProfile
 
 PackageCatalogKind = Literal["package_root", "plugin", "remote_package", "catalog"]
 PackageCatalogScope = Literal["user", "project", "session", "merged", "catalog"]
@@ -153,7 +158,7 @@ class PackageCatalogBuilder:
                 )
             )
 
-        manager = PluginManager(disabled_plugins=disabled_plugins)
+        plugin_authority = PluginResolutionAuthority(disabled_plugins=disabled_plugins)
         for source, scope in sources.plugin_sources:
             if is_remote_package_source(source):
                 entries.append(
@@ -162,31 +167,78 @@ class PackageCatalogBuilder:
                         scope=scope,
                         cwd=cwd,
                         materializer=materializer,
+                        plugin_authority=plugin_authority,
                     )
                 )
                 continue
-            plugin = manager.add_plugin_source(source)
-            package_root = plugin.manifest.package_root or plugin.manifest.root
-            summary = (
-                empty_package_summary(package_root)
-                if not plugin.enabled
-                else self._summary_provider(package_root, cwd, None)
-            )
             entries.append(
-                PackageCatalogEntry(
-                    name=plugin.manifest.name,
-                    kind="plugin",
+                self._local_plugin_entry(
+                    source=source,
                     scope=scope,
-                    version=plugin.manifest.version or "",
-                    source=str(plugin.source.path),
-                    path=package_root,
-                    enabled=plugin.enabled,
-                    summary=summary,
+                    cwd=cwd,
+                    plugin_authority=plugin_authority,
+                    materializer=materializer,
                 )
             )
 
         entries.extend(load_package_catalog(catalog_path))
         return mark_package_conflicts(entries)
+
+    def _local_plugin_entry(
+        self,
+        *,
+        source: str,
+        scope: PackageCatalogScope,
+        cwd: Path,
+        plugin_authority: PluginResolutionAuthority,
+        materializer: PackageMaterializer | None,
+    ) -> PackageCatalogEntry:
+        configured_root = Path(source).expanduser().resolve()
+        inspection = plugin_authority.inspect(
+            PluginSource(path=Path(source).expanduser()),
+            binding_validator=materializer,
+        )
+        package = inspection.package
+        manifest_diagnostics = project_plugin_diagnostics(inspection.diagnostics)
+        plugin = (
+            inspection.plugin
+            if package is not None and not manifest_diagnostics
+            else None
+        )
+        if package is not None:
+            package_root = package.package_root
+        else:
+            package_root = configured_root
+        enabled = plugin.enabled if plugin is not None else False
+        return PackageCatalogEntry(
+            name=(
+                plugin.manifest.name
+                if plugin is not None
+                else package.manifest.name
+                if package is not None
+                else configured_root.name
+            ),
+            kind="plugin",
+            scope=scope,
+            version=(
+                plugin.manifest.version or ""
+                if plugin is not None
+                else package.manifest.version or ""
+                if package is not None
+                else ""
+            ),
+            source=(
+                str(plugin.source.path) if plugin is not None else str(configured_root)
+            ),
+            path=package_root,
+            enabled=enabled,
+            summary=(
+                self._summary_provider(package_root, cwd, None)
+                if enabled
+                else empty_package_summary(package_root)
+            ),
+            manifest_diagnostics=manifest_diagnostics,
+        )
 
     def remote_package_entry(
         self,
@@ -196,29 +248,81 @@ class PackageCatalogBuilder:
         cwd: Path | None = None,
         materializer: PackageMaterializer | None = None,
         package_source: PackageSourceConfig | None = None,
+        plugin_authority: PluginResolutionAuthority | None = None,
     ) -> PackageCatalogEntry:
         record = materializer.get_record(source) if materializer is not None else None
         lifecycle = record.lifecycle if record is not None else "remote_registered"
         path = record.target_path if record is not None else None
-        manifest = resolve_package_manifest(
-            path or Path(), installed=lifecycle == "installed"
-        )
-        summary_root = manifest.package_root if path is not None else manifest.root
+        installed = lifecycle == "installed"
+        if plugin_authority is not None and path is not None and installed:
+            inspection = plugin_authority.inspect(
+                PluginSource(path=path, url=source, kind="remote"),
+                binding_validator=materializer,
+            )
+            resolved_plugin_package = inspection.package
+            manifest_diagnostics = project_plugin_diagnostics(inspection.diagnostics)
+            plugin = (
+                inspection.plugin
+                if resolved_plugin_package is not None and not manifest_diagnostics
+                else None
+            )
+            manifest_root = (
+                resolved_plugin_package.root
+                if resolved_plugin_package is not None
+                else path.resolve()
+            )
+            manifest_package_root = (
+                resolved_plugin_package.package_root
+                if resolved_plugin_package is not None
+                else manifest_root
+            )
+            manifest_version = (
+                resolved_plugin_package.manifest.version or ""
+                if resolved_plugin_package is not None
+                else ""
+            )
+        else:
+            manifest = resolve_package_manifest(
+                path or Path(),
+                installed=installed,
+            )
+            resolved_plugin_package = manifest.resolved_plugin_package
+            manifest_diagnostics = manifest.diagnostics
+            manifest_root = manifest.root
+            manifest_package_root = manifest.package_root
+            manifest_version = manifest.version
+            plugin = None
+        enabled = plugin.enabled if plugin is not None else installed
+        if plugin_authority is not None and plugin is None:
+            enabled = False
+        summary_root = manifest_package_root if path is not None else manifest_root
         summary = (
             empty_package_summary(summary_root)
-            if path is None or lifecycle != "installed" or not summary_root.is_dir()
+            if path is None or not enabled or not summary_root.is_dir()
             else self._summary_provider(
                 summary_root, cwd or summary_root, package_source
             )
         )
         return PackageCatalogEntry(
-            name=remote_package_name(source),
+            name=(
+                plugin.manifest.name
+                if plugin is not None
+                else resolved_plugin_package.manifest.name
+                if resolved_plugin_package is not None
+                else remote_package_name(source)
+            ),
             kind="remote_package",
             scope=scope,
-            version=manifest.version,
+            version=(
+                plugin.manifest.version or ""
+                if plugin is not None
+                else resolved_plugin_package.manifest.version or ""
+                if resolved_plugin_package is not None
+                else manifest_version
+            ),
             source=source,
             path=path,
-            enabled=lifecycle == "installed",
+            enabled=enabled,
             summary=summary,
             lifecycle=lifecycle,
             security=record.security if record is not None else "allowed",
@@ -238,11 +342,11 @@ class PackageCatalogBuilder:
             if record is not None
             else (),
             package_root=(
-                manifest.package_root
-                if path is not None and manifest.package_root != manifest.root
+                manifest_package_root
+                if path is not None and manifest_package_root != manifest_root
                 else None
             ),
-            manifest_diagnostics=manifest.diagnostics,
+            manifest_diagnostics=manifest_diagnostics,
         )
 
 
@@ -336,12 +440,8 @@ def summarize_package_resources(
     cwd: Path,
     package_source: PackageSourceConfig | None = None,
 ) -> PackageResourceSummary:
-    return _summarize_package_resources(
-        ResourceLoader,
-        package_root,
-        cwd,
-        package_source,
-    )
+    del cwd
+    return summarize_package_inventory(package_root, package_source)
 
 
 def summarize_profiled_package_resources(
@@ -351,31 +451,10 @@ def summarize_profiled_package_resources(
     *,
     profile: ResourceLoaderProfile,
 ) -> PackageResourceSummary:
-    """Summarize one package root through an existing resource-loader profile."""
+    """Compatibility signature over the Product-neutral inventory port."""
 
-    return _summarize_package_resources(
-        lambda **kwargs: ProfiledResourceLoader(profile=profile, **kwargs),
-        package_root,
-        cwd,
-        package_source,
-    )
-
-
-def _summarize_package_resources(
-    loader_factory: Callable[..., ResourceLoader],
-    package_root: Path,
-    cwd: Path,
-    package_source: PackageSourceConfig | None,
-) -> PackageResourceSummary:
-    filters: dict[str | Path, PackageSourceConfig] | None = (
-        {package_root: package_source} if package_source is not None else None
-    )
-    loader = loader_factory(
-        package_roots=(package_root,), package_source_filters=filters
-    )
-    loader.discover_resources(cwd)
-    summaries = loader.get_package_resource_summaries()
-    return summaries[0] if summaries else empty_package_summary(package_root)
+    del cwd, profile
+    return summarize_package_inventory(package_root, package_source)
 
 
 def empty_package_summary(package_root: Path) -> PackageResourceSummary:

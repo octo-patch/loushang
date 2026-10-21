@@ -13,6 +13,7 @@ from typing import Protocol
 
 from loushang.agent.types import AgentToolResult
 from loushang.ai.types import AssistantMessage
+from loushang.foundation.json import require_json_value
 from loushang.harness.diagnostics.service import DiagnosticsService
 from loushang.harness.diagnostics.types import (
     DiagnosticDraft,
@@ -25,11 +26,11 @@ from loushang.harness.diagnostics.types import (
     ErrorReport,
 )
 from loushang.harness.extensions.types import ResolvedCommand
-from loushang.protocol import require_json_value
 
 _EXTENSION_ERROR_DIAGNOSTIC_CODES: frozenset[str] = frozenset(
     {
         "extension_runtime_bind_failed",
+        "extension_graph_provider_restart_required",
         "extension_resource_refresh_failed",
         "extension_session_start_failed",
         "extension_session_refresh_failed",
@@ -133,6 +134,21 @@ class SessionDiagnosticsRuntime:
         )
 
     def record_extension_runtime_diagnostic(self, diagnostic: DiagnosticDraft) -> None:
+        self.record_runtime_diagnostic(
+            diagnostic,
+            source="extensions",
+            level=_extension_diagnostic_level(diagnostic.code),
+        )
+
+    def record_runtime_diagnostic(
+        self,
+        diagnostic: DiagnosticDraft,
+        *,
+        source: DiagnosticSource,
+        level: DiagnosticLevel,
+    ) -> None:
+        """Record a Product-classified runtime diagnostic in Session scope."""
+
         if self.diagnostics_service is None:
             return
         scope = self.get_scope()
@@ -140,10 +156,10 @@ class SessionDiagnosticsRuntime:
             self.diagnostics_service.normalize_diagnostic(
                 diagnostic,
                 phase="runtime",
-                source="extensions",
+                source=source,
                 session_id=scope.session_id,
                 entry_id=scope.entry_id,
-                level=_extension_diagnostic_level(diagnostic.code),
+                level=level,
             )
         )
 
@@ -251,6 +267,30 @@ class SessionDiagnosticsRuntime:
         ):
             return
         scope = self.get_scope()
+        details: dict[str, object] = {
+            "provider": assistant_message.provider,
+            "model_id": assistant_message.model,
+            "api": assistant_message.api,
+            "response_id": assistant_message.response_id,
+            "stop_reason": assistant_message.stop_reason,
+        }
+        error_info = assistant_message.error_info
+        if isinstance(error_info, Mapping):
+            for source_key, target_key in (
+                ("code", "error_code"),
+                ("source", "error_source"),
+                ("retryable", "retryable"),
+                ("statusCode", "status_code"),
+                ("requestId", "request_id"),
+            ):
+                value = error_info.get(source_key)
+                if isinstance(value, str | int | bool):
+                    details[target_key] = value
+            typed_details = error_info.get("details")
+            if isinstance(typed_details, Mapping):
+                exception_type = typed_details.get("exceptionType")
+                if isinstance(exception_type, str) and exception_type:
+                    details["exception_type"] = exception_type
         self.diagnostics_service.capture_failure(
             code="assistant_response_error",
             error=assistant_message.error_message,
@@ -258,13 +298,7 @@ class SessionDiagnosticsRuntime:
             source="provider",
             session_id=scope.session_id,
             entry_id=scope.entry_id,
-            details={
-                "provider": assistant_message.provider,
-                "model_id": assistant_message.model,
-                "api": assistant_message.api,
-                "response_id": assistant_message.response_id,
-                "stop_reason": assistant_message.stop_reason,
-            },
+            details=details,
         )
 
     def record_tool_execution_error(self, event: Mapping[str, object]) -> None:

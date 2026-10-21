@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from functools import partial
 
+from loushang.agent import PrepareModelCallFn
+from loushang.ai import PreparedRequestLimits
 from loushang.coding.compaction.profiles import (
     CODING_BRANCH_SUMMARY_PROFILE,
     CODING_COMPACTION_SUMMARY_PROFILE,
@@ -58,6 +60,8 @@ async def execute_coding_compaction(
     signal: object | None = None,
     custom_instructions: str | None = None,
     completer: SummaryCompleter = default_summary_completer,
+    prepare_model_call: PrepareModelCallFn | None = None,
+    request_limits: PreparedRequestLimits | None = None,
 ) -> CompactionResult:
     """Bind Coding prompts and file-operation annotations to Harness compaction."""
 
@@ -72,6 +76,8 @@ async def execute_coding_compaction(
         custom_instructions=custom_instructions,
         completer=completer,
         decorate=_decorate_coding_summary,
+        prepare_model_call=prepare_model_call,
+        request_limits=request_limits,
     )
 
 
@@ -86,6 +92,7 @@ async def execute_coding_branch_summary(
     replace_instructions: bool = False,
     reserve_tokens: int = 16_384,
     completer: SummaryCompleter = default_summary_completer,
+    prepare_model_call: PrepareModelCallFn | None = None,
 ) -> BranchSummaryOutput:
     """Bind Coding prompts and file-operation annotations to branch summaries."""
 
@@ -101,6 +108,7 @@ async def execute_coding_branch_summary(
         reserve_tokens=reserve_tokens,
         completer=completer,
         decorate=_decorate_coding_summary,
+        prepare_model_call=prepare_model_call,
     )
 
 

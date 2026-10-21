@@ -11,6 +11,7 @@ from typing import Literal, TypeVar
 from .registry import AgentRegistry, Clock
 from .types import (
     AgentAuthorityPolicy,
+    AgentCaller,
     AgentCompletionNotice,
     AgentFact,
     AgentFactKind,
@@ -31,6 +32,7 @@ from .types import (
     MultiAgentError,
     TerminalPayload,
     TerminalStatus,
+    TransitionReason,
 )
 from .workspace import WorkspaceLeaseSnapshot
 
@@ -128,6 +130,29 @@ class MultiAgentControl:
             None,
         )
 
+    def read_completion_notice(
+        self,
+        *,
+        caller: AgentCaller,
+        ref: AgentRef,
+        round_id: int,
+    ) -> AgentCompletionNotice:
+        """Read one finished round for its original, still-live recipient."""
+
+        self._validate_caller(caller)
+        notice = self.completion_notice(ref, round_id=round_id)
+        if notice is None:
+            raise MultiAgentError(
+                "agent_result_not_found",
+                f"agent result is unavailable: {ref}, round {round_id}",
+            )
+        if notice.recipient_ref != caller.ref:
+            raise MultiAgentError(
+                "agent_authority_denied",
+                f"caller cannot read result from {ref}",
+            )
+        return notice
+
     def agent_type(self, name: str) -> AgentTypeSpec | None:
         return self._agent_types.resolve(name)
 
@@ -214,8 +239,7 @@ class MultiAgentControl:
                     "limit": spec.maximum_children,
                     "open_count": len(same_type_children),
                     "open_children": tuple(
-                        _capacity_occupant(record)
-                        for record in same_type_children
+                        _capacity_occupant(record) for record in same_type_children
                     ),
                     "recovery": (
                         "Use list_agents, then reuse an existing child with "
@@ -287,7 +311,9 @@ class MultiAgentControl:
             recent_activity=(
                 previous.recent_activity if recent_activity is None else recent_activity
             ),
-            summary=previous.summary if summary is _KEEP_SUMMARY else summary,
+            summary=(
+                previous.summary if isinstance(summary, _KeepSummary) else summary
+            ),
         )
         record = self._registry.update(ref, progress=progress)
         self._emit_fact("progress", record, progress=progress)
@@ -350,7 +376,7 @@ class MultiAgentControl:
             return AgentTransition(False, "stale_round", current)
         notification_key = (ref, round_id)
         if current.status in {"completed", "failed", "interrupted"}:
-            reason = (
+            reason: TransitionReason = (
                 "duplicate"
                 if notification_key in self._notified_rounds
                 else "invalid_state"

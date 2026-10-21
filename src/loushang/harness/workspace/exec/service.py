@@ -1,25 +1,69 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import inspect
 import os
-import signal as signal_module
 import tempfile
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Coroutine
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, Protocol, TextIO
+from typing import Any, Literal, Protocol, TextIO, TypeVar
+from uuid import uuid4
 
+from loushang.harness.authorization import (
+    EffectiveExecutionProfile,
+    ExecutionProfileProvider,
+    select_execution_profile,
+)
+from loushang.harness.runtime._owned_tasks import _await_cancellation_atomic
+from loushang.harness.workspace._local_process import (
+    kill_local_process_tree,
+    spawn_local_process,
+)
+from loushang.harness.workspace.process import (
+    AuthorizedProcessLauncher,
+    ProcessExit,
+    ProcessHandle,
+    ProcessLaunchRequest,
+)
 from loushang.harness.workspace.truncation import truncate_tail
 
+from ._capture_supervision import wait_for_captured_process
+from .capture import (
+    CAPTURE_READ_BYTES,
+    CapturedExecExecutor,
+    ExecCaptureSink,
+    _CaptureSinkBorrow,
+    bounded_capture_request,
+    validate_capture,
+)
+from .errors import ExecLaunchError, ExecLaunchErrorKind
 from .types import (
     ExecOutputChunk,
     ExecRequest,
     ExecResult,
     ExecUpdateCallback,
+    StdioDrainReason,
     materialize_exec_request,
 )
+
+_T = TypeVar("_T")
+
+
+def _process_task(
+    coroutine: Coroutine[Any, Any, _T], *, captured: bool, name: str | None = None,
+) -> asyncio.Task[_T]:
+    """Publish captured process support only through the trusted Task primitive.
+
+    The process is already owned: an external factory must not detach a reader
+    or cleanup task by scheduling it and then losing its publication receipt.
+    Ordinary execution retains its existing task-factory behavior.
+    """
+    if captured:
+        return asyncio.Task(coroutine, loop=asyncio.get_running_loop(), name=name)
+    return asyncio.create_task(coroutine, name=name)
 
 
 class ExecBackend(Protocol):
@@ -40,9 +84,41 @@ class ExecService:
         *,
         backend: ExecBackend | None = None,
         execution_profile: object | None = None,
+        execution_profile_provider: ExecutionProfileProvider | None = None,
     ) -> None:
         self._backend = backend if backend is not None else LocalExecBackend()
-        self.execution_profile = execution_profile
+        if execution_profile_provider is not None and not isinstance(
+            execution_profile, EffectiveExecutionProfile,
+        ):
+            raise TypeError("live execution selection requires an EffectiveExecutionProfile ceiling")
+        self._execution_profile = execution_profile
+        self._execution_profile_provider = execution_profile_provider
+
+    @property
+    def execution_profile(self) -> object | None:
+        if self._execution_profile_provider is None:
+            return self._execution_profile
+        assert isinstance(self._execution_profile, EffectiveExecutionProfile)
+        return select_execution_profile(self._execution_profile, self._execution_profile_provider)
+
+    @execution_profile.setter
+    def execution_profile(self, value: object | None) -> None:
+        if self._execution_profile_provider is not None:
+            raise AttributeError("a live execution service has an immutable ceiling")
+        self._execution_profile = value
+
+    def capture_executor(self) -> CapturedExecExecutor | None:
+        # An execute wrapper must explicitly preserve its own policy. Its
+        # unused inherited backend is not a capture capability.
+        if getattr(self.execute, "__func__", None) is not ExecService.execute:
+            return None
+        for base in (LocalExecBackend, AuthorizedProcessExecBackend):
+            if (isinstance(self._backend, base)
+                    and type(self._backend).__call__ is not base.__call__
+                    and type(self._backend).execute_captured is base.execute_captured):
+                return None
+        operation = getattr(self._backend, "execute_captured", None)
+        return _BoundCapturedExecutor(operation) if callable(operation) else None
 
     async def execute(
         self,
@@ -60,38 +136,121 @@ class ExecService:
         return result
 
 
+class _CapturedOperation(Protocol):
+    def __call__(
+        self, request: ExecRequest, *, capture: ExecCaptureSink,
+        signal: object | None = None, on_update: ExecUpdateCallback | None = None,
+    ) -> Awaitable[ExecResult]: ...
+
+
+class _BoundCapturedExecutor:
+    def __init__(self, operation: _CapturedOperation) -> None:
+        self._operation = operation
+
+    async def execute(
+        self, request: ExecRequest, *, capture: ExecCaptureSink,
+        signal: object | None = None, on_update: ExecUpdateCallback | None = None,
+    ) -> ExecResult:
+        validate_capture(capture)
+        result = await self._operation(
+            materialize_exec_request(bounded_capture_request(request)),
+            capture=capture, signal=signal, on_update=on_update,
+        )
+        if not isinstance(result, ExecResult):
+            raise TypeError("captured exec backend must return ExecResult")
+        return result
+
+
 class LocalExecBackend:
     """Run one already-materialized request as a local child process."""
 
+    def __init__(
+        self,
+        *,
+        read_chunk_bytes: int = 64 * 1024,
+        post_exit_stdio_grace_seconds: float = 0.5,
+        post_exit_stdio_hard_timeout_seconds: float = 2.0,
+    ) -> None:
+        if read_chunk_bytes < 1:
+            raise ValueError("read_chunk_bytes must be >= 1")
+        if post_exit_stdio_grace_seconds <= 0:
+            raise ValueError("post_exit_stdio_grace_seconds must be > 0")
+        if post_exit_stdio_hard_timeout_seconds <= 0:
+            raise ValueError("post_exit_stdio_hard_timeout_seconds must be > 0")
+        if post_exit_stdio_hard_timeout_seconds < post_exit_stdio_grace_seconds:
+            raise ValueError(
+                "post_exit_stdio_hard_timeout_seconds must be >= "
+                "post_exit_stdio_grace_seconds"
+            )
+        self._read_chunk_bytes = read_chunk_bytes
+        self._normal_output_drain_policy = _OutputDrainPolicy(
+            idle_timeout_seconds=post_exit_stdio_grace_seconds,
+            hard_timeout_seconds=post_exit_stdio_hard_timeout_seconds,
+        )
+
+    async def execute_captured(
+        self, request: ExecRequest, *, capture: ExecCaptureSink,
+        signal: object | None = None, on_update: ExecUpdateCallback | None = None,
+    ) -> ExecResult:
+        validate_capture(capture)
+        return await self._execute(
+            bounded_capture_request(request), signal=signal, on_update=on_update,
+            capture=capture,
+        )
+
     async def __call__(
+        self, request: ExecRequest, *, signal: object | None = None,
+        on_update: ExecUpdateCallback | None = None,
+    ) -> ExecResult:
+        return await self._execute(request, signal=signal, on_update=on_update)
+
+    async def _execute(
         self,
         request: ExecRequest,
         *,
         signal: object | None = None,
         on_update: ExecUpdateCallback | None = None,
+        capture: ExecCaptureSink | None = None,
     ) -> ExecResult:
         assert request.effective_environment is not None
+        assert request.cwd is not None
+        capture_guard = None if capture is None else _CaptureSinkBorrow(capture)
+        capture = capture_guard
         env = dict(request.effective_environment)
 
-        process = await asyncio.create_subprocess_exec(
-            *request.command,
-            cwd=request.cwd,
-            env=env,
-            start_new_session=True,
-            stdin=asyncio.subprocess.PIPE if request.stdin is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        _validate_local_launch(request.command, request.cwd)
+        try:
+            process = await spawn_local_process(
+                command=request.command,
+                cwd=request.cwd,
+                environment=env,
+                pipe_stdin=request.stdin is not None,
+            )
+        except FileNotFoundError as exc:
+            raise _file_not_found_error(
+                command=request.command,
+                cwd=request.cwd,
+                cause=exc,
+            ) from exc
+        except OSError as exc:
+            raise ExecLaunchError(
+                "spawn_failed",
+                command=request.command,
+                cwd=request.cwd,
+                cause=exc,
+            ) from exc
 
         stdout_capture = _StreamCapture(
             stream_name="stdout",
             capture_full_output=request.capture_full_output,
+            retain_output_artifact=request.retain_output_artifacts,
             rolling_max_bytes=request.rolling_max_bytes,
             artifact_dir=request.artifact_dir,
         )
         stderr_capture = _StreamCapture(
             stream_name="stderr",
             capture_full_output=request.capture_full_output,
+            retain_output_artifact=request.retain_output_artifacts,
             rolling_max_bytes=request.rolling_max_bytes,
             artifact_dir=request.artifact_dir,
         )
@@ -99,63 +258,94 @@ class LocalExecBackend:
             capture_full_output=request.capture_full_output,
             rolling_max_bytes=request.rolling_max_bytes,
         )
+        activity = _OutputActivity(asyncio.get_running_loop().time())
+
+        async def _publish(
+            stream_name: Literal["stdout", "stderr"],
+            sink: _StreamCapture,
+            text: str,
+        ) -> None:
+            if not text:
+                return
+            activity.mark()
+            sink.append(text)
+            output_chunk = ExecOutputChunk(stream=stream_name, text=text)
+            output_capture.append(output_chunk)
+            if capture is not None:
+                await capture.append(output_chunk)
+            if on_update is not None:
+                update = on_update(output_chunk)
+                if inspect.isawaitable(update):
+                    await update
 
         async def _read_stream(
             stream_name: Literal["stdout", "stderr"],
             stream,
             sink: _StreamCapture,
         ) -> None:
-            while True:
-                chunk = await stream.readline()
-                if not chunk:
-                    break
-                text = chunk.decode("utf-8", errors="surrogateescape")
-                sink.append(text)
-                output_chunk = ExecOutputChunk(stream=stream_name, text=text)
-                output_capture.append(output_chunk)
-                if on_update is not None:
-                    update = on_update(output_chunk)
-                    if inspect.isawaitable(update):
-                        await update
-
-        stdout_task = asyncio.create_task(
-            _read_stream("stdout", process.stdout, stdout_capture)
-        )
-        stderr_task = asyncio.create_task(
-            _read_stream("stderr", process.stderr, stderr_capture)
-        )
-        wait_task = asyncio.create_task(process.wait())
-
-        if process.stdin is not None:
-            input_bytes = (
-                request.stdin.encode("utf-8", errors="surrogateescape")
-                if request.stdin is not None
-                else b""
-            )
+            chunk_bytes = self._read_chunk_bytes if capture is None else min(self._read_chunk_bytes, CAPTURE_READ_BYTES)
+            decoder = _IncrementalTextChunks(max_chunk_chars=chunk_bytes)
             try:
-                process.stdin.write(input_bytes)
-                await process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError):
-                # A short-lived command may exit without reading stdin. Its
-                # process result remains authoritative; a closed pipe is not
-                # an execution-service failure.
-                pass
+                while True:
+                    chunk = await stream.read(chunk_bytes)
+                    if not chunk:
+                        break
+                    activity.mark()
+                    for text in decoder.feed(chunk):
+                        await _publish(stream_name, sink, text)
+                    # A pipe can remain readable for many consecutive reads.
+                    # Give terminal input and the Working timer a scheduling
+                    # turn even when every read completes from the local buffer.
+                    await asyncio.sleep(0)
+            except BaseException:
+                if capture is not None:
+                    capture.stop_accepting()
+                raise
             finally:
-                process.stdin.close()
-                with suppress(BrokenPipeError, ConnectionResetError):
-                    await process.stdin.wait_closed()
+                for text in decoder.finish():
+                    await _publish(stream_name, sink, text)
+
+        stdout_task = _process_task(
+            _read_stream("stdout", process.stdout, stdout_capture), captured=capture is not None,
+        )
+        stderr_task = _process_task(
+            _read_stream("stderr", process.stderr, stderr_capture), captured=capture is not None,
+        )
+        root_exit_task = _process_task(_wait_for_root_process_exit(process), captured=capture is not None)
+        settlement_task = _process_task(process.wait(), captured=capture is not None)
 
         abort_task = (
-            asyncio.create_task(_wait_for_abort(signal)) if signal is not None else None
+            _process_task(_wait_for_abort(signal), captured=capture is not None) if signal is not None else None
         )
         timed_out = False
         cancelled = False
+        force_terminated = False
+        drain_outcome = _OutputDrainOutcome.complete()
+        stdin_task: asyncio.Task[None] | None = None
 
         try:
-            if request.timeout_seconds is None and abort_task is None:
-                await wait_task
+            if capture is not None:
+                stdin_task = _process_task(_write_process_stdin(process, request.stdin), captured=True)
+                reason = await wait_for_captured_process(
+                    exit_task=root_exit_task, stdin_task=stdin_task,
+                    readers=(stdout_task, stderr_task), abort_task=abort_task,
+                    timeout=request.timeout_seconds,
+                )
+                if reason != "exit":
+                    cancelled, timed_out = reason == "abort", reason == "timeout"
+                    force_terminated = True
+                    if cancelled:
+                        capture.stop_accepting()
+                    await _kill_process(process)
+                    await asyncio.shield(root_exit_task)
             else:
-                waiters: set[asyncio.Task[int] | asyncio.Task[None]] = {wait_task}
+                await _write_process_stdin(process, request.stdin)
+            if capture is not None:
+                pass
+            elif request.timeout_seconds is None and abort_task is None:
+                await asyncio.shield(root_exit_task)
+            else:
+                waiters: set[asyncio.Task[int] | asyncio.Task[None]] = {root_exit_task}
                 if abort_task is not None:
                     waiters.add(abort_task)
                 done, pending = await asyncio.wait(
@@ -163,27 +353,76 @@ class LocalExecBackend:
                     timeout=request.timeout_seconds,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                if wait_task in done:
+                if root_exit_task in done:
                     pass
                 elif abort_task is not None and abort_task in done:
                     cancelled = True
-                    _kill_process(process)
-                    await wait_task
+                    force_terminated = True
+                    await _kill_process(process)
+                    await asyncio.shield(root_exit_task)
                 else:
                     timed_out = True
-                    _kill_process(process)
-                    await wait_task
+                    force_terminated = True
+                    await _kill_process(process)
+                    await asyncio.shield(root_exit_task)
                 for task in pending:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError as error:
+            if capture is not None:
+                capture.stop_accepting()
+                capture.annotate(error)
+            force_terminated = True
+            await _kill_process(process)
+            if not root_exit_task.done():
+                await asyncio.shield(root_exit_task)
+            raise
+        except BaseException as error:
+            if capture is not None:
+                capture.stop_accepting()
+                capture.annotate(error)
+            raise
         finally:
-            if abort_task is not None and not abort_task.done():
-                abort_task.cancel()
-                await asyncio.gather(abort_task, return_exceptions=True)
-            await asyncio.gather(stdout_task, stderr_task)
-            stdout_capture.close()
-            stderr_capture.close()
+            async def finish_process() -> None:
+                nonlocal force_terminated, drain_outcome
+                if abort_task is not None and not abort_task.done():
+                    abort_task.cancel()
+                    await asyncio.gather(abort_task, return_exceptions=True)
+                if not root_exit_task.done():
+                    force_terminated = True
+                    await _kill_process(process)
+                    await asyncio.shield(root_exit_task)
+                try:
+                    if stdin_task is not None:
+                        await _cancel_tasks({stdin_task})
+                    activity.mark()
+                    drain_outcome = await _drain_output_tasks(
+                        process, (stdout_task, stderr_task), activity=activity,
+                        policy=(_FORCED_OUTPUT_DRAIN_POLICY if force_terminated
+                                else self._normal_output_drain_policy),
+                    )
+                finally:
+                    _close_reader_transport(process.stdout)
+                    _close_reader_transport(process.stderr)
+                    try:
+                        await settlement_task
+                    finally:
+                        stdout_capture.close()
+                        stderr_capture.close()
 
+            if capture is None:
+                await finish_process()
+            else:
+                # This mandatory cleanup must not be published through an
+                # external task factory after the process is already owned.
+                cleanup_task = _process_task(
+                    finish_process(), captured=True,
+                    name="harness-captured-local-cleanup",
+                )
+                await _await_cancellation_atomic(cleanup_task)
+
+        if capture_guard is not None and capture_guard.stop_error is not None:
+            raise capture_guard.stop_error
         stdout = stdout_capture.content
         stderr = stderr_capture.content
         stdout_preview, stdout_artifact_path = _build_preview_from_capture(
@@ -219,13 +458,529 @@ class LocalExecBackend:
             stdout_total_bytes=stdout_capture.total_bytes,
             stderr_total_lines=stderr_capture.total_lines,
             stderr_total_bytes=stderr_capture.total_bytes,
+            stdio_complete=drain_outcome.is_complete,
+            stdio_drain_reason=drain_outcome.reason,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class AuthorizedProcessExecBackend:
+    """Adapt one graph-authorized process launcher to the Exec backend contract.
+
+    The launcher remains the sole process authority. This adapter owns only the
+    Product-neutral Exec lifecycle: cancellation/timeout races, bounded stdout
+    draining, output retention, and result projection.
+    """
+
+    launcher: AuthorizedProcessLauncher
+    post_exit_stdout_timeout_seconds: float = 2.0
+    forced_stdout_timeout_seconds: float = 0.5
+
+    def __post_init__(self) -> None:
+        if not callable(getattr(self.launcher, "start", None)):
+            raise TypeError("Authorized process Exec backend requires a launcher")
+        for name, value in (
+            ("post-exit stdout timeout", self.post_exit_stdout_timeout_seconds),
+            ("forced stdout timeout", self.forced_stdout_timeout_seconds),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                raise TypeError(f"Authorized process {name} must be numeric")
+            if value <= 0:
+                raise ValueError(f"Authorized process {name} must be positive")
+
+    async def execute_captured(
+        self, request: ExecRequest, *, capture: ExecCaptureSink,
+        signal: object | None = None, on_update: ExecUpdateCallback | None = None,
+    ) -> ExecResult:
+        validate_capture(capture)
+        return await self._execute(
+            bounded_capture_request(request), signal=signal, on_update=on_update,
+            capture=capture,
+        )
+
+    async def __call__(
+        self, request: ExecRequest, *, signal: object | None = None,
+        on_update: ExecUpdateCallback | None = None,
+    ) -> ExecResult:
+        return await self._execute(request, signal=signal, on_update=on_update)
+
+    async def _execute(
+        self,
+        request: ExecRequest,
+        *,
+        signal: object | None = None,
+        on_update: ExecUpdateCallback | None = None,
+        capture: ExecCaptureSink | None = None,
+    ) -> ExecResult:
+        if not isinstance(request, ExecRequest):
+            raise TypeError("Authorized process execution requires an ExecRequest")
+        if request.cwd is None or request.effective_environment is None:
+            raise ValueError("Authorized process execution requires a frozen request")
+        capture_guard = None if capture is None else _CaptureSinkBorrow(capture)
+        capture = capture_guard
+        handle = await self.launcher.start(
+            ProcessLaunchRequest(
+                command=request.command,
+                cwd=request.cwd,
+                effective_environment=request.effective_environment,
+                stream_stderr=True,
+            ),
+            correlation_id=f"workspace-exec:{uuid4().hex}",
+            signal=signal,
+        )
+        stdout_capture = _StreamCapture(
+            stream_name="stdout",
+            capture_full_output=request.capture_full_output,
+            retain_output_artifact=request.retain_output_artifacts,
+            rolling_max_bytes=request.rolling_max_bytes,
+            artifact_dir=request.artifact_dir,
+        )
+        stderr_capture = _StreamCapture(
+            stream_name="stderr",
+            capture_full_output=request.capture_full_output,
+            retain_output_artifact=request.retain_output_artifacts,
+            rolling_max_bytes=request.rolling_max_bytes,
+            artifact_dir=request.artifact_dir,
+        )
+        output_capture = _OutputCapture(
+            capture_full_output=request.capture_full_output,
+            rolling_max_bytes=request.rolling_max_bytes,
+        )
+
+        async def publish(
+            chunk: ExecOutputChunk,
+            stream_capture: _StreamCapture,
+        ) -> None:
+            if not chunk.text:
+                return
+            stream_capture.append(chunk.text)
+            output_capture.append(chunk)
+            if capture is not None:
+                await capture.append(chunk)
+            if on_update is not None:
+                update = on_update(chunk)
+                if inspect.isawaitable(update):
+                    await update
+
+        async def drain_stream(
+            stream_name: Literal["stdout", "stderr"],
+        ) -> None:
+            decoder = _IncrementalTextChunks(max_chunk_chars=64 * 1024 if capture is None else CAPTURE_READ_BYTES)
+            try:
+                while True:
+                    read = handle.read_stdout if stream_name == "stdout" else handle.read_stderr
+                    content = await read() if capture is None else await read(CAPTURE_READ_BYTES)
+                    if not content:
+                        return
+                    for text in decoder.feed(content):
+                        await publish(
+                            ExecOutputChunk(stream=stream_name, text=text),
+                            stdout_capture
+                            if stream_name == "stdout"
+                            else stderr_capture,
+                        )
+            except BaseException:
+                if capture is not None:
+                    capture.stop_accepting()
+                raise
+            finally:
+                for text in decoder.finish():
+                    await publish(
+                        ExecOutputChunk(stream=stream_name, text=text),
+                        stdout_capture
+                        if stream_name == "stdout"
+                        else stderr_capture,
+                    )
+
+        drain_tasks = (
+            _process_task(drain_stream("stdout"), captured=capture is not None),
+            _process_task(drain_stream("stderr"), captured=capture is not None),
+        )
+        wait_task: asyncio.Task[ProcessExit] | None = None
+        abort_task = (
+            _process_task(_wait_for_abort(signal), captured=capture is not None) if signal is not None else None
+        )
+        timed_out = False
+        cancelled = False
+        stdio_complete = True
+        exit_status: ProcessExit | None = None
+        result: ExecResult | None = None
+        operation_error: BaseException | None = None
+        stdin_task: asyncio.Task[None] | None = None
+
+        async def write_input() -> None:
+            if request.stdin is not None:
+                await handle.write_stdin(request.stdin.encode("utf-8", errors="surrogateescape"))
+            await handle.close_stdin()
+
+        try:
+            if capture is not None:
+                wait_task = _process_task(handle.wait(), captured=True)
+                stdin_task = _process_task(write_input(), captured=True)
+                reason = await wait_for_captured_process(
+                    exit_task=wait_task, stdin_task=stdin_task, readers=drain_tasks,
+                    abort_task=abort_task, timeout=request.timeout_seconds,
+                )
+                if reason == "exit":
+                    exit_status = wait_task.result()
+                else:
+                    cancelled, timed_out = reason == "abort", reason == "timeout"
+                    if cancelled:
+                        capture.stop_accepting()
+                    exit_status = await handle.terminate()
+                await _cancel_tasks({stdin_task})
+            else:
+                await write_input()
+                wait_task = asyncio.create_task(handle.wait())
+            if capture is not None:
+                pass
+            elif request.timeout_seconds is None and abort_task is None:
+                exit_status = await wait_task
+            else:
+                waiters: set[asyncio.Task[object]] = {
+                    wait_task,  # type: ignore[arg-type]
+                }
+                if abort_task is not None:
+                    waiters.add(abort_task)  # type: ignore[arg-type]
+                done, _ = await asyncio.wait(
+                    waiters,
+                    timeout=request.timeout_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if wait_task in done:
+                    exit_status = wait_task.result()
+                elif abort_task is not None and abort_task in done:
+                    cancelled = True
+                    exit_status = await handle.terminate()
+                else:
+                    timed_out = True
+                    exit_status = await handle.terminate()
+            if wait_task is not None and not wait_task.done():
+                wait_task.cancel()
+                await asyncio.gather(wait_task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*drain_tasks),
+                    timeout=(
+                        self.forced_stdout_timeout_seconds
+                        if timed_out or cancelled
+                        else self.post_exit_stdout_timeout_seconds
+                    ),
+                )
+            except TimeoutError:
+                stdio_complete = False
+                await asyncio.gather(*drain_tasks, return_exceptions=True)
+            assert exit_status is not None
+            if capture_guard is not None and capture_guard.stop_error is not None:
+                raise capture_guard.stop_error
+            stdout_capture.close()
+            stderr_capture.close()
+            stdout = stdout_capture.content
+            stderr = stderr_capture.content
+            stdout_preview, stdout_artifact_path = _build_preview_from_capture(
+                stdout_capture,
+                max_lines=request.preview_max_lines,
+                max_bytes=request.preview_max_bytes,
+            )
+            stderr_preview, stderr_artifact_path = _build_preview_from_capture(
+                stderr_capture,
+                max_lines=request.preview_max_lines,
+                max_bytes=request.preview_max_bytes,
+            )
+            result = ExecResult(
+                exit_code=exit_status.return_code,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=timed_out,
+                cancelled=cancelled,
+                stdout_chunks=tuple(stdout_capture.chunks),
+                stderr_chunks=tuple(stderr_capture.chunks),
+                output_chunks=tuple(output_capture.chunks),
+                stdout_preview=stdout_preview.content,
+                stderr_preview=stderr_preview.content,
+                stdout_truncated=stdout_preview.truncated,
+                stdout_truncated_by=stdout_preview.truncated_by,
+                stderr_truncated=stderr_preview.truncated,
+                stderr_truncated_by=stderr_preview.truncated_by,
+                stdout_artifact_path=stdout_artifact_path,
+                stderr_artifact_path=stderr_artifact_path,
+                stdout_total_lines=stdout_capture.total_lines,
+                stdout_total_bytes=stdout_capture.total_bytes,
+                stderr_total_lines=stderr_capture.total_lines,
+                stderr_total_bytes=stderr_capture.total_bytes,
+                stdio_complete=stdio_complete,
+                stdio_drain_reason=None if stdio_complete else "hard_timeout",
+            )
+        except BaseException as error:
+            operation_error = error
+            if capture is not None:
+                capture.stop_accepting()
+                capture.annotate(error)
+
+        cleanup_task = _process_task(
+            _cleanup_authorized_process(
+                handle,
+                (wait_task, abort_task, *drain_tasks, stdin_task),
+                terminate=operation_error is not None,
+            ),
+            captured=capture is not None,
+            name="harness-authorized-process-cleanup",
+        )
+        cleanup_error: BaseException | None = None
+        try:
+            await _await_cancellation_atomic(cleanup_task)
+        except BaseException as error:
+            cleanup_error = error
+            if (
+                isinstance(error, asyncio.CancelledError)
+                and operation_error is not None
+                and cleanup_task.done()
+                and not cleanup_task.cancelled()
+            ):
+                try:
+                    cleanup_task.result()
+                except BaseException as task_error:
+                    cleanup_error = task_error
+                else:
+                    # Preserve the first operation cancellation/error after the
+                    # owned cleanup has survived any repeated cancellation.
+                    cleanup_error = None
+        finally:
+            stdout_capture.close()
+            stderr_capture.close()
+            if operation_error is not None or cleanup_error is not None:
+                stdout_capture.discard_artifact()
+                stderr_capture.discard_artifact()
+
+        if operation_error is not None:
+            if cleanup_error is not None:
+                operation_error.add_note(
+                    f"Authorized process cleanup also failed: {cleanup_error!r}"
+                )
+            raise operation_error.with_traceback(operation_error.__traceback__)
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
+        assert result is not None
+        return result
+
+
+async def _cleanup_authorized_process(
+    handle: ProcessHandle,
+    tasks: tuple[asyncio.Task[Any] | None, ...],
+    *,
+    terminate: bool,
+) -> None:
+    primary_error: BaseException | None = None
+    if terminate:
+        try:
+            await handle.terminate()
+        except BaseException as error:
+            primary_error = error
+    for task in tasks:
+        if task is not None and not task.done():
+            task.cancel()
+    if any(task is not None for task in tasks):
+        await asyncio.gather(
+            *(task for task in tasks if task is not None),
+            return_exceptions=True,
+        )
+    try:
+        await handle.close()
+    except BaseException as error:
+        if primary_error is None:
+            primary_error = error
+        else:
+            primary_error.add_note(f"Authorized process close also failed: {error!r}")
+    if primary_error is not None:
+        raise primary_error
+
+
+@dataclass
+class _OutputActivity:
+    last_at: float
+
+    def mark(self) -> None:
+        self.last_at = asyncio.get_running_loop().time()
+
+
+@dataclass(frozen=True)
+class _OutputDrainPolicy:
+    idle_timeout_seconds: float
+    hard_timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class _OutputDrainOutcome:
+    reason: StdioDrainReason | None
+
+    @property
+    def is_complete(self) -> bool:
+        return self.reason is None
+
+    @classmethod
+    def complete(cls) -> _OutputDrainOutcome:
+        return cls(reason=None)
+
+
+_FORCED_OUTPUT_DRAIN_POLICY = _OutputDrainPolicy(
+    idle_timeout_seconds=0.1,
+    hard_timeout_seconds=0.5,
+)
+
+
+class _IncrementalTextChunks:
+    def __init__(self, *, max_chunk_chars: int) -> None:
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
+        self._max_chunk_chars = max_chunk_chars
+        self._pending = ""
+
+    def feed(self, content: bytes) -> tuple[str, ...]:
+        self._pending += self._decoder.decode(content, final=False)
+        return self._take_chunks(final=False)
+
+    def finish(self) -> tuple[str, ...]:
+        self._pending += self._decoder.decode(b"", final=True)
+        return self._take_chunks(final=True)
+
+    def _take_chunks(self, *, final: bool) -> tuple[str, ...]:
+        chunks: list[str] = []
+        while self._pending:
+            newline_index = self._pending.find("\n")
+            if 0 <= newline_index < self._max_chunk_chars:
+                boundary = newline_index + 1
+            elif len(self._pending) >= self._max_chunk_chars:
+                boundary = self._max_chunk_chars
+            elif final:
+                boundary = len(self._pending)
+            else:
+                break
+            chunks.append(self._pending[:boundary])
+            self._pending = self._pending[boundary:]
+        return tuple(chunks)
+
+
+def _validate_local_launch(command: tuple[str, ...], cwd: str) -> None:
+    if not cwd or not os.path.exists(cwd):
+        raise ExecLaunchError("cwd_not_found", command=command, cwd=cwd)
+    if not os.path.isdir(cwd):
+        raise ExecLaunchError("cwd_not_directory", command=command, cwd=cwd)
+    if not command or not command[0]:
+        raise ExecLaunchError("executable_not_found", command=command, cwd=cwd)
+
+
+def _file_not_found_error(
+    *,
+    command: tuple[str, ...],
+    cwd: str,
+    cause: FileNotFoundError,
+) -> ExecLaunchError:
+    if not os.path.exists(cwd):
+        kind: ExecLaunchErrorKind = "cwd_not_found"
+    elif not os.path.isdir(cwd):
+        kind = "cwd_not_directory"
+    else:
+        kind = "executable_not_found"
+    return ExecLaunchError(kind, command=command, cwd=cwd, cause=cause)
+
+
+async def _wait_for_root_process_exit(
+    process: asyncio.subprocess.Process,
+) -> int:
+    # asyncio's public Process.wait() settles only after pipe transports close.
+    # A descendant may inherit those pipes after the root has already exited,
+    # so observe the root return code separately before applying drain grace.
+    while process.returncode is None:
+        await asyncio.sleep(0.01)
+    return process.returncode
+
+
+async def _write_process_stdin(
+    process: asyncio.subprocess.Process,
+    content: str | None,
+) -> None:
+    if process.stdin is None:
+        return
+    input_bytes = (
+        content.encode("utf-8", errors="surrogateescape")
+        if content is not None
+        else b""
+    )
+    try:
+        process.stdin.write(input_bytes)
+        await process.stdin.drain()
+    except (BrokenPipeError, ConnectionResetError):
+        # A short-lived command may exit without reading stdin. Its process
+        # result remains authoritative; a closed pipe is not an exec failure.
+        pass
+    finally:
+        process.stdin.close()
+        with suppress(BrokenPipeError, ConnectionResetError):
+            await process.stdin.wait_closed()
+
+
+async def _drain_output_tasks(
+    process: asyncio.subprocess.Process,
+    tasks: tuple[asyncio.Task[None], asyncio.Task[None]],
+    *,
+    activity: _OutputActivity,
+    policy: _OutputDrainPolicy,
+) -> _OutputDrainOutcome:
+    loop = asyncio.get_running_loop()
+    hard_deadline = loop.time() + policy.hard_timeout_seconds
+    pending = set(tasks)
+    while pending:
+        idle_deadline = activity.last_at + policy.idle_timeout_seconds
+        remaining = max(
+            0.0,
+            min(idle_deadline, hard_deadline) - loop.time(),
+        )
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if done:
+            try:
+                for task in done:
+                    task.result()
+            except BaseException:
+                await _cancel_tasks(pending)
+                raise
+            continue
+        now = loop.time()
+        if now >= hard_deadline:
+            reason: StdioDrainReason = "hard_timeout"
+        elif now >= activity.last_at + policy.idle_timeout_seconds:
+            reason = "idle_timeout"
+        else:
+            continue
+
+        _close_reader_transport(process.stdout)
+        _close_reader_transport(process.stderr)
+        await _cancel_tasks(pending)
+        return _OutputDrainOutcome(reason=reason)
+    return _OutputDrainOutcome.complete()
+
+
+async def _cancel_tasks(tasks: set[asyncio.Task[None]]) -> None:
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _close_reader_transport(stream: object | None) -> None:
+    transport = getattr(stream, "_transport", None)
+    close = getattr(transport, "close", None)
+    if callable(close):
+        close()
 
 
 @dataclass
 class _StreamCapture:
     stream_name: str
     capture_full_output: bool
+    retain_output_artifact: bool
     rolling_max_bytes: int
     artifact_dir: str | None
     chunks: list[str] = field(default_factory=list)
@@ -235,6 +990,8 @@ class _StreamCapture:
     _rolled: bool = False
     _total_bytes: int = 0
     _total_lines: int = 0
+    _line_open: bool = False
+    _last_was_carriage_return: bool = False
 
     @property
     def content(self) -> str:
@@ -260,20 +1017,43 @@ class _StreamCapture:
         if not text:
             return
         self._total_bytes += len(_output_bytes(text))
-        self._total_lines += len(text.splitlines())
+        self._record_lines(text)
         if self.capture_full_output:
             self.chunks.append(text)
             return
 
-        self._ensure_artifact_handle().write(text)
+        # Rolling previews do not require a disk spool when retention is off.
+        # This also keeps the no-retention fallback free of temporary-file IO.
+        if self.retain_output_artifact:
+            self._ensure_artifact_handle().write(text)
         self.chunks.append(text)
         self._chunk_bytes += len(_output_bytes(text))
         self._trim_rolling_chunks()
 
     def close(self) -> None:
+        if self._line_open:
+            self._total_lines += 1
+            self._line_open = False
         if self._artifact_handle is not None:
             self._artifact_handle.close()
             self._artifact_handle = None
+        if not self.retain_output_artifact:
+            self.discard_artifact()
+
+    def _record_lines(self, text: str) -> None:
+        for character in text:
+            if character == "\r":
+                self._total_lines += 1
+                self._line_open = False
+                self._last_was_carriage_return = True
+            elif character == "\n":
+                if not self._last_was_carriage_return:
+                    self._total_lines += 1
+                self._line_open = False
+                self._last_was_carriage_return = False
+            else:
+                self._line_open = True
+                self._last_was_carriage_return = False
 
     def discard_artifact(self) -> None:
         if self._artifact_path is None:
@@ -350,19 +1130,8 @@ class _OutputCapture:
         self._chunk_bytes = len(_output_bytes(trimmed))
 
 
-def _kill_process(process: asyncio.subprocess.Process) -> None:
-    try:
-        if process.pid is not None:
-            os.killpg(process.pid, signal_module.SIGKILL)
-        else:
-            process.kill()
-    except ProcessLookupError:
-        return
-    except OSError:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            return
+async def _kill_process(process: asyncio.subprocess.Process) -> None:
+    await kill_local_process_tree(process)
 
 
 async def _wait_for_abort(signal: object | None) -> None:
@@ -394,6 +1163,15 @@ def _build_preview_from_capture(
     max_bytes: int,
 ):
     if capture.capture_full_output:
+        if not capture.retain_output_artifact:
+            return (
+                truncate_tail(
+                    capture.content,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                ),
+                None,
+            )
         return _build_preview(
             capture.content,
             max_lines=max_lines,
@@ -436,4 +1214,9 @@ def _output_bytes(content: str) -> bytes:
     return content.encode("utf-8", errors="surrogateescape")
 
 
-__all__ = ["ExecBackend", "ExecService", "LocalExecBackend"]
+__all__ = [
+    "AuthorizedProcessExecBackend",
+    "ExecBackend",
+    "ExecService",
+    "LocalExecBackend",
+]

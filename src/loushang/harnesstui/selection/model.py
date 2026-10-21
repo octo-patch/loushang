@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Literal, cast
+from typing import Literal
 
 from loushang.tui import (
     InputEvent,
@@ -11,11 +11,22 @@ from loushang.tui import (
     RenderResult,
     SelectionSurface,
     SelectItem,
+    ThemeResolver,
     apply_theme_style,
+    visible_width,
 )
-from loushang.tui.input import InputIntentKind
 
 MODEL_SELECTOR_SELECTED_STYLE = {"color": 33, "bold": True}
+MODEL_SELECTOR_THEME = ThemeResolver(
+    defaults={
+        "surface.title": {"bold": True, "color": "cyan"},
+        "surface.subtitle": {"color": "bright_black"},
+        "surface.footer": {"color": "bright_black", "dim": True},
+        "model_selector.error": {"color": "bright_red"},
+        "model_selector.recovery": {"color": "yellow"},
+        "model_selector.search": {"bold": True, "color": "cyan"},
+    }
+)
 
 
 @dataclass(slots=True)
@@ -24,6 +35,7 @@ class ModelSelectorSurface:
     scoped_items: tuple[SelectItem, ...] = ()
     selected_value: str | None = None
     max_visible: int = 10
+    theme: ThemeResolver = field(default_factory=lambda: MODEL_SELECTOR_THEME)
     _scope: Literal["all", "scoped"] = field(default="all", init=False)
     _surface: SelectionSurface = field(init=False, repr=False)
     _filter_text: str = field(default="", init=False, repr=False)
@@ -40,7 +52,16 @@ class ModelSelectorSurface:
     def blur(self) -> None:
         self._surface.blur()
 
-    def handle_input(self, event: InputEvent) -> InputIntent | None:
+    @property
+    def footer_help(self) -> str:
+        if self._filter_text:
+            return "↑/↓ choose · Enter switch · Esc keep current"
+        return (
+            "Type to filter · ↑/↓ choose · Enter switch · "
+            "1–9 quick select · Esc keep current"
+        )
+
+    def handle_input(self, event: InputEvent) -> InputIntent[str] | None:
         if event.kind == "text":
             consumed, quick_select = self._handle_ordinal_text(event.text)
             if consumed:
@@ -98,9 +119,14 @@ class ModelSelectorSurface:
             empty_text="No matching models",
             show_scroll_info=False,
             selected_style=MODEL_SELECTOR_SELECTED_STYLE,
+            theme=self.theme,
+            search_prompt=apply_theme_style(
+                "Search: ", self.theme.resolve("model_selector.search")
+            ),
             enable_search=True,
             show_search_when_empty=False,
             filter_mode="contains",
+            primary_column_width=_model_primary_column_width(items),
         )
         if self._filter_text:
             self._surface.set_filter(self._filter_text)
@@ -120,7 +146,7 @@ class ModelSelectorSurface:
         all_models = apply_theme_style("all", MODEL_SELECTOR_SELECTED_STYLE)
         return f"Scope: {all_models} | scoped"
 
-    def _handle_ordinal_text(self, text: str) -> tuple[bool, InputIntent | None]:
+    def _handle_ordinal_text(self, text: str) -> tuple[bool, InputIntent[str] | None]:
         if (
             self._surface.filter_text
             or not text
@@ -138,7 +164,7 @@ class ModelSelectorSurface:
                 return True, intent
         return consumed, None
 
-    def _handle_ordinal_digit(self, digit: str) -> tuple[bool, InputIntent | None]:
+    def _handle_ordinal_digit(self, digit: str) -> tuple[bool, InputIntent[str] | None]:
         items = self._current_items()
         if not items:
             self._pending_ordinal = ""
@@ -163,7 +189,7 @@ class ModelSelectorSurface:
         self._pending_ordinal = candidate
         return True, None
 
-    def _select_pending_ordinal(self) -> InputIntent | None:
+    def _select_pending_ordinal(self) -> InputIntent[str] | None:
         if not self._pending_ordinal:
             return None
         pending = self._pending_ordinal
@@ -172,7 +198,7 @@ class ModelSelectorSurface:
             return None
         return self._select_ordinal(int(pending))
 
-    def _select_ordinal(self, ordinal: int) -> InputIntent | None:
+    def _select_ordinal(self, ordinal: int) -> InputIntent[str] | None:
         index = ordinal - 1
         items = self._current_items()
         if index < 0 or index >= len(items):
@@ -216,17 +242,29 @@ def _selected_model_item_index(
     return 0
 
 
-def _screen_input_intent_or_none(result: object) -> InputIntent | None:
+def _model_primary_column_width(items: tuple[SelectItem, ...]) -> int | None:
+    """Reserve enough room to distinguish complete model identities when possible."""
+
+    if not items:
+        return None
+    return max(visible_width(item.label or item.selected_value) + 2 for item in items)
+
+
+def _screen_input_intent_or_none(result: object) -> InputIntent[str] | None:
     if isinstance(result, InputIntent):
         return result
     kind = getattr(result, "kind", None)
     if not isinstance(kind, str):
         return None
     return InputIntent(
-        kind=cast(InputIntentKind, kind),
+        kind=kind,
         text=str(getattr(result, "text", "")),
         note=str(getattr(result, "note", "")),
     )
 
 
-__all__ = ["MODEL_SELECTOR_SELECTED_STYLE", "ModelSelectorSurface"]
+__all__ = [
+    "MODEL_SELECTOR_SELECTED_STYLE",
+    "MODEL_SELECTOR_THEME",
+    "ModelSelectorSurface",
+]

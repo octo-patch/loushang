@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
+import loushang.harness.session.inspection_projection as inspection_projection
 from loushang.agent import Agent
 from loushang.ai.model import Capabilities, Model, ModelSelection
 from loushang.ai.types import (
@@ -16,6 +18,7 @@ from loushang.coding.session_manager import SessionManager
 from loushang.harness.conversation import CommandExecutionRecord
 from loushang.harness.runtime.types import RunState
 from loushang.harness.session import AgentSessionInspector
+from loushang.harness.session.inspection import TokenUsageTotals
 from loushang.harness.session.inspection_projection import (
     project_fork_candidates,
     project_session_stats,
@@ -58,6 +61,7 @@ def _assistant_message(
     text: str = "answer", *, total_tokens: int = 17, stop_reason: str = "toolUse"
 ) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[
             TextPart(type="text", text=text),
@@ -81,6 +85,7 @@ def _assistant_message(
 
 def _tool_only_assistant_message() -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[
             ToolCall(
@@ -152,7 +157,7 @@ def test_session_view_controller_builds_usage_and_pi_stats(tmp_path) -> None:
         is_retrying=True,
         is_compacting=False,
         model_selection=ModelSelection(
-            provider="faux", model_id="faux-model"
+            endpoint_id="test-endpoint", provider="faux", model_id="faux-model"
         ),
     )
 
@@ -172,7 +177,7 @@ def test_session_view_controller_builds_usage_and_pi_stats(tmp_path) -> None:
     assert stats.active_tool_count == 2
     assert stats.is_retrying is True
     assert stats.last_model_selection == ModelSelection(
-        provider="faux", model_id="faux-model"
+        endpoint_id="test-endpoint", provider="faux", model_id="faux-model"
     )
     pi_stats = project_session_stats(
         agent=agent,
@@ -194,6 +199,8 @@ def test_session_view_controller_builds_usage_and_pi_stats(tmp_path) -> None:
             "cache_read": 5,
             "cache_write": 7,
             "total": 17,
+            "source": "legacy_derived",
+            "incomplete_attempts": True,
         },
         "cost": 0.25,
         "context_usage": None,
@@ -206,6 +213,47 @@ def test_session_view_controller_builds_usage_and_pi_stats(tmp_path) -> None:
     assert pi_usage["compactPercent"] == usage.compact_percent
     assert pi_usage["thresholdReason"] == usage.threshold_reason
     assert "message_count" not in pi_usage
+
+
+def test_session_stats_projection_preserves_durable_usage_authority(
+    monkeypatch,
+) -> None:
+    expected = TokenUsageTotals(
+        input=30,
+        output=5,
+        cache_read=2,
+        cache_write=1,
+        total=38,
+        source="attempt_usage_facts",
+        incomplete_attempts=False,
+    )
+    monkeypatch.setattr(
+        inspection_projection,
+        "_build_token_usage_totals",
+        lambda entries: expected,
+    )
+    agent = SimpleNamespace(state=SimpleNamespace(messages=[]))
+    manager = SimpleNamespace(
+        get_session_file=lambda: None,
+        get_session_record=lambda: SimpleNamespace(session_id="session-1"),
+        get_branch=lambda: (),
+    )
+
+    projected = project_session_stats(
+        agent=agent,
+        session_manager=manager,
+        context_usage=None,
+    )
+
+    assert projected["tokens"] == {
+        "input": 30,
+        "output": 5,
+        "cache_read": 2,
+        "cache_write": 1,
+        "total": 38,
+        "source": "attempt_usage_facts",
+        "incomplete_attempts": False,
+    }
 
 
 def test_session_view_controller_reports_unknown_current_context_after_compaction(
@@ -259,9 +307,12 @@ def test_session_view_controller_reports_unknown_current_context_after_compactio
 
     assert usage is not None
     assert usage.has_compaction is True
-    assert usage.tokens is None
+    assert usage.tokens is not None
     assert usage.context_window == 128000
-    assert usage.percent is None
+    assert usage.percent is not None
+    assert usage.authority == "local_estimator"
+    assert usage.accuracy == "estimated"
+    assert usage.surface_fingerprint is not None
 
     pi_stats = project_session_stats(
         agent=agent,
@@ -410,7 +461,7 @@ def test_session_view_controller_builds_state_snapshot(tmp_path) -> None:
         is_retrying=True,
         is_compacting=False,
         model_selection=ModelSelection(
-            provider="faux", model_id="faux-model"
+            endpoint_id="test-endpoint", provider="faux", model_id="faux-model"
         ),
     )
 

@@ -8,6 +8,7 @@ from loushang.ai.event_stream.raw_parts import RawPart
 from loushang.ai.model.domain import OpenAIResponsesConfig
 from loushang.ai.options import get_reasoning_summary
 from loushang.ai.output_budget import resolve_output_token_budget
+from loushang.ai.prepared_request import invoke_prepared_request
 from loushang.ai.protocols._helpers import (
     canonicalize_sdk_headers,
     close_provider_stream,
@@ -18,10 +19,12 @@ from loushang.ai.protocols._openai_responses import (
     process_responses_response,
     process_responses_stream,
 )
-from loushang.ai.provider import ProviderRequest
+from loushang.ai.protocols._openai_sdk import OPENAI_SDK_API_KEY_PLACEHOLDER
+from loushang.ai.provider import PreparedModelRequest, ProviderRequest
 from loushang.ai.provider.errors import provider_error_part
 from loushang.ai.structured import openai_responses_text_format
 from loushang.ai.trace import emit_trace as _emit_trace
+from loushang.ai.utils.async_iter import close_async_source
 
 
 def _resolve_cache_retention(options: object | None) -> str | None:
@@ -95,6 +98,14 @@ class OpenAIResponsesAdapter:
         self._client = client
 
     async def invoke_raw(self, request: ProviderRequest) -> AsyncIterator[RawPart]:
+        source = invoke_prepared_request(self, request)
+        try:
+            async for part in source:
+                yield part
+        finally:
+            await close_async_source(source)
+
+    def prepare_request(self, request: ProviderRequest) -> PreparedModelRequest:
         model = request.model
         options = request.options
         resolved = request
@@ -110,17 +121,6 @@ class OpenAIResponsesAdapter:
             adapter_config=adapter_config,
             options=options,
         )
-
-        # 延迟导入 OpenAI SDK
-        try:
-            from openai import AsyncOpenAI, Omit  # type: ignore
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "openai SDK is not installed. Install via `pip install openai`"
-            ) from e
-
-        headers = resolved.headers or {}
-        default_headers = canonicalize_sdk_headers(headers)
 
         # 构造 Responses API 输入。下一步会继续向 pi-ai 的 shared conversion 收敛。
         capabilities = model.capabilities
@@ -139,20 +139,6 @@ class OpenAIResponsesAdapter:
             adapter_config=adapter_config,
             cache_retention=cache_retention,
         )
-        client = self._client or AsyncOpenAI(  # type: ignore[call-arg]
-            api_key="",
-            base_url=resolved.base_url,
-        )
-        _debug(
-            "client",
-            {
-                "api": model.api,
-                "provider": model.provider_id,
-                "endpoint": model.endpoint_id,
-                "model": model.id,
-            },
-        )
-
         upstream_model_id = model.upstream_id or model.id
         is_stream_request = getattr(resolved, "mode", "stream") == "stream"
         params: dict[str, Any] = {
@@ -216,40 +202,93 @@ class OpenAIResponsesAdapter:
                 "tool_count": len(mapped_tools or []),
             },
         )
-        params["extra_headers"] = {
-            "Authorization": Omit(),
-            "X-Api-Key": Omit(),
-            **default_headers,
-        }
+        return PreparedModelRequest.from_provider_request(request, payload=params)
 
-        # 发送请求
+    async def invoke_prepared_raw(
+        self,
+        request: ProviderRequest,
+        prepared: PreparedModelRequest,
+    ) -> AsyncIterator[RawPart]:
+        model = request.model
+        options = request.options
+        resolved = request
+
+        def _debug(event: str, data: dict | None = None) -> None:
+            _emit_trace(options, {"type": f"sdk:{event}", **(data or {})})
+
         try:
-            response = await client.responses.create(**params)
-        except Exception as e:
-            _debug("stream_error", {"exceptionType": type(e).__name__})
-            yield provider_error_part(e, source=self.api)
-            return
-        if not is_stream_request:
-            for part in process_responses_response(
+            from openai import AsyncOpenAI, Omit  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "openai SDK is not installed. Install via `pip install openai`"
+            ) from e
+
+        default_headers = canonicalize_sdk_headers(resolved.headers or {})
+        client: Any
+        if self._client is None:
+            owns_client = True
+            client = AsyncOpenAI(  # type: ignore[call-arg]
+                api_key=OPENAI_SDK_API_KEY_PLACEHOLDER,
+                base_url=resolved.base_url,
+            )
+        else:
+            owns_client = False
+            client = self._client
+        try:
+            _debug(
+                "client",
+                {
+                    "api": model.api,
+                    "provider": model.provider_id,
+                    "endpoint": model.endpoint_id,
+                    "model": model.id,
+                },
+            )
+
+            params: dict[str, Any] = prepared.payload_for_transport()
+            params["extra_headers"] = {
+                "Authorization": Omit(),
+                "X-Api-Key": Omit(),
+                **default_headers,
+            }
+
+            # 发送请求
+            is_stream_request = getattr(resolved, "mode", "stream") == "stream"
+            try:
+                response = await client.responses.create(**params)
+            except Exception as e:
+                _debug("stream_error", {"exceptionType": type(e).__name__})
+                yield provider_error_part(e, source=self.api)
+                return
+            if not is_stream_request:
+                for part in process_responses_response(
+                    response,
+                    reasoning_enabled=resolved.reasoning_enabled is True,
+                    source=self.api,
+                ):
+                    yield part
+                return
+
+            parts = process_responses_stream(
                 response,
                 reasoning_enabled=resolved.reasoning_enabled is True,
                 source=self.api,
-            ):
-                yield part
-            return
-
-        try:
-            async for part in process_responses_stream(
-                response,
-                reasoning_enabled=resolved.reasoning_enabled is True,
-                source=self.api,
-            ):
-                yield part
-        except Exception as e:
-            _debug("stream_iter_error", {"exceptionType": type(e).__name__})
-            yield provider_error_part(e, source=self.api)
+            )
+            try:
+                try:
+                    async for part in parts:
+                        yield part
+                except Exception as e:
+                    _debug("stream_iter_error", {"exceptionType": type(e).__name__})
+                    yield provider_error_part(e, source=self.api)
+            finally:
+                try:
+                    await close_async_source(parts)
+                finally:
+                    await close_provider_stream(response)
         finally:
-            await close_provider_stream(response)
+            if owns_client:
+                await close_async_source(client)
 
 
 def _supports_reasoning(capabilities: object | None) -> bool:

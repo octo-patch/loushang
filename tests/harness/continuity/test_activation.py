@@ -8,6 +8,7 @@ from loushang.harness.continuity import (
     ActivationLeaseStateError,
     CallbackPreparedActivationLease,
     ContinuityTarget,
+    consume_prepared_activation,
 )
 
 
@@ -51,3 +52,64 @@ async def _unconsumed_activation_lease_cleanup_is_idempotent() -> None:
     await lease.close()
 
     assert events == ["abort"]
+
+
+def test_prepared_activation_transaction_aborts_a_failed_lease() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+
+        class _FailingLease:
+            target = ContinuityTarget(
+                provider_id="design.canvases",
+                opaque_id="canvas-1",
+            )
+            disposition = "relaunch"
+            consumed = False
+
+            async def consume(self) -> object:
+                events.append("consume")
+                raise RuntimeError("activation failed")
+
+            async def abort(self) -> None:
+                events.append("abort")
+
+            async def close(self) -> None:
+                events.append("close")
+
+        with pytest.raises(RuntimeError, match="activation failed"):
+            await consume_prepared_activation(_FailingLease())
+
+        assert events == ["consume", "abort"]
+
+    asyncio.run(scenario())
+
+
+def test_abort_intent_linearizes_before_async_cleanup() -> None:
+    asyncio.run(_abort_intent_linearizes_before_async_cleanup())
+
+
+async def _abort_intent_linearizes_before_async_cleanup() -> None:
+    events: list[str] = []
+    abort_started = asyncio.Event()
+    allow_abort = asyncio.Event()
+
+    async def abort() -> None:
+        events.append("abort-start")
+        abort_started.set()
+        await allow_abort.wait()
+        events.append("abort-done")
+
+    lease = CallbackPreparedActivationLease(
+        target=ContinuityTarget("coding.sessions", "session-1"),
+        disposition="in_place",
+        consume=lambda: events.append("consume") or "published",
+        abort=abort,
+    )
+    cleanup = asyncio.create_task(lease.abort())
+    await abort_started.wait()
+
+    with pytest.raises(ActivationLeaseStateError, match="closed"):
+        await lease.consume()
+    allow_abort.set()
+    await cleanup
+    assert events == ["abort-start", "abort-done"]

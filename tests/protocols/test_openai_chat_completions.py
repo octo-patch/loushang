@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -12,7 +13,7 @@ from loushang.ai import (
     get_model,
 )
 from loushang.ai.auth import ApiKeyAuth, OAuthBearerAuth
-from loushang.ai.context import NormalizedContext, normalize_context
+from loushang.ai.context import NormalizedContext
 from loushang.ai.model import (
     Auth,
     Capabilities,
@@ -39,9 +40,10 @@ from loushang.ai.types import (
 )
 from tests.protocols._runtime import (
     bound_test_model,
+    invoke_raw_parts_for_test,
     make_provider_request,
-    provider_request_for_test,
-    start_test_provider_stream,
+    normalized_context_for_test,
+    stream_for_test,
 )
 
 MAX_TOKENS_FIELD = "maxTokensField"
@@ -66,57 +68,9 @@ def _registry_with_endpoint(provider_id: str, endpoint: Endpoint) -> ModelRegist
     )
 
 
-def _normalized_context(model, context, options=None):
-    if not isinstance(model, Model) or not model.api:
-        model = bound_test_model(
-            model,
-            api="openai-completions",
-            options=options,
-        )
-    pairing_mode = (
-        "strict" if getattr(options, "pairing_mode", "strict") == "strict" else "repair"
-    )
-    return normalize_context(context, model=model, pairing_mode=pairing_mode)
-
-
-def _invoke_raw_parts(
-    provider,
-    model,
-    context,
-    options=None,
-    request=None,
-    *,
-    mode: str = "stream",
-):
-    normalized_context = _normalized_context(
-        request.model if request is not None else model,
-        context,
-        options,
-    )
-    provider_request = provider_request_for_test(
-        provider,
-        model,
-        normalized_context,
-        options=options,
-        request=request,
-    )
-    if mode != "stream":
-        provider_request = replace(provider_request, mode=mode)
-    return provider.invoke_raw(provider_request)
-
-
-async def _stream(provider, model, context, options=None, request=None):
-    return start_test_provider_stream(
-        provider,
-        model,
-        _normalized_context(
-            request.model if request is not None else model,
-            context,
-            options,
-        ),
-        options,
-        request=request,
-    )
+_normalized_context = partial(normalized_context_for_test, "openai-completions")
+_invoke_raw_parts = partial(invoke_raw_parts_for_test, "openai-completions")
+_stream = partial(stream_for_test, "openai-completions")
 
 
 def _adapter_config_from_compat(
@@ -141,6 +95,7 @@ def _adapter_config_from_compat(
         raw["reasoningFormat"] = compat[THINKING_FORMAT]
     return OpenAICompletionsConfig.from_raw(raw)
 
+
 def test_openai_completions_payload_maps_user_image_assistant_toolcall_and_tool_result_mixed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -159,6 +114,7 @@ def test_openai_completions_payload_maps_user_image_assistant_toolcall_and_tool_
         ],
         api="openai-completions",
         provider="openai",
+        endpoint="openai-completions",
         model="gpt-test",
         response_id="resp_1",
         usage=Usage(
@@ -931,6 +887,7 @@ def test_openai_completions_payload_synthesizes_missing_tool_result_for_assistan
         ],
         api="openai-completions",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id="resp_1",
         usage=Usage(
@@ -1233,12 +1190,15 @@ def test_openai_completions_forwards_authoritative_auth_headers(
     )
 
     headers = _FakeAsyncOpenAI.last_create_kwargs["extra_headers"]
-    assert _FakeAsyncOpenAI.last_init_kwargs["api_key"] == ""
+    sdk_api_key = _FakeAsyncOpenAI.last_init_kwargs["api_key"]
+    assert isinstance(sdk_api_key, str) and sdk_api_key
+    assert sdk_api_key not in headers.values()
     if not expected_headers:
         assert isinstance(headers["Authorization"], _FakeOmit)
         assert isinstance(headers["X-Api-Key"], _FakeOmit)
     else:
-        assert headers | expected_headers == headers
+        assert all(headers[name] == value for name, value in expected_headers.items())
+        assert sdk_api_key not in expected_headers.values()
 
 
 def test_openai_completions_uses_catalog_auth_header_and_prefix(

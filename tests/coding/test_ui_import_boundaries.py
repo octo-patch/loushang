@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -186,11 +187,13 @@ RETIRED_CODING_UI_MODULES = {
 }
 
 RETAINED_CODING_UI_PRODUCT_ADAPTER_MODULES = {
+    "_plugin_completion",
     "cli",
     "completion",
     "hotkeys",
     "mode",
     "plain_app",
+    "plugin_theme",
     "product_binding",
     "screen_app",
     "screen_input",
@@ -228,6 +231,23 @@ assert "loushang.coding.presentation.tui.plain" not in sys.modules
 """
     )
 
+    assert result.returncode == 0, result.stderr
+
+
+def test_screen_app_preview_helpers_do_not_load_workspace_tools() -> None:
+    result = _run_python_import_boundary_check(
+        """
+import sys
+from loushang.coding.ui import screen_app
+from loushang.harness.tools import output_preview
+assert 'loushang.harness.tools.workspace' not in sys.modules
+assert screen_app.drop_tool_timing_tail_line is output_preview.drop_tool_timing_tail_line
+assert screen_app.prefers_tail_tool_output is output_preview.prefers_tail_tool_output
+from loushang.harness.tools.workspace import output_preview as legacy_preview
+assert legacy_preview.drop_tool_timing_tail_line is output_preview.drop_tool_timing_tail_line
+assert legacy_preview.prefers_tail_tool_output is output_preview.prefers_tail_tool_output
+"""
+    )
     assert result.returncode == 0, result.stderr
 
 
@@ -419,6 +439,13 @@ def test_mode_is_only_the_coding_tui_composition_root() -> None:
         "run_tui_launch_shell",
     ):
         assert token in source
+
+    assert (
+        "screen_run_profile: ConversationScreenRunProfile = "
+        "CODING_SCREEN_RUN_PROFILE" in source
+    )
+    assert "profile=screen_run_profile" in source
+    assert "profile=CODING_SCREEN_RUN_PROFILE" not in source
 
     for token in (
         "class _CodingTuiSessionPort",
@@ -622,9 +649,17 @@ def test_conversation_event_dispatch_uses_shared_projection_owner() -> None:
 
     for path in (
         Path("src/loushang/coding/presentation/tui/plain.py"),
-        Path("src/loushang/harnesstui/conversation/agent_binding.py"),
     ):
         assert 'event.get("type")' not in path.read_text(encoding="utf-8")
+
+    binding = Path(
+        "src/loushang/harnesstui/conversation/agent_binding.py"
+    ).read_text(encoding="utf-8")
+    before_pacing, pacing = binding.split(
+        "def cooperative_agent_screen_event_listener(", 1
+    )
+    _, after_pacing = pacing.split("\ndef _agent_tool_result_message_event(", 1)
+    assert 'event.get("type")' not in before_pacing + after_pacing
 
 
 def test_shared_transcript_style_does_not_own_screen_product_policy() -> None:
@@ -639,14 +674,18 @@ def test_shared_transcript_style_does_not_own_screen_product_policy() -> None:
         )
     )
     screen = Path("src/loushang/coding/ui/screen_app.py").read_text(encoding="utf-8")
+    theme = Path("src/loushang/harnesstui/conversation/theme.py").read_text(
+        encoding="utf-8"
+    )
 
     for token in (
         "loushang.coding",
         "ScreenCodingTuiApp",
         "_project_coding_tool_name",
+        "_project_coding_tool_command",
         "_project_coding_tool_output",
-        "collapse_tool_output_preview",
-        "DEFAULT_TOOL_OUTPUT_PREVIEW_LINES",
+        "_collapse_coding_tool_preview",
+        "DEFAULT_TOOL_PREVIEW_SCREEN_ROWS",
         "bright_cyan",
         'user_prompt_prefix="› "',
         'tool_command_prefix="  │ "',
@@ -661,8 +700,9 @@ def test_shared_transcript_style_does_not_own_screen_product_policy() -> None:
     assert "compact_absolute_display_paths" in shared
     assert "compact_absolute_display_paths" in screen
     assert "_compact_display_paths" not in screen
-    assert "collapse_tool_output_preview" in screen
-    assert '"transcript.tool.marker": {"color": "bright_cyan"' in screen
+    assert "_collapse_coding_tool_preview" in screen
+    assert "terminal_transcript_theme" in screen
+    assert '"transcript.tool.marker": {"color": "bright_cyan"' in theme
 
 
 def test_shared_performance_probe_does_not_load_coding_sessions() -> None:
@@ -833,7 +873,9 @@ def test_shared_interaction_types_are_not_redefined_in_coding_ui() -> None:
     assert offenders == []
 
 
-def test_shared_conversation_interaction_does_not_own_coding_policy_or_copy() -> None:
+def test_shared_conversation_interaction_separates_product_and_clipboard_policy() -> (
+    None
+):
     shared = "\n".join(
         Path(f"src/loushang/harnesstui/conversation/{module}.py").read_text(
             encoding="utf-8"
@@ -871,6 +913,9 @@ def test_shared_conversation_interaction_does_not_own_coding_policy_or_copy() ->
     screen_input = Path("src/loushang/coding/ui/screen_input.py").read_text(
         encoding="utf-8"
     )
+    clipboard_policy = Path(
+        "src/loushang/harnesstui/conversation/clipboard_policy.py"
+    ).read_text(encoding="utf-8")
     product_binding = Path("src/loushang/coding/ui/product_binding.py").read_text(
         encoding="utf-8"
     )
@@ -885,10 +930,16 @@ def test_shared_conversation_interaction_does_not_own_coding_policy_or_copy() ->
     assert "Operation aborted" in screen_input
     assert "ImagePart" not in screen_input
     assert "ImagePart" in product_binding
-    assert '".loushang" / "clipboard"' in screen_input
+    assert '".loushang" / "clipboard"' not in screen_input
+    assert "RuntimeScope" in clipboard_policy
+    assert 'scope.drafts / "clipboard"' in clipboard_policy
+    assert "Attached clipboard image: " in clipboard_policy
+    assert "ClipboardImageInputProfile" not in screen_input
     assert "class ScreenInputResult" not in screen_input
     assert "class ScreenInputRouter" not in screen_input
     assert "bind_clipboard_image_input_router(" in screen_input
+    assert "ConversationInputRouterFactoryPort" not in screen_input
+    assert "cast(" not in screen_input
     assert "PromptIntent" in intents
     assert "BashIntent" in intents
     assert "ConversationRoutingProfile" in shared
@@ -1202,7 +1253,7 @@ def test_shared_completion_host_does_not_own_coding_catalog_or_path_policy() -> 
         "PreparedCatalogCompletionHost",
         'model_command_value="/model"',
         'model_argument_group="Models"',
-        'CatalogSlashAlias("/quit", "/exit", "Quit loushang")',
+        "build_session_catalog_completion_host",
         "coding_completion_host",
         "base_path=base_path",
     ):
@@ -1342,18 +1393,25 @@ def test_tui_owns_transcript_region_while_coding_owns_presentation_policy() -> N
         for module in ("transcript_display", "transcript_presentation")
     )
     coding = Path("src/loushang/coding/ui/screen_app.py").read_text(encoding="utf-8")
+    theme = Path("src/loushang/harnesstui/conversation/theme.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "class _ScreenTranscriptRegion" not in coding
     for token in (
         "_project_coding_tool_name",
+        "_project_coding_tool_command",
         "_project_coding_tool_output",
-        "collapse_tool_output_preview",
-        "DEFAULT_TOOL_OUTPUT_PREVIEW_LINES",
-        "bright_cyan",
+        "_collapse_coding_tool_preview",
+        "DEFAULT_TOOL_PREVIEW_SCREEN_ROWS",
     ):
         assert token not in engine
         assert token not in shared
         assert token in coding
+    assert "bright_cyan" not in engine
+    assert "bright_cyan" not in shared
+    assert "bright_cyan" not in coding
+    assert "bright_cyan" in theme
     assert "ProfiledConversationTranscriptPresentation" in shared
     assert "TranscriptDisplayProjectionProfile" in shared
     assert "TranscriptDisplayProjectionProfile" in coding
@@ -1404,7 +1462,7 @@ def test_shared_screen_app_does_not_own_coding_presentation_policy() -> None:
         "LoushangWelcomePanel",
         "Compacted summary:",
         "DEFAULT_ACTIVE_TRANSCRIPT_LINE_BUDGET = 320",
-        "collapse_tool_output_preview",
+        "_collapse_coding_tool_preview",
     ):
         assert token not in shared
         assert token in coding
@@ -1494,7 +1552,12 @@ def test_active_coding_ui_surfaces_do_not_use_legacy_native_product_names() -> N
                 continue
             text = path.read_text(encoding="utf-8")
             for token in forbidden:
-                if token in text:
+                found = (
+                    re.search(r"(?<!\w)native_app(?!\w)", text) is not None
+                    if token == "native_app"
+                    else token in text
+                )
+                if found:
                     offenders.append(f"{path}:{token}")
 
     assert offenders == []

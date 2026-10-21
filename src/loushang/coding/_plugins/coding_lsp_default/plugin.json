@@ -1,0 +1,56 @@
+{
+  "manifestVersion": 1,
+  "engine": {
+    "apiVersion": 1,
+    "declarationIrVersion": 2,
+    "requiredFeatures": [
+      "capability-provider-v2",
+      "catalog-consumer-v1",
+      "declaration-document-v1",
+      "in-process-definition-v1",
+      "symbol-reference-v2"
+    ]
+  },
+  "name": "coding.lsp.default",
+  "packageRoot": ".",
+  "version": "1",
+  "contributionIndex": {
+    "version": 2,
+    "items": [
+      {
+        "id": "coding-lsp-default",
+        "kind": "capability_provider",
+        "owner": "coding.lsp",
+        "contributionExecutionModel": "in_process",
+        "declarationSource": {
+          "entrypoint": "definition.py:declare",
+          "kind": "in_process",
+          "sourceVersion": 1
+        },
+        "requestedAuthorities": [
+          "filesystem",
+          "process"
+        ],
+        "configuration": {},
+        "required": true
+      },
+      {
+        "id": "coding-lsp-tools",
+        "kind": "tool_pack",
+        "owner": "coding.tools",
+        "contributionExecutionModel": "data_only",
+        "declarationSource": {
+          "kind": "document",
+          "locator": "declarations/tools.json",
+          "mediaType": "application/vnd.loushang.plugin-declarations+json",
+          "schemaId": "loushang.plugin-declaration-document",
+          "schemaVersion": 1,
+          "sourceVersion": 1
+        },
+        "requestedAuthorities": [],
+        "configuration": {},
+        "required": true
+      }
+    ]
+  }
+}

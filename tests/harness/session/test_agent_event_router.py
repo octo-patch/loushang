@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
-from loushang.ai.types import AssistantMessage, TextPart, Usage
+import pytest
+
+from loushang.ai.types import AssistantMessage, TextPart, Usage, UserMessage
 from loushang.harness.session import AgentEventRouter
-from loushang.harness.transcript import ApplicationMessage
+from loushang.harness.transcript import ApplicationMessage, AutoRetryOutcome
 
 
 def _usage() -> Usage:
@@ -22,6 +24,7 @@ def _assistant_message(
     *, stop_reason: str = "stop", error_message: str | None = None
 ) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text="reply")],
         api="anthropic-messages",
@@ -62,10 +65,16 @@ class _RetryRecorder:
         self.order.append("retry_is_retryable")
         return self.retryable
 
-    async def handle_retryable_error(self, assistant_message: AssistantMessage) -> bool:
+    async def handle_retryable_error(
+        self, assistant_message: AssistantMessage
+    ) -> AutoRetryOutcome:
         del assistant_message
         self.order.append("retry_handle")
-        return self.did_retry
+        return AutoRetryOutcome(should_continue=self.did_retry)
+
+    def continue_retry(self, continue_run: object) -> None:
+        assert callable(continue_run)
+        self.order.append("retry_continue")
 
 
 class _CompactionRecorder:
@@ -109,6 +118,7 @@ def test_agent_event_router_preserves_assistant_message_end_ordering() -> None:
             check_auto_compaction=lambda message: _record_async(
                 order, f"auto_compact:{message.role}"
             ),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
         )
 
         await router.handle({"type": "message_end", "message": assistant}, object())
@@ -123,6 +133,178 @@ def test_agent_event_router_preserves_assistant_message_end_ordering() -> None:
         "retry_finish_success",
         "compaction_clear_overflow",
     ]
+
+
+def test_agent_event_router_suppresses_recovery_without_losing_error_observation() -> None:
+    order: list[str] = []
+    allow = False
+    router = AgentEventRouter(
+        append_message=lambda message: _record_async(order, "append"),
+        dispatch_event=lambda event, **kwargs: _record_async(order, "dispatch"),
+        emit_extension_agent_event=lambda event: _record_async(order, "extension"),
+        record_tool_execution_error=lambda event: None,
+        retry_controller=_RetryRecorder(order, retryable=True, did_retry=True),
+        compaction_controller=_CompactionRecorder(order),
+        sync_extension_diagnostics=lambda **kwargs: order.append("sync"),
+        record_assistant_response_error=lambda message: order.append("error"),
+        check_auto_compaction=lambda message: _record_async(order, "compact"),
+        schedule_continue_run=lambda: _record_async(order, "continue"),
+        allow_automatic_recovery=lambda: allow,
+    )
+
+    async def scenario() -> None:
+        nonlocal allow
+        event = {"type": "agent_end", "messages": [_assistant_message(stop_reason="error")]}
+        await router.handle(event, object())
+        assert order == ["dispatch", "extension", "sync", "error"]
+        allow = True
+        await router.handle(event, object())
+        assert "retry_ensure_future" in order
+        assert "retry_continue" in order
+
+    asyncio.run(scenario())
+
+
+def test_agent_event_router_binds_request_evidence_before_dispatch() -> None:
+    order: list[str] = []
+
+    class Evidence:
+        def prepare_message_commit(self, message: object) -> dict[str, object]:
+            order.append(f"prepare:{message.role}")
+            return {"resource": {"durable": True}}
+
+        def commit_message(self, message: object, record_id: str) -> bool:
+            order.append(f"evidence:{record_id}:{message.role}")
+            return True
+
+    async def scenario() -> None:
+        async def append_message(
+            _message: object,
+            *,
+            metadata: object | None = None,
+        ) -> str:
+            assert metadata == {"resource": {"durable": True}}
+            order.append("append")
+            return "record-1"
+
+        message = UserMessage(
+            role="user",
+            content=[TextPart(type="text", text="context")],
+            timestamp=0.0,
+        )
+        router = AgentEventRouter(
+            append_message=append_message,
+            dispatch_event=lambda _event, **_kwargs: _record_async(order, "dispatch"),
+            emit_extension_agent_event=lambda _event: _record_async(
+                order, "extension"
+            ),
+            record_tool_execution_error=lambda _event: None,
+            retry_controller=_RetryRecorder(order),
+            compaction_controller=_CompactionRecorder(order),
+            sync_extension_diagnostics=lambda **_kwargs: None,
+            record_assistant_response_error=lambda _message: None,
+            check_auto_compaction=lambda _message: _record_async(order, "compact"),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
+            request_evidence=Evidence(),  # type: ignore[arg-type]
+        )
+
+        await router.handle({"type": "message_end", "message": message}, object())
+
+    asyncio.run(scenario())
+
+    assert order[:5] == [
+        "prepare:user",
+        "append",
+        "evidence:record-1:user",
+        "dispatch",
+        "extension",
+    ]
+
+
+def test_agent_event_router_merges_product_metadata_with_resource_evidence_once() -> None:
+    appended: list[object] = []
+    prepared: list[object] = []
+
+    class Evidence:
+        def prepare_message_commit(self, message: object) -> dict[str, object]:
+            return {"resource": {"durable": True}}
+
+        def commit_message(self, message: object, record_id: str) -> bool:
+            assert record_id == "record-1"
+            return True
+
+    async def append_message(
+        _message: object, *, metadata: object | None = None,
+    ) -> str:
+        appended.append(metadata)
+        return "record-1"
+
+    async def scenario() -> None:
+        message = UserMessage(
+            role="user", content=[TextPart(type="text", text="resume")], timestamp=0.0,
+        )
+
+        def prepare(message_to_commit: object) -> dict[str, object]:
+            prepared.append(message_to_commit)
+            return {"coding.runtimeBindingV1": {"schemaVersion": 1}}
+
+        router = AgentEventRouter(
+            append_message=append_message,
+            dispatch_event=lambda _event, **_kwargs: _record_async([], "dispatch"),
+            emit_extension_agent_event=lambda _event: _record_async([], "extension"),
+            record_tool_execution_error=lambda _event: None,
+            retry_controller=_RetryRecorder([]),
+            compaction_controller=_CompactionRecorder([]),
+            sync_extension_diagnostics=lambda **_kwargs: None,
+            record_assistant_response_error=lambda _message: None,
+            check_auto_compaction=lambda _message: _record_async([], "compact"),
+            schedule_continue_run=lambda: _record_async([], "continue"),
+            request_evidence=Evidence(),  # type: ignore[arg-type]
+            prepare_message_metadata=prepare,
+        )
+        await router.handle({"type": "message_end", "message": message}, object())
+
+    asyncio.run(scenario())
+    assert len(prepared) == 1
+    assert appended == [{
+        "resource": {"durable": True},
+        "coding.runtimeBindingV1": {"schemaVersion": 1},
+    }]
+
+
+def test_agent_event_router_rejects_metadata_collision_before_append() -> None:
+    appended: list[object] = []
+
+    class Evidence:
+        def prepare_message_commit(self, message: object) -> dict[str, object]:
+            return {"same": {"resource": True}}
+
+        def commit_message(self, message: object, record_id: str) -> bool:
+            raise AssertionError("uncommitted evidence was marked committed")
+
+    async def scenario() -> None:
+        message = UserMessage(
+            role="user", content=[TextPart(type="text", text="resume")], timestamp=0.0,
+        )
+        router = AgentEventRouter(
+            append_message=lambda value, **kwargs: _append_async(appended, value),
+            dispatch_event=lambda _event, **_kwargs: _record_async([], "dispatch"),
+            emit_extension_agent_event=lambda _event: _record_async([], "extension"),
+            record_tool_execution_error=lambda _event: None,
+            retry_controller=_RetryRecorder([]),
+            compaction_controller=_CompactionRecorder([]),
+            sync_extension_diagnostics=lambda **_kwargs: None,
+            record_assistant_response_error=lambda _message: None,
+            check_auto_compaction=lambda _message: _record_async([], "compact"),
+            schedule_continue_run=lambda: _record_async([], "continue"),
+            request_evidence=Evidence(),  # type: ignore[arg-type]
+            prepare_message_metadata=lambda _message: {"same": {"binding": True}},
+        )
+        with pytest.raises(ValueError, match="metadata key conflict"):
+            await router.handle({"type": "message_end", "message": message}, object())
+
+    asyncio.run(scenario())
+    assert appended == []
 
 
 def test_agent_event_router_consumes_queued_application_message_on_start() -> None:
@@ -147,6 +329,7 @@ def test_agent_event_router_consumes_queued_application_message_on_start() -> No
             sync_extension_diagnostics=lambda **kwargs: None,
             record_assistant_response_error=lambda value: None,
             check_auto_compaction=lambda value: _record_async([], "compact"),
+            schedule_continue_run=lambda: _record_async([], "continue"),
             consume_queued_message=lambda value: consumed.append(value) or True,
         )
 
@@ -179,6 +362,7 @@ def test_agent_event_router_does_not_dispatch_after_append_failure() -> None:
             sync_extension_diagnostics=lambda **kwargs: None,
             record_assistant_response_error=lambda message: None,
             check_auto_compaction=lambda message: _record_async(order, "compact"),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
         )
 
         try:
@@ -225,6 +409,7 @@ def test_agent_event_router_retries_projection_without_appending_again() -> None
             sync_extension_diagnostics=lambda **kwargs: None,
             record_assistant_response_error=lambda message: None,
             check_auto_compaction=lambda message: _record_async(order, "compact"),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
         )
         event = {"type": "message_end", "message": assistant}
 
@@ -273,6 +458,7 @@ def test_agent_event_router_records_tool_errors_before_dispatch_and_extension_mi
             check_auto_compaction=lambda message: _record_async(
                 order, f"auto_compact:{message.role}"
             ),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
         )
 
         await router.handle({"type": "tool_execution_end", "is_error": True}, object())
@@ -317,6 +503,7 @@ def test_agent_event_router_retries_before_auto_compaction_and_short_circuits() 
             check_auto_compaction=lambda message: _record_async(
                 order, f"auto_compact:{message.role}"
             ),
+            schedule_continue_run=lambda: _record_async(order, "continue"),
         )
 
         await router.handle({"type": "agent_end", "messages": [assistant]}, object())
@@ -332,6 +519,7 @@ def test_agent_event_router_retries_before_auto_compaction_and_short_circuits() 
         "retry_ensure_future",
         "retry_is_retryable",
         "retry_handle",
+        "retry_continue",
     ]
 
 

@@ -6,12 +6,17 @@ import pytest
 
 from loushang.harness.runtime import SessionOperationResult
 from loushang.harness.session import (
+    SessionInputCapabilities,
+    SessionInputCapability,
     SessionLifecycleOperationPorts,
     SessionOperationAvailability,
     SessionOperationCapability,
     SessionOperationRuntime,
     SessionOperationUnavailableError,
     SessionPromptRequest,
+    current_session_operation_resolver,
+    require_active_session,
+    session_operation_resolver,
 )
 
 
@@ -218,6 +223,113 @@ def test_session_operation_runtime_rejects_unbound_operation_group() -> None:
         runtime.abort_compaction()
 
 
+def test_session_operation_runtime_declares_standard_input_capabilities() -> None:
+    runtime = SessionOperationRuntime(_Control())
+
+    assert runtime.input_capabilities.supports(SessionInputCapability.STEER)
+    assert runtime.input_capabilities.supports(SessionInputCapability.FOLLOW_UP)
+
+
+def test_session_operation_runtime_enforces_declared_input_capabilities() -> None:
+    control = _Control()
+    runtime = SessionOperationRuntime(
+        control,
+        input_capabilities=SessionInputCapabilities.from_capabilities(
+            (SessionInputCapability.FOLLOW_UP,)
+        ),
+    )
+
+    runtime.follow_up("later")
+    with pytest.raises(SessionOperationUnavailableError, match="steer"):
+        runtime.steer("now")
+
+    assert control.follow_up_messages == [("later", None)]
+    assert control.steering == []
+
+
+def test_session_operation_runtime_hides_input_capabilities_without_input_group() -> (
+    None
+):
+    runtime = SessionOperationRuntime(
+        _Control(),
+        availability=SessionOperationAvailability.from_capabilities(
+            (SessionOperationCapability.MAINTENANCE,)
+        ),
+    )
+
+    assert runtime.input_capabilities.capabilities == frozenset()
+
+
+def test_session_operation_resolver_exposes_capabilities_without_resolving_control() -> (
+    None
+):
+    def fail_if_resolved() -> _Control:
+        raise AssertionError("capability inspection must not resolve control")
+
+    resolve = session_operation_resolver(
+        fail_if_resolved,
+        input_capabilities=SessionInputCapabilities.from_capabilities(
+            (SessionInputCapability.FOLLOW_UP,)
+        ),
+    )
+
+    assert not resolve.input_capabilities.supports(SessionInputCapability.STEER)
+    assert resolve.input_capabilities.supports(SessionInputCapability.FOLLOW_UP)
+
+
 def test_session_prompt_request_requires_non_empty_text() -> None:
     with pytest.raises(ValueError, match="non-empty"):
         SessionPromptRequest(text="")
+
+
+def test_current_session_operation_resolver_rebinds_after_session_change() -> None:
+    first = _Control()
+    first.session_id = "first"
+    second = _Control()
+    second.session_id = "second"
+
+    class _Session:
+        def __init__(self, control: _Control) -> None:
+            self.session_control = control
+
+    class _Runtime:
+        def __init__(self) -> None:
+            self.current = _Session(first)
+
+        def get_current_session(self) -> _Session:
+            return self.current
+
+    product = _Runtime()
+    resolve = current_session_operation_resolver(product)
+
+    assert resolve().session_id == "first"
+    product.current = _Session(second)
+    assert resolve().session_id == "second"
+
+
+def test_dynamic_session_resolution_rejects_a_missing_active_session() -> None:
+    class _Runtime:
+        def get_current_session(self) -> None:
+            return None
+
+    product = _Runtime()
+    resolve = current_session_operation_resolver(product)
+
+    with pytest.raises(RuntimeError, match="requires an active session"):
+        resolve()
+    with pytest.raises(RuntimeError, match="requires an active session"):
+        require_active_session(product)
+
+
+def test_active_session_resolution_requires_the_runtime_contract() -> None:
+    with pytest.raises(TypeError, match="provide get_current_session"):
+        require_active_session(object())
+
+
+def test_abort_turn_does_not_clear_queue() -> None:
+    control = _Control()
+    runtime = SessionOperationRuntime(control)
+
+    assert runtime.abort_turn() is True
+    assert control.aborted is True
+    assert control.get_steering_messages() == ["steer"]

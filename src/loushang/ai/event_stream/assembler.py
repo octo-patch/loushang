@@ -57,6 +57,7 @@ from loushang.ai.types import (
     Usage,
 )
 from loushang.ai.utils.json_parse import parse_streaming_json
+from loushang.foundation.json import JSONValue
 
 
 @dataclass
@@ -75,6 +76,7 @@ class RawAssembler:
         stream: AssistantMessageEventStream,
         api: str,
         provider: str,
+        endpoint: str,
         model: str,
         pricing=None,
         clock: Callable[[], float] = time,
@@ -82,6 +84,7 @@ class RawAssembler:
         self._stream = stream
         self._api = api
         self._provider = provider
+        self._endpoint = endpoint
         self._model = model
         self._pricing = pricing
         self._clock = clock
@@ -107,6 +110,7 @@ class RawAssembler:
             cost=None,
         )
         self._usage_cost_multiplier = 1.0
+        self._usage_observed = False
         self._final_message: AssistantMessage | None = None
         self._started = False
         self._text_started = False
@@ -306,6 +310,7 @@ class RawAssembler:
             return
 
         if part_type == "usage_delta":
+            self._usage_observed = True
             usage_part = cast(UsageDeltaPart, part)
             input_tokens = usage_part.get("input", self._usage.input)
             output_tokens = usage_part.get("output", self._usage.output)
@@ -408,11 +413,13 @@ class RawAssembler:
                 response_error_part,
                 source=self._api,
                 provider=self._provider,
+                endpoint=self._endpoint,
                 model=self._model,
             )
             message = self._build_message(
                 stop_reason="error",
                 error_message=error_info.message,
+                error_info=error_info.to_dict(),
             )
             error_event: ErrorEvent = {
                 "type": "error",
@@ -502,6 +509,12 @@ class RawAssembler:
             raise RuntimeError("Raw assembler has not produced a final message yet")
         return self._final_message
 
+    @property
+    def usage_observed(self) -> bool:
+        """Whether a normalized provider usage part reached this assembler."""
+
+        return self._usage_observed
+
     def _finalize_usage_cost(self) -> None:
         if self._pricing is None:
             return
@@ -523,19 +536,25 @@ class RawAssembler:
             )
 
     def _build_message(
-        self, *, stop_reason: str, error_message: str | None
+        self,
+        *,
+        stop_reason: str,
+        error_message: str | None,
+        error_info: dict[str, JSONValue] | None = None,
     ) -> AssistantMessage:
         return AssistantMessage(
             role="assistant",
             content=self._build_content(),
             api=self._api,
             provider=self._provider,
+            endpoint=self._endpoint,
             model=self._model,
             response_id=self._response_id,
             usage=self._usage,
             stop_reason=_assistant_stop_reason(stop_reason),
             error_message=error_message,
             timestamp=self._clock(),
+            error_info=error_info,
         )
 
     def _build_partial_message(self) -> AssistantMessage:

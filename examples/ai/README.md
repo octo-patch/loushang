@@ -38,6 +38,11 @@
 `DASHSCOPE_API_KEY`、`DEEPSEEK_API_KEY`、`MOONSHOT_API_KEY` 和
 `STEPFUN_API_KEY`。具体 endpoint 声明以 `models.json` 为准。
 
+OpenAI 的 `openai-responses` 与 `coding-responses` catalog 路由均列出
+`gpt-6-sol`、`gpt-6-astra`、`gpt-6.1-sol` 和 `gpt-6-luna`。例如可用
+`get_model("openai", "openai-responses", "gpt-6.1-sol")` 获取标准 API 模型。
+`coding-responses` 使用 ChatGPT OAuth，实际可用模型仍由账号权限决定。
+
 运行全部离线示例：
 
 ```bash
@@ -57,6 +62,8 @@ message = await complete(
 )
 ```
 
+`message.provider`、`message.endpoint` 和 `message.model` 共同记录完整响应来源。
+
 公共 `complete` 和 `stream` 不接收 registry 参数。
 
 ## 高级示例
@@ -66,12 +73,12 @@ message = await complete(
 
 ```python
 from loushang.ai.advanced.registry import (
-    clear_api_providers,
-    register_api_provider,
+    clear_api_adapters,
+    register_api_adapter,
 )
 
-clear_api_providers()
-register_api_provider(custom_adapter)
+clear_api_adapters()
+register_api_adapter(custom_adapter)
 ```
 
 高级离线 faux 示例：

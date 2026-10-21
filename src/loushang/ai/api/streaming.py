@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from uuid import uuid4
 
 from loushang.ai.api_registry import get_default_api_registry
 from loushang.ai.auth.credentials import AuthCredential
@@ -22,7 +23,7 @@ from loushang.ai.provider import (
     resolve_request_for_model,
 )
 from loushang.ai.provider.invocation import (
-    call_api_provider_stream,
+    call_api_adapter_stream,
     validate_provider_request,
 )
 from loushang.ai.provider_registry import get_default_provider_registry
@@ -33,22 +34,7 @@ from loushang.ai.structured import (
     parse_structured_output,
     with_structured_output_options,
 )
-from loushang.ai.types import ImagePart, ToolResultMessage, UserMessage
-
-
-def _has_image_input(normalized_context: NormalizedContext) -> bool:
-    for message in normalized_context.messages:
-        if (
-            isinstance(message, UserMessage)
-            and isinstance(message.content, list)
-            and any(isinstance(part, ImagePart) for part in message.content)
-        ):
-            return True
-        if isinstance(message, ToolResultMessage) and any(
-            isinstance(part, ImagePart) for part in message.content
-        ):
-            return True
-    return False
+from loushang.ai.utils.capabilities import context_has_image_input
 
 
 def _has_tools(normalized_context: NormalizedContext) -> bool:
@@ -177,7 +163,7 @@ def _validate_capability(
         )
 
     supports_image_input = bool(getattr(capabilities, "supports_image_input", False))
-    if _has_image_input(normalized_context) and not supports_image_input:
+    if context_has_image_input(normalized_context.messages) and not supports_image_input:
         raise UnsupportedCapabilityError(
             f"Model {model.id!r} does not support image input",
             model=getattr(model, "id", None),
@@ -204,8 +190,8 @@ def _supports_structured_output_mapping(adapter: object) -> bool:
 
 def _resolve_pairing_mode(options) -> PairingMode:
     if options is None:
-        return "strict"
-    pairing_mode = getattr(options, "pairing_mode", "strict")
+        return "repair"
+    pairing_mode = getattr(options, "pairing_mode", "repair")
     if pairing_mode == "repair":
         return "repair"
     return "strict"
@@ -218,7 +204,7 @@ def _emit_normalization_diagnostics(
     if not diagnostics:
         return
     from loushang.ai.trace import emit_trace
-    from loushang.observability import get_log
+    from loushang.foundation.observability import get_log
 
     log = get_log(__name__).bind(component="AINormalization")
     for diagnostic in diagnostics:
@@ -282,6 +268,8 @@ async def _start_stream(
         context=normalized,
         options=options,
         mode=mode,
+        invocation_id=uuid4().hex,
+        attempt=1,
     )
     _validate_capability(
         resolved_model,
@@ -311,7 +299,7 @@ async def _start_stream(
                 "api": resolved_model.api,
             },
         )
-    return await call_api_provider_stream(adapter, resolved)
+    return await call_api_adapter_stream(adapter, resolved)
 
 
 async def stream(
@@ -372,5 +360,7 @@ def _with_explicit_auth(
     if options is None:
         return CallOptions(auth=auth)
     if options.auth is not None:
-        raise ValueError("Pass request auth through either auth= or CallOptions.auth, not both")
+        raise ValueError(
+            "Pass request auth through either auth= or CallOptions.auth, not both"
+        )
     return replace(options, auth=auth)

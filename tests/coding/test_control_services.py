@@ -4,6 +4,7 @@ import asyncio
 from datetime import date
 
 from loushang.ai.model import Capabilities, Model
+from loushang.coding.prompt import CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT
 
 
 def _runtime_footer(cwd: str) -> str:
@@ -135,38 +136,38 @@ def test_create_services_provides_settings_and_model_resolution_for_sessions(
     services = create_services(ai_model_registry=AiModelRegistry())
     services.model_registry.register_model(_model("alpha", name="Alpha"))
     services.settings_manager.set_default_model(
-        ModelSelection(provider="faux", model_id="alpha")
+        ModelSelection(
+            endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
+        )
     )
     services.settings_manager.update_settings(
         system_prompt="Be precise.", thinking_level="high"
     )
 
     manager = asyncio.run(
-        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+        SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
     )
     session = create_agent_session(session_manager=manager, services=services)
 
     assert session.get_model_selection() == ModelSelection(
-        provider="faux", model_id="alpha"
+        endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
     )
     assert (
         session.agent.system_prompt
-        == f"Be precise.\n\n{_runtime_footer('/tmp/project')}"
+        == f"Be precise.\n\n{CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT.rstrip()}\n\n"
+        f"{_runtime_footer(str(tmp_path.resolve()))}"
     )
     assert session.agent.thinking_level == "high"
 
 
-def test_model_registry_records_problem_for_ambiguous_model_selection() -> None:
-    import pytest
-
+def test_model_registry_resolves_each_complete_endpoint_selection() -> None:
     from loushang.ai.model.registry import ModelRegistry as AiModelRegistry
     from loushang.coding.session import ModelSelection
-    from loushang.harness.model_catalog import ModelCatalog as ModelRegistry
-    from loushang.observability import (
+    from loushang.foundation.observability._router import (
         get_problem_store,
-        log_context,
         reset_observability,
     )
+    from loushang.harness.model_catalog import ModelCatalog as ModelRegistry
 
     registry = ModelRegistry(ai_registry=AiModelRegistry())
     registry.register_model(
@@ -178,23 +179,24 @@ def test_model_registry_records_problem_for_ambiguous_model_selection() -> None:
 
     reset_observability()
     try:
-        with log_context(session_id="session-1", mode="startup"):
-            with pytest.raises(ValueError, match="Ambiguous model selection"):
-                registry.build_model(ModelSelection(provider="faux", model_id="alpha"))
+        messages = registry.build_model(
+            ModelSelection(
+                endpoint_id="anthropic-messages",
+                provider="faux",
+                model_id="alpha",
+            )
+        )
+        responses = registry.build_model(
+            ModelSelection(
+                endpoint_id="openai-responses",
+                provider="faux",
+                model_id="alpha",
+            )
+        )
 
-        records = get_problem_store().all()
-        assert len(records) == 1
-        assert records[0].code == "model_selection_ambiguous"
-        assert records[0].source == "config"
-        assert records[0].recoverable is True
-        assert records[0].message == "Ambiguous model selection: faux:alpha"
-        assert records[0].details == {
-            "endpoint_ids": ["anthropic-messages", "openai-responses"],
-            "model_id": "alpha",
-            "provider_id": "faux",
-        }
-        assert records[0].session_id == "session-1"
-        assert records[0].mode == "startup"
+        assert messages.endpoint_id == "anthropic-messages"
+        assert responses.endpoint_id == "openai-responses"
+        assert get_problem_store().all() == []
     finally:
         reset_observability()
 
@@ -204,23 +206,34 @@ def test_model_registry_records_problem_for_missing_model_selection() -> None:
 
     from loushang.ai.model.registry import ModelRegistry as AiModelRegistry
     from loushang.coding.session import ModelSelection
+    from loushang.foundation.observability._router import (
+        get_problem_store,
+        reset_observability,
+    )
     from loushang.harness.model_catalog import ModelCatalog as ModelRegistry
-    from loushang.observability import get_problem_store, reset_observability
 
     registry = ModelRegistry(ai_registry=AiModelRegistry())
 
     reset_observability()
     try:
         with pytest.raises(KeyError):
-            registry.build_model(ModelSelection(provider="faux", model_id="missing"))
+            registry.build_model(
+                ModelSelection(
+                    endpoint_id="test-endpoint", provider="faux", model_id="missing"
+                )
+            )
 
         records = get_problem_store().all()
         assert len(records) == 1
         assert records[0].code == "model_selection_not_found"
         assert records[0].source == "config"
         assert records[0].recoverable is True
-        assert records[0].message == "Model selection not found: faux:missing"
+        assert (
+            records[0].message
+            == "Model selection not found: faux:test-endpoint:missing"
+        )
         assert records[0].details == {
+            "endpoint_id": "test-endpoint",
             "model_id": "missing",
             "provider_id": "faux",
         }
@@ -244,27 +257,38 @@ def test_runtime_uses_latest_settings_for_new_sessions(tmp_path) -> None:
         _model("beta", endpoint="responses", name="Beta")
     )
     services.settings_manager.set_default_model(
-        ModelSelection(provider="faux", model_id="alpha")
+        ModelSelection(
+            endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
+        )
     )
 
     runtime = create_agent_session_runtime(
         session_dir=tmp_path, services=services, persist=False
     )
-    first = asyncio.run(runtime.create_session(cwd=str(project_a)))
 
-    services.settings_manager.set_default_model(
-        ModelSelection(provider="faux", model_id="beta")
-    )
-    services.settings_manager.update_settings(thinking_level="minimal")
-    second = asyncio.run(runtime.create_session(cwd=str(project_b)))
+    async def scenario() -> None:
+        try:
+            first = await runtime.create_session(cwd=str(project_a))
 
-    assert first.get_model_selection() == ModelSelection(
-        provider="faux", model_id="alpha"
-    )
-    assert second.get_model_selection() == ModelSelection(
-        provider="faux", model_id="beta"
-    )
-    assert second.agent.thinking_level == "minimal"
+            services.settings_manager.set_default_model(
+                ModelSelection(
+                    endpoint_id="responses", provider="faux", model_id="beta"
+                )
+            )
+            services.settings_manager.update_settings(thinking_level="minimal")
+            second = await runtime.create_session(cwd=str(project_b))
+
+            assert first.get_model_selection() == ModelSelection(
+                endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
+            )
+            assert second.get_model_selection() == ModelSelection(
+                endpoint_id="responses", provider="faux", model_id="beta"
+            )
+            assert second.agent.thinking_level == "minimal"
+        finally:
+            await runtime.dispose_session_runtime()
+
+    asyncio.run(scenario())
 
 
 def test_create_services_can_use_preloaded_persistent_settings_manager(
@@ -286,7 +310,11 @@ def test_create_services_can_use_preloaded_persistent_settings_manager(
     global_settings_path.write_text(
         json.dumps(
             {
-                "default_model": {"provider": "faux", "model_id": "alpha"},
+                "default_model": {
+                    "provider": "faux",
+                    "endpoint_id": "anthropic-messages",
+                    "model_id": "alpha",
+                },
                 "thinking_level": "minimal",
             }
         ),
@@ -319,12 +347,13 @@ def test_create_services_can_use_preloaded_persistent_settings_manager(
     session = create_agent_session(session_manager=manager, services=services)
 
     assert session.get_model_selection() == ModelSelection(
-        provider="faux", model_id="alpha"
+        endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
     )
     assert session.agent.thinking_level == "minimal"
     assert (
         session.agent.system_prompt
-        == f"Use project policy.\n\n{_runtime_footer(str(project_root))}"
+        == f"Use project policy.\n\n{CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT.rstrip()}\n\n"
+        f"{_runtime_footer(str(project_root))}"
     )
 
 
@@ -342,24 +371,34 @@ def test_session_restores_persisted_model_and_accepts_model_selection_updates(
         _model("beta", endpoint="responses", name="Beta")
     )
     services.settings_manager.set_default_model(
-        ModelSelection(provider="faux", model_id="alpha")
+        ModelSelection(
+            endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
+        )
     )
 
     manager = asyncio.run(
-        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+        SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
     )
-    asyncio.run(manager.append_model_change("faux", "beta"))
+    asyncio.run(manager.append_model_change("faux", "beta", endpoint_id="responses"))
 
     session = create_agent_session(session_manager=manager, services=services)
 
     assert session.get_model_selection() == ModelSelection(
-        provider="faux", model_id="beta"
+        endpoint_id="responses", provider="faux", model_id="beta"
     )
 
-    asyncio.run(session.set_model(ModelSelection(provider="faux", model_id="alpha")))
+    asyncio.run(
+        session.set_model(
+            ModelSelection(
+                endpoint_id="anthropic-messages",
+                provider="faux",
+                model_id="alpha",
+            )
+        )
+    )
 
     assert session.get_model_selection() == ModelSelection(
-        provider="faux", model_id="alpha"
+        endpoint_id="anthropic-messages", provider="faux", model_id="alpha"
     )
     assert [entry.kind for entry in manager.get_entries()] == [
         "agent.model_selection",

@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from loushang.ai.model import (
-    Model,
     ModelSelection,
     is_usable_model_selection,
+    model_selection_ref,
     normalize_model_selection,
 )
 
@@ -40,7 +40,7 @@ class ModelChoiceData:
     label: str
     value: str
     selection: object
-    endpoint_id: str = ""
+    endpoint_id: str
     region: str = ""
     lane: str = ""
     api: str = ""
@@ -52,12 +52,8 @@ def model_identity_data(selection: object | None) -> ModelIdentityData:
     normalized = normalize_model_selection(selection)
     if normalized is None:
         return ModelIdentityData()
-    label = f"{normalized.provider}/{normalized.model_id}"
-    value = (
-        f"{normalized.provider}:{normalized.endpoint_id}:{normalized.model_id}"
-        if normalized.endpoint_id
-        else None
-    )
+    label = _model_label(normalized)
+    value = model_selection_ref(normalized)
     return ModelIdentityData(label=label, value=value)
 
 
@@ -70,12 +66,8 @@ def model_choice_data_from_details(
         normalized = normalize_model_selection(detail)
         if normalized is None:
             continue
-        label = f"{normalized.provider}/{normalized.model_id}"
-        value = (
-            f"{normalized.provider}:{normalized.endpoint_id}:{normalized.model_id}"
-            if normalized.endpoint_id
-            else label
-        )
+        label = _model_label(normalized)
+        value = model_selection_ref(normalized)
         if value in seen:
             continue
         seen.add(value)
@@ -84,7 +76,7 @@ def model_choice_data_from_details(
                 label=label,
                 value=value,
                 selection=detail,
-                endpoint_id=normalized.endpoint_id or "",
+                endpoint_id=normalized.endpoint_id,
                 region=_detail_string(detail, "region"),
                 lane=_detail_string(detail, "lane"),
                 api=_detail_string(detail, "api"),
@@ -108,15 +100,16 @@ def model_choice_data_from_selections(
         normalized = normalize_model_selection(selection)
         if normalized is None:
             continue
-        label = f"{normalized.provider}/{normalized.model_id}"
+        label = _model_label(normalized)
         if label in seen:
             continue
         seen.add(label)
         choices.append(
             ModelChoiceData(
                 label=label,
-                value=label,
+                value=model_selection_ref(normalized),
                 selection=selection,
+                endpoint_id=normalized.endpoint_id,
             )
         )
     return choices
@@ -137,20 +130,9 @@ def _detail_bool(value: object, *names: str) -> bool:
 def _detail_field(value: object, name: str) -> object | None:
     if isinstance(value, Mapping):
         return value.get(name)
-    if isinstance(value, Model):
-        return {
-            "api": value.api,
-            "region": value.region,
-            "lane": value.lane,
-            "preferred_endpoint": value.preferred_endpoint,
-            "preferred": value.preferred_endpoint,
-            "name": value.name,
-            "family": value.family,
-            "alias": value.alias,
-        }.get(name)
     try:
-        return vars(value).get(name)
-    except TypeError:
+        return getattr(value, name, None)
+    except Exception:
         return None
 
 
@@ -164,7 +146,7 @@ async def apply_session_model_selection(
 
     normalized = normalize_model_selection(selection)
     if normalized is None:
-        raise ValueError("Model selection requires provider and model id.")
+        raise ValueError("Model selection requires provider, endpoint, and model ids.")
     setter = getattr(session, "set_model", None)
     if not callable(setter):
         raise RuntimeError("Model selection is not available.")
@@ -200,7 +182,7 @@ async def iter_available_model_details(session: object) -> list[object]:
     if not callable(getter):
         return []
     details = await _maybe_await(getter())
-    if not isinstance(details, list | tuple):
+    if not isinstance(details, Iterable) or isinstance(details, str | bytes | Mapping):
         return []
     return list(details)
 
@@ -264,7 +246,7 @@ def _dedupe_model_selections(values: object) -> list[ModelSelection]:
         selection = normalize_model_selection(raw_value)
         if selection is None or not is_usable_model_selection(selection):
             continue
-        key = (selection.provider, selection.endpoint_id or "", selection.model_id)
+        key = (selection.provider, selection.endpoint_id, selection.model_id)
         if key not in seen:
             seen.add(key)
             selections.append(selection)
@@ -286,14 +268,20 @@ def model_listing_getter(
 
 
 def unique_sorted_model_entries(models: Iterable[object]) -> list[object]:
-    """Dedupe model values by provider/model id in stable display order."""
+    """Dedupe model values by complete identity in stable display order."""
 
-    by_key: dict[tuple[str, str], object] = {}
+    by_key: dict[tuple[str, str, str], object] = {}
     for selection in models:
-        provider = _model_provider(selection)
-        model_id = _model_id(selection)
-        if isinstance(provider, str) and isinstance(model_id, str):
-            by_key.setdefault((provider, model_id), selection)
+        normalized = _safe_normalize_model_selection(selection)
+        if normalized is not None:
+            by_key.setdefault(
+                (
+                    normalized.provider,
+                    normalized.endpoint_id,
+                    normalized.model_id,
+                ),
+                selection,
+            )
     return [by_key[key] for key in sorted(by_key)]
 
 
@@ -304,14 +292,14 @@ def normalize_model_listing(
 
     entries: list[dict[str, object]] = []
     for selection in models:
-        provider = _model_provider(selection)
-        model_id = _model_id(selection)
-        if not isinstance(provider, str) or not isinstance(model_id, str):
+        normalized = _safe_normalize_model_selection(selection)
+        if normalized is None:
             continue
         entry: dict[str, object] = {
-            "provider": provider,
-            "model_id": model_id,
-            "id": f"{provider}/{model_id}",
+            "provider": normalized.provider,
+            "endpoint_id": normalized.endpoint_id,
+            "model_id": normalized.model_id,
+            "id": model_selection_ref(normalized),
         }
         if include_metadata:
             entry.update(
@@ -334,12 +322,13 @@ def model_listing_matches_query(entry: Mapping[str, object], query: str) -> bool
     """Match a normalized model entry by substring or subsequence."""
 
     provider = str(entry.get("provider") or "").lower()
+    endpoint_id = str(entry.get("endpoint_id") or "").lower()
     model_id = str(entry.get("model_id") or "").lower()
     if not provider and not model_id:
         return False
     if query in provider or query in model_id:
         return True
-    haystack = f"{provider}/{model_id}"
+    haystack = f"{provider}:{endpoint_id}:{model_id}"
     return query in haystack or _is_subsequence(query, haystack)
 
 
@@ -349,6 +338,7 @@ def format_model_metadata_table(models: Sequence[Mapping[str, object]]) -> str:
     rows = [
         (
             str(model["provider"]),
+            str(model["endpoint_id"]),
             str(model["model_id"]),
             _format_context_window(model.get("context_window")),
             _format_optional_int(model.get("max_tokens")),
@@ -357,7 +347,15 @@ def format_model_metadata_table(models: Sequence[Mapping[str, object]]) -> str:
         )
         for model in models
     ]
-    headers = ("provider", "model", "context", "max-out", "thinking", "images")
+    headers = (
+        "provider",
+        "endpoint",
+        "model",
+        "context",
+        "max-out",
+        "thinking",
+        "images",
+    )
     widths = [
         max(len(headers[index]), *(len(row[index]) for row in rows))
         if rows
@@ -369,40 +367,28 @@ def format_model_metadata_table(models: Sequence[Mapping[str, object]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _model_provider(selection: object) -> str | None:
-    provider = _safe_model_getattr(selection, "provider", None)
-    if isinstance(provider, str):
-        return provider
-    provider_id = _safe_model_getattr(selection, "provider_id", None)
-    return provider_id if isinstance(provider_id, str) else None
+def _safe_normalize_model_selection(selection: object) -> ModelSelection | None:
+    try:
+        return normalize_model_selection(selection)
+    except Exception:
+        return None
 
 
-def _model_id(selection: object) -> str | None:
-    model_id = _safe_model_getattr(selection, "model_id", None)
-    if isinstance(model_id, str):
-        return model_id
-    model_id = _safe_model_getattr(selection, "id", None)
-    return model_id if isinstance(model_id, str) else None
+def _model_label(selection: ModelSelection) -> str:
+    return model_selection_ref(selection)
 
 
 def _optional_int_attr(selection: object, attr: str) -> int | None:
-    value = _safe_model_getattr(selection, attr, None)
+    value = _detail_field(selection, attr)
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _bool_model_attr(selection: object, *attrs: str) -> bool:
     for attr in attrs:
-        value = _safe_model_getattr(selection, attr, None)
+        value = _detail_field(selection, attr)
         if isinstance(value, bool):
             return value
     return False
-
-
-def _safe_model_getattr(selection: object, name: str, default: object) -> object:
-    try:
-        return getattr(selection, name, default)
-    except Exception:
-        return default
 
 
 def _is_subsequence(needle: str, haystack: str) -> bool:
@@ -448,14 +434,17 @@ __all__ = [
     "PersistModelSelection",
     "apply_session_model_selection",
     "ensure_usable_session_model",
+    "format_model_metadata_table",
+    "get_session_model_identity",
     "get_session_model_selection",
+    "iter_available_model_details",
     "iter_available_model_selections",
     "iter_scoped_model_selections",
-    "format_model_metadata_table",
+    "model_choice_data_from_details",
+    "model_choice_data_from_selections",
+    "model_identity_data",
     "model_listing_getter",
     "model_listing_matches_query",
-    "model_choice_data_from_details",
-    "model_identity_data",
     "normalize_model_listing",
     "unique_sorted_model_entries",
 ]

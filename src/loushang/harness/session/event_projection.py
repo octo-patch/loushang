@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, TypeAlias, cast
 
 from loushang.agent.types import AgentToolResult
 from loushang.ai.json_codec import serialize_assistant_message_event
+from loushang.foundation.json import JsonValueError, require_json_mapping
+from loushang.harness.artifacts.references import SessionBlobRef
 from loushang.harness.events.json import snake_case_json_keys
 from loushang.harness.events.projection import matches_event_select
 from loushang.harness.presentation import ToolDefinitionResolver, ToolRenderRuntime
 from loushang.harness.session.event_serialization import serialize_session_event
 from loushang.harness.tools.core import ToolRenderOutput
 from loushang.harness.transcript import create_agent_transcript_message_codec
-from loushang.protocol import JsonValueError, require_json_mapping
 
 SessionEvent: TypeAlias = Mapping[str, Any]
 JsonEventView = Literal["full", "compact", "assistant_stream", "tools", "final"]
@@ -229,10 +230,13 @@ def _render_tool_event(
     expanded: bool,
 ) -> ToolRenderOutput:
     try:
-        return tool_render_runtime.render_event(
-            event,
-            tool_definition_resolver,
-            expanded=expanded,
+        return cast(
+            ToolRenderOutput,
+            tool_render_runtime.render_event(
+                event,
+                tool_definition_resolver,
+                expanded=expanded,
+            ),
         )
     except Exception:
         return None
@@ -380,6 +384,22 @@ def _rendered_tool_artifacts(event: SessionEvent) -> list[dict[str, str]]:
             if stream is not None:
                 artifact["stream"] = stream
             artifacts.append(artifact)
+    for key in ("stdout_blob", "stderr_blob"):
+        value = details.get(key)
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            reference = SessionBlobRef.from_manifest_entry(value)
+        except (TypeError, ValueError):
+            continue
+        artifact = {
+            "type": "session-blob",
+            "name": reference.logical_name,
+            "blobId": reference.blob_id,
+        }
+        stream = "stdout" if key == "stdout_blob" else "stderr"
+        artifact["stream"] = stream
+        artifacts.append(artifact)
     return artifacts
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, redirect_stderr
@@ -10,7 +11,6 @@ from io import StringIO
 from pathlib import Path
 from typing import Generic, TextIO, TypeAlias, TypeVar, cast
 
-from loushang.channel import ProductHostLifecycle
 from loushang.harness.cli.agent_args import (
     AgentCliArgs,
     agent_cli_bootstrap_args,
@@ -28,12 +28,18 @@ from loushang.harness.cli.launch import (
     cli_output_guard_enabled,
     cli_static_error,
 )
+from loushang.harness.cli.plugin_management import PluginManagementCliBinding
 from loushang.harness.cli.resource_toggles import (
     agent_resource_toggle_request,
     report_agent_resource_settings_errors,
 )
-from loushang.harness.cli.session_resolution import resolve_agent_cli_session
+from loushang.harness.cli.session_resolution import (
+    SessionResolutionRuntime,
+    resolve_agent_cli_session,
+)
+from loushang.harness.host.product_host import ProductHostLifecycle
 from loushang.harness.tools.workspace import (
+    ToolPolicyEvaluator,
     WorkspaceToolRuntimeSettings,
     workspace_tool_runtime_settings,
 )
@@ -111,6 +117,13 @@ def format_cli_error(error: BaseException) -> str:
         strerror = getattr(error, "strerror", None)
         if filename is not None and strerror:
             return f"{strerror}: {filename}"
+    code = getattr(error, "code", None)
+    if (
+        getattr(error, "expose_cli_code", False) is True
+        and isinstance(code, str)
+        and code
+    ):
+        return f"{code}: {error}"
     return str(error)
 
 
@@ -124,6 +137,8 @@ class AgentCliApplicationState(Generic[AgentArgsT]):
     settings_manager: object | None
     tool_registry: object
     approval_resolver: object | None
+    tool_policy_evaluator: object | None = None
+    plugin_management: PluginManagementCliBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -151,9 +166,15 @@ class AgentCliStatePreparationPorts(Generic[AgentArgsT]):
         [object, WorkspaceToolRuntimeSettings, object],
         object,
     ]
-    policy_factory: Callable[..., object]
-    build_interactive_approval_resolver: Callable[[], object]
+    policy_factory: Callable[..., ToolPolicyEvaluator]
+    build_interactive_approval_resolver: Callable[..., object]
     run_resource_toggle: Callable[..., int | None]
+    build_plugin_management: (
+        Callable[[Path, object | None], PluginManagementCliBinding | None] | None
+    ) = None
+    build_plugin_management_read: (
+        Callable[[Path, object | None], PluginManagementCliBinding | None] | None
+    ) = None
     evaluate_plugin_source: Callable[[str], str | None] | None = None
     is_remote_plugin_source: Callable[[str], bool] | None = None
     on_policy_denied: Callable[[object, str, str | None], None] | None = None
@@ -171,6 +192,19 @@ async def prepare_agent_cli_application_state(
     args = context.args
     resolved_services = services or ports.build_services(context.project_root)
     settings_manager = getattr(resolved_services, "settings_manager", None)
+    toggle_request = agent_resource_toggle_request(args)
+    read_only_list = args.list_plugins and toggle_request is None
+    management_factory = (
+        ports.build_plugin_management_read
+        if read_only_list and ports.build_plugin_management_read is not None
+        else ports.build_plugin_management
+    )
+    plugin_management = (
+        management_factory(context.project_root, settings_manager)
+        if management_factory is not None
+        and (args.list_plugins or args.enable_plugins or args.disable_plugins)
+        else None
+    )
     report_agent_resource_settings_errors(
         args,
         settings_manager,
@@ -178,9 +212,10 @@ async def prepare_agent_cli_application_state(
     )
     toggle_result = ports.run_resource_toggle(
         settings_manager,
-        agent_resource_toggle_request(args),
+        toggle_request,
         stdout=context.stdout,
         stderr=context.stderr,
+        plugin_management=plugin_management,
         evaluate_plugin_source=ports.evaluate_plugin_source,
         is_remote_plugin_source=ports.is_remote_plugin_source,
         on_policy_denied=(
@@ -228,19 +263,18 @@ async def prepare_agent_cli_application_state(
         policy_factory=ports.policy_factory,
     )
     configured_resolver = tool_settings.approval_resolver
-    interactive_resolver = (
-        ports.build_interactive_approval_resolver()
-        if configured_resolver is None
-        else None
+    interactive_resolver = invoke_cli_builder(
+        ports.build_interactive_approval_resolver,
+        required={},
+        optional={"fallback": configured_resolver},
     )
-    approval_resolver = configured_resolver or interactive_resolver
     tool_registry = (
         ports.build_empty_tool_registry()
         if runtime_args.no_builtin_tools
         else ports.build_tool_registry(
             resolved_services,
             tool_settings,
-            approval_resolver,
+            interactive_resolver,
         )
     )
     return CliPhaseResult.continue_with(
@@ -251,6 +285,8 @@ async def prepare_agent_cli_application_state(
             settings_manager=settings_manager,
             tool_registry=tool_registry,
             approval_resolver=interactive_resolver,
+            tool_policy_evaluator=tool_settings.policy_engine,
+            plugin_management=plugin_management,
         )
     )
 
@@ -270,6 +306,7 @@ async def collect_agent_cli_help_extension_flags(
         CliMaybeAsync[object | None],
     ],
     services: object | None = None,
+    dispose_runtime: Callable[[object], CliMaybeAsync[None]] | None = None,
 ) -> dict[str, object]:
     """Discover extension flags using the Product's standard CLI bindings."""
 
@@ -279,6 +316,7 @@ async def collect_agent_cli_help_extension_flags(
         no_session=True,
     )
     resolved_services = services or state_ports.build_services(project_root)
+    runtime: object | None = None
     try:
         session_dir = resolve_agent_session_dir(
             args,
@@ -309,6 +347,9 @@ async def collect_agent_cli_help_extension_flags(
         return collect_extension_flags(session) if session is not None else {}
     except Exception:
         return {}
+    finally:
+        if runtime is not None and dispose_runtime is not None:
+            await _settle_runtime_disposal(dispose_runtime, runtime)
 
 
 @dataclass(frozen=True)
@@ -357,6 +398,7 @@ class CliApplicationPorts(Generic[ArgsT, StateT, RuntimeT, SessionT]):
         CliMaybeAsync[int],
     ]
     output_guard: CliOutputGuard
+    dispose_runtime: Callable[[RuntimeT], CliMaybeAsync[None]] | None = None
     pre_session_bootstrap: Callable[
         [CliRuntimeContext[ArgsT, StateT, RuntimeT]],
         CliMaybeAsync[CliPhaseResult[SessionT] | None],
@@ -424,6 +466,7 @@ class AgentCliApplicationBinding(Generic[AgentArgsT]):
     ]
     host_lifecycle: ProductHostLifecycle
     services: object | None = None
+    dispose_runtime: Callable[[object], CliMaybeAsync[None]] | None = None
     format_error: Callable[[BaseException], str] = format_cli_error
     session_resolution_error: (
         Callable[
@@ -449,6 +492,26 @@ class AgentCliApplicationBinding(Generic[AgentArgsT]):
         ]
         | None
     ) = None
+
+
+def _run_agent_cli_runtime_operation(
+    context: CliRuntimeContext[
+        AgentArgsT, AgentCliApplicationState[AgentArgsT], object
+    ],
+    *,
+    format_error: Callable[[BaseException], str],
+) -> int | None:
+    result = run_agent_cli_session_listing(
+        context.state.args,
+        context.runtime,
+        stdout=context.bootstrap.stdout,
+        stderr=context.bootstrap.stderr,
+        default_cwd=context.bootstrap.project_root,
+        format_error=format_error,
+    )
+    if result == 0 and context.state.args.export is not None:
+        return None
+    return result
 
 
 def build_agent_cli_application_ports(
@@ -480,10 +543,18 @@ def build_agent_cli_application_ports(
                         services=services,
                         tool_registry=registry,
                         approval_resolver=None,
+                        tool_policy_evaluator=None,
                     )
                 ),
-                resolve_session=resolve_agent_cli_session,
+                resolve_session=lambda args, runtime, project_root: (
+                    resolve_agent_cli_session(
+                        args,
+                        cast(SessionResolutionRuntime, runtime),
+                        project_root,
+                    )
+                ),
                 services=binding.services,
+                dispose_runtime=binding.dispose_runtime,
             )
         ),
         format_help=binding.format_help,
@@ -523,13 +594,10 @@ def build_agent_cli_application_ports(
             services=state.services,
             tool_registry=state.tool_registry,
             approval_resolver=state.approval_resolver,
+            tool_policy_evaluator=state.tool_policy_evaluator,
         ),
-        runtime_operation=lambda context: run_agent_cli_session_listing(
-            context.state.args,
-            context.runtime,
-            stdout=context.bootstrap.stdout,
-            stderr=context.bootstrap.stderr,
-            format_error=binding.format_error,
+        runtime_operation=lambda context: _run_agent_cli_runtime_operation(
+            context, format_error=binding.format_error
         ),
         pre_session_bootstrap=(
             binding.pre_session_bootstrap
@@ -547,6 +615,7 @@ def build_agent_cli_application_ports(
         output_guard=lambda enabled: binding.host_lifecycle.output_guard(
             enabled=enabled
         ),
+        dispose_runtime=binding.dispose_runtime,
         format_error=binding.format_error,
     )
 
@@ -595,7 +664,7 @@ async def _resolve_bound_agent_cli_session(
             raise RuntimeError(message)
     return await resolve_agent_cli_session(
         context.state.args,
-        context.runtime,
+        cast(SessionResolutionRuntime, context.runtime),
         context.bootstrap.project_root,
     )
 
@@ -654,82 +723,110 @@ class CliApplicationRuntime(Generic[ArgsT, StateT, RuntimeT, SessionT]):
             return prepared.exit_code
         state = cast(StateT, prepared.value)
 
-        with self._ports.startup_context(bootstrap, state):
-            with self._ports.output_guard(
-                cli_output_guard_enabled(bootstrap.launch_plan)
-            ):
-                runtime = await _resolve(self._ports.build_runtime(bootstrap, state))
-            runtime_context = CliRuntimeContext(
-                bootstrap=bootstrap,
-                state=state,
-                runtime=runtime,
-            )
-            with self._ports.output_guard(
-                cli_output_guard_enabled(self._ports.launch_plan(bootstrap_args))
-            ):
-                runtime_result = await _resolve(
-                    self._ports.runtime_operation(runtime_context)
-                )
-            if runtime_result is not None:
-                return runtime_result
-            try:
+        runtime: RuntimeT | None = None
+        try:
+            with self._ports.startup_context(bootstrap, state):
                 with self._ports.output_guard(
                     cli_output_guard_enabled(bootstrap.launch_plan)
                 ):
-                    pre_session = await _resolve(
-                        self._ports.pre_session_bootstrap(runtime_context)
+                    runtime = await _resolve(
+                        self._ports.build_runtime(bootstrap, state)
                     )
-                    if pre_session is not None:
-                        if pre_session.exit_code is not None:
-                            return pre_session.exit_code
-                        session = cast(SessionT, pre_session.value)
-                    else:
-                        session = await _resolve(
-                            self._ports.resolve_session(runtime_context)
+                runtime_context = CliRuntimeContext(
+                    bootstrap=bootstrap,
+                    state=state,
+                    runtime=runtime,
+                )
+                with self._ports.output_guard(
+                    cli_output_guard_enabled(self._ports.launch_plan(bootstrap_args))
+                ):
+                    runtime_result = await _resolve(
+                        self._ports.runtime_operation(runtime_context)
+                    )
+                if runtime_result is not None:
+                    return runtime_result
+                session: SessionT | None
+                try:
+                    with self._ports.output_guard(
+                        cli_output_guard_enabled(bootstrap.launch_plan)
+                    ):
+                        pre_session = await _resolve(
+                            self._ports.pre_session_bootstrap(runtime_context)
                         )
-            except (
-                FileNotFoundError,
-                NotADirectoryError,
-                RuntimeError,
-                ValueError,
-            ) as error:
-                stderr.write(f"Error: {self._ports.format_error(error)}\n")
-                return 1
-        if session is None:
-            return 2
+                        if pre_session is not None:
+                            if pre_session.exit_code is not None:
+                                return pre_session.exit_code
+                            session = cast(SessionT, pre_session.value)
+                        else:
+                            session = await _resolve(
+                                self._ports.resolve_session(runtime_context)
+                            )
+                except (
+                    FileNotFoundError,
+                    NotADirectoryError,
+                    RuntimeError,
+                    ValueError,
+                ) as error:
+                    stderr.write(f"Error: {self._ports.format_error(error)}\n")
+                    return 1
+            if session is None:
+                return 2
 
-        extension_flags = self._ports.collect_extension_flags(session)
-        parsed = self._ports.parse_args(
-            raw_argv,
-            stderr,
-            extension_flags,
-            False,
-        )
-        if parsed.args is None:
-            return parsed.exit_code
-        args = parsed.args
-        session_context = CliSessionContext(
-            bootstrap=bootstrap,
-            args=args,
-            launch_plan=self._ports.launch_plan(args),
-            state=state,
-            runtime=runtime,
-            session=session,
-        )
-        with self._ports.output_guard(
-            cli_output_guard_enabled(session_context.launch_plan)
-        ):
-            configure_result = await _resolve(
-                self._ports.configure_session(session_context)
+            extension_flags = self._ports.collect_extension_flags(session)
+            parsed = self._ports.parse_args(
+                raw_argv,
+                stderr,
+                extension_flags,
+                False,
             )
-            if configure_result is not None:
-                return configure_result
-            operation_result = await _resolve(
-                self._ports.session_operations(session_context)
+            if parsed.args is None:
+                return parsed.exit_code
+            args = parsed.args
+            session_context = CliSessionContext(
+                bootstrap=bootstrap,
+                args=args,
+                launch_plan=self._ports.launch_plan(args),
+                state=state,
+                runtime=runtime,
+                session=session,
             )
-            if operation_result is not None:
-                return operation_result
-            return await _resolve(self._ports.run_host(session_context))
+            with self._ports.output_guard(
+                cli_output_guard_enabled(session_context.launch_plan)
+            ):
+                configure_result = await _resolve(
+                    self._ports.configure_session(session_context)
+                )
+                if configure_result is not None:
+                    return configure_result
+                operation_result = await _resolve(
+                    self._ports.session_operations(session_context)
+                )
+                if operation_result is not None:
+                    return operation_result
+                return await _resolve(self._ports.run_host(session_context))
+        finally:
+            if runtime is not None and self._ports.dispose_runtime is not None:
+                await _settle_runtime_disposal(self._ports.dispose_runtime, runtime)
+
+
+async def _settle_runtime_disposal(
+    dispose: Callable[[RuntimeT], CliMaybeAsync[None]], runtime: RuntimeT
+) -> None:
+    """Keep a Product cleanup task alive through repeated CLI cancellation."""
+
+    async def run() -> None:
+        await _resolve(dispose(runtime))
+
+    task = asyncio.create_task(run())
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+    task.result()
+    if interrupted:
+        raise asyncio.CancelledError
 
 
 def capture_cli_parse(
@@ -779,6 +876,7 @@ def invoke_agent_cli_runtime_builder(
     services: object,
     tool_registry: object,
     approval_resolver: object | None,
+    tool_policy_evaluator: object | None = None,
 ) -> ResultT:
     """Invoke an Agent runtime builder with the standard CLI arguments."""
 
@@ -791,7 +889,10 @@ def invoke_agent_cli_runtime_builder(
             "services": services,
             "tool_registry": tool_registry,
         },
-        optional={"approval_resolver": approval_resolver},
+        optional={
+            "approval_resolver": approval_resolver,
+            "tool_policy_evaluator": tool_policy_evaluator,
+        },
     )
 
 

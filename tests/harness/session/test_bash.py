@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
+
+import pytest
 
 from loushang.agent.types import AgentToolResult
 from loushang.ai.types import Context, TextPart
+from loushang.harness.artifacts import SessionBlobRef
 from loushang.harness.conversation import CommandExecutionRecord
-from loushang.harness.session import BashExecutionPorts, BashExecutionRuntime
+from loushang.harness.session.bash import (
+    BashExecutionPorts,
+    BashExecutionRuntime,
+    SessionCommandExecutionRuntime,
+    UserCommandHookResult,
+    UserCommandRequest,
+    command_result_from_tool_result,
+)
 from loushang.harness.workspace.exec import ExecOutputChunk
 
 
@@ -46,13 +57,28 @@ def test_bash_runtime_executes_streams_and_records_context(tmp_path) -> None:
                 details={"exit_code": 0},
             )
 
-    class ToolRegistry:
-        def get_definition(self, name: str):
-            assert name == "bash"
-            return BashTool()
-
     def refresh_context() -> None:
         refreshes.append(True)
+
+    bash_tool = BashTool()
+
+    async def execute_definition(
+        definition,
+        *,
+        tool_call_id,
+        arguments,
+        signal=None,
+        on_update=None,
+        operation_bindings=None,
+    ):
+        del operation_bindings
+        assert definition is bash_tool
+        return await definition.execute(
+            tool_call_id,
+            arguments,
+            signal=signal,
+            on_update=on_update,
+        )
 
     async def on_output(chunk: ExecOutputChunk) -> None:
         chunks.append(chunk)
@@ -60,7 +86,8 @@ def test_bash_runtime_executes_streams_and_records_context(tmp_path) -> None:
     runtime = BashExecutionRuntime(
         BashExecutionPorts(
             get_cwd=transcript.get_cwd,
-            get_definition=lambda: ToolRegistry().get_definition("bash"),
+            get_definition=lambda: bash_tool,
+            execute_definition=execute_definition,
             create_call_id=lambda: "bash-test-1",
             append_record=transcript.append_message,
             refresh_context=refresh_context,
@@ -84,6 +111,111 @@ def test_bash_runtime_executes_streams_and_records_context(tmp_path) -> None:
     assert command.command == "printf hi"
 
 
+def test_bash_runtime_records_both_session_owned_stream_blobs() -> None:
+    records: list[CommandExecutionRecord] = []
+    stdout = SessionBlobRef(
+        session_id="session-1",
+        blob_id="a" * 64,
+        logical_name="command-output/stdout.log",
+        kind="command-stdout",
+        media_type="text/plain",
+        disclosure="private",
+        size_bytes=10,
+        sha256="a" * 64,
+        created_at=1.0,
+    )
+    stderr = SessionBlobRef(
+        session_id="session-1",
+        blob_id="b" * 64,
+        logical_name="command-output/stderr.log",
+        kind="command-stderr",
+        media_type="text/plain",
+        disclosure="private",
+        size_bytes=10,
+        sha256="b" * 64,
+        created_at=1.0,
+    )
+
+    async def execute_definition(*_args, **_kwargs):
+        return AgentToolResult(
+            content=[TextPart(type="text", text="preview")],
+            details={
+                "exit_code": 0,
+                "truncated": True,
+                "stdout_blob": stdout.manifest_entry(),
+                "stderr_blob": stderr.manifest_entry(),
+            },
+        )
+
+    async def append_record(record: CommandExecutionRecord) -> None:
+        records.append(record)
+
+    runtime = BashExecutionRuntime(
+        BashExecutionPorts(
+            get_cwd=lambda: "/workspace",
+            get_definition=lambda: object(),
+            execute_definition=execute_definition,
+            create_call_id=lambda: "call-1",
+            append_record=append_record,
+            refresh_context=lambda: None,
+        )
+    )
+
+    result = asyncio.run(runtime.execute("build"))
+
+    assert result["full_output_path"] is None
+    assert records[0].stdout_blob == stdout
+    assert records[0].stderr_blob == stderr
+    assert records[0].full_output_path is None
+
+
+def test_bash_runtime_records_retained_streams_before_reraising_failure() -> None:
+    records: list[CommandExecutionRecord] = []
+    stdout = SessionBlobRef(
+        session_id="session-1",
+        blob_id="a" * 64,
+        logical_name="command-output/stdout.log",
+        kind="command-stdout",
+        media_type="text/plain",
+        disclosure="private",
+        size_bytes=10,
+        sha256="a" * 64,
+        created_at=1.0,
+    )
+
+    async def execute_definition(*_args, **_kwargs):
+        error = RuntimeError("preview\n\nCommand exited with code 7")
+        error.tool_result_details = {
+            "exit_code": 7,
+            "cancelled": False,
+            "truncated": True,
+            "stdout_blob": stdout.manifest_entry(),
+        }
+        raise error
+
+    async def append_record(record: CommandExecutionRecord) -> None:
+        records.append(record)
+
+    runtime = BashExecutionRuntime(
+        BashExecutionPorts(
+            get_cwd=lambda: "/workspace",
+            get_definition=lambda: object(),
+            execute_definition=execute_definition,
+            create_call_id=lambda: "call-1",
+            append_record=append_record,
+            refresh_context=lambda: None,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="exited with code 7"):
+        asyncio.run(runtime.execute("build"))
+
+    assert len(records) == 1
+    assert records[0].exit_code == 7
+    assert records[0].stdout_blob == stdout
+    assert records[0].full_output_path is None
+
+
 def test_bash_runtime_injects_session_owned_operations() -> None:
     selected_operations = object()
     executed: list[dict[str, object]] = []
@@ -100,10 +232,33 @@ def test_bash_runtime_injects_session_owned_operations() -> None:
                 details={"exit_code": 0},
             )
 
+    bash_tool = BashTool()
+
+    async def execute_definition(
+        definition,
+        *,
+        tool_call_id,
+        arguments,
+        signal=None,
+        on_update=None,
+        operation_bindings=None,
+    ):
+        assert definition is bash_tool
+        assert isinstance(operation_bindings, dict)
+        operation_bindings_seen.append(operation_bindings)
+        return await definition.execute(
+            tool_call_id,
+            arguments,
+            signal=signal,
+            on_update=on_update,
+        )
+
+    operation_bindings_seen: list[dict[str, object]] = []
     runtime = BashExecutionRuntime(
         BashExecutionPorts(
             get_cwd=lambda: "/tmp/project",
-            get_definition=lambda: BashTool(),
+            get_definition=lambda: bash_tool,
+            execute_definition=execute_definition,
             create_call_id=lambda: "bash-session-1",
             append_record=append_record,
             refresh_context=lambda: None,
@@ -113,4 +268,202 @@ def test_bash_runtime_injects_session_owned_operations() -> None:
 
     asyncio.run(runtime.execute("true"))
 
-    assert executed[0]["__operations"] is selected_operations
+    assert "__operations" not in executed[0]
+    assert operation_bindings_seen == [{"bash_operations": selected_operations}]
+
+
+def test_bash_compatibility_runtime_uses_plain_script_for_shell_definition() -> None:
+    executed: list[dict[str, object]] = []
+
+    async def append_record(record: object) -> None:
+        del record
+
+    class ShellTool:
+        name = "shell"
+
+    async def execute_definition(
+        definition,
+        *,
+        tool_call_id,
+        arguments,
+        signal=None,
+        on_update=None,
+        operation_bindings=None,
+    ):
+        del definition, tool_call_id, signal, on_update, operation_bindings
+        executed.append(arguments)
+        return AgentToolResult(
+            content=[TextPart(type="text", text="ok\n")],
+            details={"exit_code": 0},
+        )
+
+    runtime = BashExecutionRuntime(
+        BashExecutionPorts(
+            get_cwd=lambda: r"C:\workspace",
+            get_definition=ShellTool,
+            execute_definition=execute_definition,
+            create_call_id=lambda: "shell-session-1",
+            append_record=append_record,
+            refresh_context=lambda: None,
+        )
+    )
+
+    asyncio.run(runtime.execute("Get-Location"))
+
+    assert executed == [
+        {"command": "Get-Location", "cwd": r"C:\workspace"}
+    ]
+
+
+def test_command_execution_is_single_flight_during_before_execute() -> None:
+    async def scenario() -> None:
+        hook_entered = asyncio.Event()
+        release_hook = asyncio.Event()
+
+        async def before_execute(
+            request: UserCommandRequest,
+        ) -> UserCommandHookResult | None:
+            del request
+            hook_entered.set()
+            await release_hook.wait()
+            return None
+
+        async def execute_definition(
+            definition: object,
+            *,
+            tool_call_id: str,
+            arguments: dict[str, object],
+            signal: object | None = None,
+            on_update: Callable[[object], Awaitable[None]] | None = None,
+            operation_bindings: dict[str, object] | None = None,
+        ) -> AgentToolResult[object]:
+            del (
+                definition,
+                tool_call_id,
+                arguments,
+                signal,
+                on_update,
+                operation_bindings,
+            )
+            return AgentToolResult(
+                content=[TextPart(type="text", text="done\n")],
+                details={"exit_code": 0},
+            )
+
+        async def append_record(record: CommandExecutionRecord) -> None:
+            del record
+
+        runtime = SessionCommandExecutionRuntime(
+            command_name="Bash",
+            get_cwd=lambda: "/tmp/project",
+            get_definition=object,
+            execute_definition=execute_definition,
+            build_execution_params=lambda command, cwd: {
+                "command": command,
+                "cwd": cwd,
+            },
+            create_call_id=lambda: "single-flight",
+            append_record=append_record,
+            refresh_context=lambda: None,
+            before_execute=before_execute,
+        )
+        first = asyncio.create_task(runtime.execute("first"))
+        await hook_entered.wait()
+        try:
+            assert runtime.is_running is True
+            with pytest.raises(RuntimeError, match="already in progress"):
+                await runtime.execute("second")
+        finally:
+            release_hook.set()
+            await first
+
+    asyncio.run(scenario())
+
+
+def test_command_execution_abort_records_streamed_output() -> None:
+    async def scenario() -> None:
+        execution_started = asyncio.Event()
+        records: list[CommandExecutionRecord] = []
+
+        async def execute_definition(
+            definition: object,
+            *,
+            tool_call_id: str,
+            arguments: dict[str, object],
+            signal: object | None = None,
+            on_update: Callable[[object], Awaitable[None]] | None = None,
+            operation_bindings: dict[str, object] | None = None,
+        ) -> AgentToolResult[object]:
+            del definition, tool_call_id, arguments, operation_bindings
+            assert signal is not None
+            assert on_update is not None
+            await on_update(
+                AgentToolResult(
+                    content=[TextPart(type="text", text="out\n")],
+                    details={"stream": "stdout"},
+                )
+            )
+            await on_update(
+                AgentToolResult(
+                    content=[TextPart(type="text", text="err\n")],
+                    details={"stream": "stderr"},
+                )
+            )
+            execution_started.set()
+            while not getattr(signal, "aborted", False):
+                await asyncio.sleep(0)
+            raise RuntimeError("out\nerr\n\nCommand aborted")
+
+        async def append_record(record: CommandExecutionRecord) -> None:
+            records.append(record)
+
+        runtime = SessionCommandExecutionRuntime(
+            command_name="Bash",
+            get_cwd=lambda: "/tmp/project",
+            get_definition=object,
+            execute_definition=execute_definition,
+            build_execution_params=lambda command, cwd: {
+                "command": command,
+                "cwd": cwd,
+            },
+            create_call_id=lambda: "abort",
+            append_record=append_record,
+            refresh_context=lambda: None,
+        )
+        pending = asyncio.create_task(runtime.execute("long-running"))
+        await execution_started.wait()
+
+        runtime.abort()
+        result = await pending
+
+        assert result == {
+            "output": "out\nerr\n",
+            "exit_code": None,
+            "cancelled": True,
+            "truncated": False,
+            "full_output_path": None,
+        }
+        assert records == [
+            CommandExecutionRecord(
+                command="long-running",
+                output="out\nerr\n",
+                exit_code=None,
+                cancelled=True,
+            )
+        ]
+        assert runtime.is_running is False
+
+    asyncio.run(scenario())
+
+
+def test_command_result_preserves_interleaved_stdout_stderr_without_duplication() -> (
+    None
+):
+    result = command_result_from_tool_result(
+        AgentToolResult(
+            content=[TextPart(type="text", text="out-1\nerr\nout-2\n")],
+            details={"exit_code": 0, "stderr": "err\n"},
+        )
+    )
+
+    assert result["output"] == "out-1\nerr\nout-2\n"

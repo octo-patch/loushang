@@ -17,6 +17,7 @@ from loushang.harness.runtime import (
 
 def _assistant_message(text: str) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text=text)],
         api="anthropic-messages",
@@ -64,17 +65,25 @@ def _completed_stream(message: AssistantMessage) -> AssistantMessageEventStream:
 def test_agent_side_question_uses_committed_context_without_persisting(
     tmp_path,
 ) -> None:
-    class _NeverRunTool:
-        name = "dangerous"
-        description = "Must stay advertised for cache compatibility."
-        parameters: dict[str, object] = {"type": "object", "properties": {}}
-        label = "Dangerous"
+    async def scenario() -> None:
+        from loushang.harness.tools.core import ToolDefinition
+        from loushang.harness.tools.execution import direct_execution
+        from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 
-        async def execute(self, *args, **kwargs):
+        async def never_run(*args, **kwargs):
             del args, kwargs
             raise AssertionError("side-question tools must be blocked")
 
-    async def scenario() -> None:
+        registry = WorkspaceToolRegistry()
+        registry.register_tool(
+            ToolDefinition(
+                name="dangerous",
+                label="Dangerous",
+                description="Must stay advertised for cache compatibility.",
+                parameters={"type": "object", "properties": {}},
+                execution=direct_execution(never_run),
+            )
+        )
         captured_contexts: list[object] = []
 
         async def stream_fn(model, context, options=None):
@@ -97,11 +106,16 @@ def test_agent_side_question_uses_committed_context_without_persisting(
         parent = Agent(
             initial_state={
                 "system_prompt": "Stable parent prompt",
-                "tools": [_NeverRunTool()],
+                "tools": [],
             },
             stream_fn=stream_fn,
         )
-        session = AgentSession(agent=parent, session_manager=manager)
+        session = AgentSession(
+            agent=parent,
+            session_manager=manager,
+            tool_registry=registry,
+            active_tool_names=["dangerous"],
+        )
         entries_before = list(manager.get_entries())
         parent_messages_before = list(parent.state.messages)
         updates: list[str] = []
@@ -163,6 +177,36 @@ def test_side_question_coordinator_cancels_only_its_active_request() -> None:
         with pytest.raises(asyncio.CancelledError):
             await task
         assert provider.cancelled is True
+        assert coordinator.active is False
+
+    asyncio.run(scenario())
+
+
+def test_side_question_cancel_error_still_joins_the_owned_request() -> None:
+    class _Provider:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def ask(self, question: str, *, on_update=None) -> SideQuestionAnswer:
+            del question, on_update
+            self.started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        def cancel(self) -> None:
+            raise RuntimeError("provider cancel failed")
+
+    async def scenario() -> None:
+        provider = _Provider()
+        coordinator = SideQuestionCoordinator(provider)
+        task = asyncio.create_task(coordinator.ask("question"))
+        await provider.started.wait()
+
+        with pytest.raises(RuntimeError, match="provider cancel failed"):
+            await coordinator.cancel_and_wait()
+        assert task.done()
+        with pytest.raises(asyncio.CancelledError):
+            await task
         assert coordinator.active is False
 
     asyncio.run(scenario())

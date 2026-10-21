@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from hashlib import sha256
 from pathlib import Path
 from typing import Protocol, TypeVar
+from uuid import uuid4
 
 from loushang.harness.resources.packages.materializer import (
     PackageMaterializationRecord,
+)
+from loushang.harness.resources.packages.product_contract import (
+    PackageProductEntrypoint,
+    PackageProductLifecycleAction,
+    PackageProductLifecycleIntentV1,
+    PackageProductLifecycleInventoryPort,
+    PackageProductLifecycleMode,
+    PackageProductLifecycleOperationPort,
+    PackageProductLifecycleRecordV1,
+    PackageProductUpdateManifestReceiptV1,
+    PackageProductUpdateTargetV1,
+    canonicalize_package_product_scope,
+)
+from loushang.harness.resources.packages.settings_mutation import (
+    PackageSourceSettingsMutation,
 )
 from loushang.harness.resources.packages.source import is_remote_package_source
 
@@ -35,11 +53,58 @@ class PackageMaterializerPort(Protocol):
 
     def forget_remote_source(self, source: str) -> None: ...
 
+    def list_records(self) -> list[PackageMaterializationRecord]: ...
+
 
 PackageMaterializerProvider = Callable[[], PackageMaterializerPort | None]
-PackageSourceRegistration = Callable[[str, str], None]
-PackageResourceRefresh = Callable[[], None]
+PackageSourceRegistration = Callable[[str, str], PackageSourceSettingsMutation]
+PackageResourceRefresh = Callable[[], object | Awaitable[object]]
 PackageUpdatePreparation = Callable[[], object | Awaitable[object]]
+PackageOperationRecord = PackageMaterializationRecord | PackageProductLifecycleRecordV1
+
+
+@dataclass(frozen=True, slots=True)
+class PackageResourceRefreshOutcome:
+    """Per-call proof of whether this package mutation crossed publication."""
+
+    published: bool
+    error: BaseException | None = None
+    settled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.published, bool):
+            raise TypeError("Package Resource refresh publication flag must be a bool")
+        if self.error is not None and not isinstance(self.error, BaseException):
+            raise TypeError("Package Resource refresh error is invalid")
+        if not isinstance(self.settled, bool):
+            raise TypeError("Package Resource settlement flag must be a bool")
+        if not self.settled and self.error is None:
+            raise ValueError(
+                "Unsettled Package Resource refresh requires an error"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class PackageResourceRefreshTransaction:
+    """Package-owned mutation hooks executed by the Catalog transaction port."""
+
+    begin: Callable[[], PackageSourceSettingsMutation]
+    settle: Callable[
+        [PackageSourceSettingsMutation, PackageResourceRefreshOutcome], None
+    ]
+
+    def __post_init__(self) -> None:
+        if not callable(self.begin) or not callable(self.settle):
+            raise TypeError("Package Resource refresh transaction hooks are invalid")
+
+
+PackageResourceRefreshTransactionRunner = Callable[
+    [PackageResourceRefreshTransaction], object | Awaitable[object]
+]
+
+
+class PackageMutationRequiresAsyncError(RuntimeError):
+    """A Catalog-backed package mutation cannot publish synchronously."""
 
 
 @dataclass
@@ -51,52 +116,206 @@ class PackageOperationsRuntime:
     remove_source: PackageSourceRegistration
     refresh_resources: PackageResourceRefresh
     prepare_updates: PackageUpdatePreparation | None = None
+    refresh_transaction: PackageResourceRefreshTransactionRunner | None = None
+    product_lifecycle: PackageProductLifecycleOperationPort | None = None
+    product_inventory: PackageProductLifecycleInventoryPort | None = None
+    product_lifecycle_mode: PackageProductLifecycleMode = "legacy"
+    _settings_transaction_lock: asyncio.Lock = field(
+        init=False,
+        default_factory=asyncio.Lock,
+        repr=False,
+    )
 
-    async def materialize(self, source: str) -> PackageMaterializationRecord:
-        if is_remote_package_source(source):
-            materializer = self._require_materializer()
-            return await materializer.materialize_remote_source(source)
+    def __post_init__(self) -> None:
+        if self.product_lifecycle_mode not in {"legacy", "dark", "enforced"}:
+            raise ValueError("Unsupported Package Product lifecycle mode")
+        if self.product_lifecycle_mode == "legacy":
+            if self.product_lifecycle is not None or self.product_inventory is not None:
+                raise ValueError("Legacy Package mode cannot receive Product bindings")
+            return
+        if self.product_lifecycle is None:
+            if self.product_lifecycle_mode == "enforced":
+                raise ValueError("Enforced Package Product mode requires activation")
+            if self.product_inventory is not None:
+                raise ValueError("Package Product inventory requires activation")
+            return
+        if getattr(self.product_lifecycle, "active", None) is not True:
+            raise ValueError("Package Product lifecycle must be activated before use")
+        if self.product_inventory is not None and (
+            getattr(self.product_inventory, "binding_id", None)
+            != self.product_lifecycle.binding_id
+        ):
+            raise ValueError("Package Product inventory owner does not match lifecycle")
 
-        path = Path(source).expanduser().resolve()
-        if not path.exists():
-            raise FileNotFoundError(f"Package path does not exist: {path}")
-        return PackageMaterializationRecord(
+    async def materialize(
+        self,
+        source: str,
+        *,
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+        scope: str = "project",
+    ) -> PackageOperationRecord:
+        routed = self._route_product(
+            action="materialize",
             source=source,
-            name=path.name,
-            lifecycle="installed",
-            target_path=path,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
         )
+        if routed is not None:
+            return routed
+        return await self._materialize_legacy(source)
 
     async def install(
         self,
         source: str,
         *,
         scope: str,
-    ) -> PackageMaterializationRecord:
-        record = await self.materialize(source)
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+    ) -> PackageOperationRecord:
+        routed = self._route_product(
+            action="install",
+            source=source,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
+        )
+        if routed is not None:
+            return routed
+        record = await self._materialize_legacy(source)
         if record.lifecycle != "installed":
             return record
-        self.add_source(source, scope)
-        self.refresh_resources()
+        async with self._settings_transaction_lock:
+            outcome = await self._refresh_settings_mutation(
+                lambda: self.add_source(source, scope)
+            )
+            _raise_refresh_error(outcome)
         return record
 
-    async def update(self, source: str) -> PackageMaterializationRecord:
+    async def update(
+        self,
+        source: str,
+        *,
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+        scope: str = "project",
+    ) -> PackageOperationRecord:
+        routed = self._route_product(
+            action="update",
+            source=source,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
+        )
+        if routed is not None:
+            return routed
         if not is_remote_package_source(source):
-            return await self.materialize(source)
-        materializer = self._require_materializer()
-        record = await materializer.update_remote_source(source)
-        self.refresh_resources()
+            record = await self._materialize_legacy(source)
+        else:
+            materializer = self._require_materializer()
+            record = await materializer.update_remote_source(source)
+        _raise_refresh_error(await self._refresh_outcome())
         return record
 
-    async def update_all(self) -> list[PackageMaterializationRecord]:
+    async def update_all(
+        self,
+        *,
+        entrypoint: PackageProductEntrypoint = "operations",
+        scope: str = "project",
+        operation_id: str | None = None,
+    ) -> list[PackageOperationRecord]:
+        scope = canonicalize_package_product_scope(scope)
+        lifecycle = self.product_lifecycle
+        if lifecycle is not None:
+            inventory = self.product_inventory
+            if inventory is None:
+                raise RuntimeError("Package Product update inventory is not available")
+            batch_id = operation_id or uuid4().hex
+
+            async def bind_inventory() -> tuple[PackageProductUpdateTargetV1, ...]:
+                if inventory.binding_id != lifecycle.binding_id:
+                    raise RuntimeError(
+                        "Package Product inventory owner changed after composition"
+                    )
+                targets = inventory.list_update_targets(scope=scope)
+                if not isinstance(targets, tuple) or any(
+                    not isinstance(target, PackageProductUpdateTargetV1)
+                    or target.scope != scope
+                    for target in targets
+                ):
+                    raise RuntimeError("Package Product update inventory is invalid")
+                ordered = tuple(sorted(targets, key=lambda target: target.target_ref))
+                if len({target.target_ref for target in ordered}) != len(ordered):
+                    raise RuntimeError(
+                        "Package Product update inventory contains duplicates"
+                    )
+                if inventory.binding_id != lifecycle.binding_id:
+                    raise RuntimeError(
+                        "Package Product inventory owner changed after listing"
+                    )
+                receipt = inventory.bind_update_targets(
+                    operation_id=batch_id,
+                    scope=scope,
+                    targets=ordered,
+                )
+                expected_receipt = PackageProductUpdateManifestReceiptV1.create(
+                    binding_id=lifecycle.binding_id,
+                    operation_id=batch_id,
+                    scope=scope,
+                    target_refs=tuple(target.target_ref for target in ordered),
+                )
+                if receipt != expected_receipt:
+                    raise RuntimeError(
+                        "Package Product update manifest receipt is invalid"
+                    )
+                if inventory.binding_id != lifecycle.binding_id:
+                    raise RuntimeError(
+                        "Package Product inventory owner changed after composition"
+                    )
+                return ordered
+
+            ordered = await lifecycle.execute_guarded_query(bind_inventory)
+            return [
+                await self.update(
+                    target.source,
+                    entrypoint=entrypoint,
+                    scope=target.scope,
+                    operation_id=sha256(
+                        f"{batch_id}\0{target.target_ref}".encode("utf-8")
+                    ).hexdigest(),
+                )
+                for target in ordered
+            ]
         if self.prepare_updates is not None:
             await _resolve(self.prepare_updates())
         materializer = self._require_materializer()
-        records = await materializer.update_all_remote_sources()
-        self.refresh_resources()
-        return records
+        legacy_records: list[PackageOperationRecord] = [
+            record for record in await materializer.update_all_remote_sources()
+        ]
+        _raise_refresh_error(await self._refresh_outcome())
+        return legacy_records
 
-    def remove(self, source: str) -> PackageMaterializationRecord:
+    def remove(
+        self,
+        source: str,
+        *,
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+        scope: str = "project",
+    ) -> PackageOperationRecord:
+        routed = self._route_product(
+            action="remove",
+            source=source,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
+        )
+        if routed is not None:
+            return routed
+        return self._remove_legacy(source)
+
+    def _remove_legacy(self, source: str) -> PackageMaterializationRecord:
         if not is_remote_package_source(source):
             path = Path(source).expanduser().resolve()
             return PackageMaterializationRecord(
@@ -107,25 +326,265 @@ class PackageOperationsRuntime:
             )
         return self._require_materializer().remove_remote_source(source)
 
-    def uninstall(
+    async def uninstall(
         self,
         source: str,
         *,
         scope: str,
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+    ) -> PackageOperationRecord:
+        routed = self._route_product(
+            action="uninstall",
+            source=source,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
+        )
+        if routed is not None:
+            return routed
+        async with self._settings_transaction_lock:
+            outcome = await self._refresh_settings_mutation(
+                lambda: self.remove_source(source, scope)
+            )
+            if outcome.published and outcome.settled:
+                record = self._remove_materialized_source(source, outcome=outcome)
+            else:
+                record = self._uninstalled_record(source)
+            _raise_refresh_error(outcome)
+            return record
+
+    def uninstall_sync(
+        self,
+        source: str,
+        *,
+        scope: str,
+        entrypoint: PackageProductEntrypoint = "operations",
+        operation_id: str | None = None,
+        legacy_refresh_available: Callable[[], bool] | None = None,
+    ) -> PackageOperationRecord:
+        """Preserve the legacy synchronous contract behind an explicit gate."""
+
+        routed = self._route_product(
+            action="uninstall",
+            source=source,
+            scope=scope,
+            entrypoint=entrypoint,
+            operation_id=operation_id,
+        )
+        if routed is not None:
+            return routed
+        if legacy_refresh_available is not None and not legacy_refresh_available():
+            raise PackageMutationRequiresAsyncError(
+                "Catalog-backed package uninstall requires uninstall_package_async()"
+            )
+
+        outcome = self._refresh_settings_mutation_sync(
+            lambda: self.remove_source(source, scope)
+        )
+        if outcome.published and outcome.settled:
+            record = self._remove_materialized_source(source, outcome=outcome)
+        else:
+            record = self._uninstalled_record(source)
+        _raise_refresh_error(outcome)
+        return record
+
+    async def _refresh_outcome(self) -> PackageResourceRefreshOutcome:
+        try:
+            refreshed = await _resolve(self.refresh_resources())
+        except BaseException as error:
+            return PackageResourceRefreshOutcome(published=False, error=error)
+        return _coerce_refresh_outcome(refreshed)
+
+    async def _refresh_settings_mutation(
+        self,
+        begin: Callable[[], PackageSourceSettingsMutation],
+    ) -> PackageResourceRefreshOutcome:
+        transaction_runner = self.refresh_transaction
+        if transaction_runner is None:
+            mutation = begin()
+            outcome = await self._refresh_outcome()
+            self._finish_settings_mutation(mutation, outcome=outcome)
+            return outcome
+        transaction = PackageResourceRefreshTransaction(
+            begin=begin,
+            settle=lambda mutation, outcome: self._finish_settings_mutation(
+                mutation,
+                outcome=outcome,
+            ),
+        )
+        try:
+            refreshed = await _resolve(transaction_runner(transaction))
+        except BaseException as error:
+            return PackageResourceRefreshOutcome(published=False, error=error)
+        return _coerce_refresh_outcome(refreshed)
+
+    def _refresh_settings_mutation_sync(
+        self,
+        begin: Callable[[], PackageSourceSettingsMutation],
+    ) -> PackageResourceRefreshOutcome:
+        transaction_runner = self.refresh_transaction
+        if transaction_runner is None:
+            mutation = begin()
+            try:
+                refreshed = self.refresh_resources()
+            except BaseException as error:
+                outcome = PackageResourceRefreshOutcome(
+                    published=False,
+                    error=error,
+                )
+            else:
+                if inspect.isawaitable(refreshed):
+                    if inspect.iscoroutine(refreshed):
+                        refreshed.close()
+                    mutation.rollback()
+                    raise PackageMutationRequiresAsyncError(
+                        "Catalog-backed package uninstall requires "
+                        "uninstall_package_async()"
+                    )
+                outcome = _coerce_refresh_outcome(refreshed)
+            self._finish_settings_mutation(mutation, outcome=outcome)
+            return outcome
+
+        transaction = PackageResourceRefreshTransaction(
+            begin=begin,
+            settle=lambda mutation, outcome: self._finish_settings_mutation(
+                mutation,
+                outcome=outcome,
+            ),
+        )
+        try:
+            refreshed = transaction_runner(transaction)
+        except BaseException as error:
+            return PackageResourceRefreshOutcome(published=False, error=error)
+        if inspect.isawaitable(refreshed):
+            if inspect.iscoroutine(refreshed):
+                refreshed.close()
+            raise PackageMutationRequiresAsyncError(
+                "Catalog-backed package uninstall requires "
+                "uninstall_package_async()"
+            )
+        return _coerce_refresh_outcome(refreshed)
+
+    @staticmethod
+    def _finish_settings_mutation(
+        mutation: PackageSourceSettingsMutation,
+        *,
+        outcome: PackageResourceRefreshOutcome,
+    ) -> None:
+        if outcome.published:
+            mutation.commit()
+        else:
+            try:
+                mutation.rollback()
+            except BaseException as rollback_error:
+                if outcome.error is None:
+                    raise
+                outcome.error.add_note(
+                    "Package source settings rollback also failed: "
+                    f"{rollback_error!r}"
+                )
+
+    def _remove_materialized_source(
+        self,
+        source: str,
+        *,
+        outcome: PackageResourceRefreshOutcome,
     ) -> PackageMaterializationRecord:
-        record = self.remove(source)
-        self.remove_source(source, scope)
+        try:
+            record = self._remove_legacy(source)
+            if record.lifecycle == "failed":
+                raise RuntimeError(
+                    record.error_message or "Package materialization cleanup failed"
+                )
+            self._forget_remote_source(source)
+        except BaseException as cleanup_error:
+            if outcome.error is None:
+                raise
+            outcome.error.add_note(
+                f"Published package uninstall cleanup also failed: {cleanup_error!r}"
+            )
+            return self._uninstalled_record(source)
+        return record
+
+    def _uninstalled_record(self, source: str) -> PackageMaterializationRecord:
+        if not is_remote_package_source(source):
+            path = Path(source).expanduser().resolve()
+            return PackageMaterializationRecord(
+                source=source,
+                name=path.name,
+                lifecycle="remote_registered",
+                target_path=path,
+            )
+        materializer = self.get_materializer()
+        record = (
+            None
+            if materializer is None
+            else getattr(materializer, "get_record", lambda _source: None)(source)
+        )
+        if isinstance(record, PackageMaterializationRecord):
+            return record.with_lifecycle("remote_registered")
+        return PackageMaterializationRecord(
+            source=source,
+            name=Path(source.rstrip("/")).stem or "package",
+            lifecycle="remote_registered",
+            target_path=Path("."),
+        )
+
+    def _forget_remote_source(self, source: str) -> None:
         materializer = self.get_materializer()
         if materializer is not None:
             materializer.forget_remote_source(source)
-        self.refresh_resources()
-        return record
 
     def _require_materializer(self) -> PackageMaterializerPort:
         materializer = self.get_materializer()
         if materializer is None:
             raise RuntimeError("Package materializer is not available.")
         return materializer
+
+    async def _materialize_legacy(self, source: str) -> PackageMaterializationRecord:
+        if is_remote_package_source(source):
+            return await self._require_materializer().materialize_remote_source(source)
+        path = Path(source).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Package path does not exist: {path}")
+        return PackageMaterializationRecord(
+            source=source,
+            name=path.name,
+            lifecycle="installed",
+            target_path=path,
+        )
+
+    def _route_product(
+        self,
+        *,
+        action: PackageProductLifecycleAction,
+        source: str,
+        scope: str,
+        entrypoint: PackageProductEntrypoint,
+        operation_id: str | None,
+    ) -> PackageProductLifecycleRecordV1 | None:
+        lifecycle = self.product_lifecycle
+        if lifecycle is None:
+            if self.product_lifecycle_mode == "enforced":
+                raise RuntimeError("Package Product lifecycle is not available")
+            return None
+        intent = PackageProductLifecycleIntentV1(
+            operation_id=operation_id or uuid4().hex,
+            action=action,
+            source=source,
+            scope=scope,
+        )
+        outcome = lifecycle.route(intent, entrypoint=entrypoint)
+        if not outcome.handled:
+            if self.product_lifecycle_mode == "enforced":
+                raise RuntimeError(
+                    "Package Product route has no accepted non-Plugin owner"
+                )
+            return None
+        if outcome.record is None:
+            raise RuntimeError("Plugin Package route returned no Product record")
+        return outcome.record
 
 
 async def _resolve(value: T | Awaitable[T]) -> T:
@@ -134,11 +593,33 @@ async def _resolve(value: T | Awaitable[T]) -> T:
     return value
 
 
+def _coerce_refresh_outcome(value: object) -> PackageResourceRefreshOutcome:
+    if value is None:
+        return PackageResourceRefreshOutcome(published=True)
+    if isinstance(value, PackageResourceRefreshOutcome):
+        return value
+    return PackageResourceRefreshOutcome(
+        published=False,
+        error=TypeError("Package Resource refresh returned an invalid outcome"),
+    )
+
+
+def _raise_refresh_error(outcome: PackageResourceRefreshOutcome) -> None:
+    if outcome.error is not None:
+        raise outcome.error
+
+
 __all__ = [
     "PackageMaterializerPort",
     "PackageMaterializerProvider",
+    "PackageOperationRecord",
     "PackageOperationsRuntime",
+    "PackageProductLifecycleInventoryPort",
+    "PackageMutationRequiresAsyncError",
     "PackageResourceRefresh",
+    "PackageResourceRefreshOutcome",
+    "PackageResourceRefreshTransaction",
+    "PackageResourceRefreshTransactionRunner",
     "PackageSourceRegistration",
     "PackageUpdatePreparation",
 ]

@@ -4,10 +4,13 @@ import asyncio
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime
 
-from loushang.coding.domain.work import create_coding_work_runtime
+from loushang.coding.adapters.harnesswork import create_coding_work_runtime
 from loushang.harness.events import RuntimeEvent
-from loushang.work.event_log import EventLogBackend
-from loushang.work.session import SessionWorkRuntime, SessionWorkTurn
+from loushang.harnesswork.event_log import EventLogBackend
+from loushang.harnesswork.integrations.session import (
+    SessionWorkRuntime,
+    SessionWorkTurn,
+)
 
 
 class FakePromptSession:
@@ -103,9 +106,7 @@ async def _submit_turn(
     )
 
 
-def test_session_work_runtime_logs_coding_operation_and_projected_events() -> (
-    None
-):
+def test_session_work_runtime_logs_coding_operation_and_projected_events() -> None:
     from loushang.work import InMemoryEventLogBackend
 
     async def scenario() -> None:
@@ -299,6 +300,7 @@ def test_session_work_runtime_jsonl_log_can_replay_persisted_turn(tmp_path) -> N
         input=0, output=0, cache_read=0, cache_write=0, total_tokens=0, cost={}
     )
     assistant = AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text="done")],
         api="anthropic-messages",
@@ -517,9 +519,7 @@ def test_session_work_runtime_always_emits_plan_boundaries_for_a_planned_run() -
     asyncio.run(scenario())
 
 
-def test_session_work_runtime_records_complete_plan_failure_lifecycle() -> (
-    None
-):
+def test_session_work_runtime_records_complete_plan_failure_lifecycle() -> None:
     from loushang.work import InMemoryEventLogBackend
 
     async def scenario() -> None:
@@ -563,7 +563,9 @@ def test_session_work_runtime_records_complete_plan_failure_lifecycle() -> (
     asyncio.run(scenario())
 
 
-def test_session_work_runtime_records_step_and_plan_failures_before_run_failure() -> None:
+def test_session_work_runtime_records_step_and_plan_failures_before_run_failure() -> (
+    None
+):
     from loushang.work import InMemoryEventLogBackend
 
     async def scenario() -> None:
@@ -689,9 +691,9 @@ def test_session_work_runtime_unsubscribes_on_success_failure_and_cancellation()
                 "WorkRunFailed",
                 "WorkRunCancelled",
             }
-            assert sum(
-                entry.payload["kind"] in terminal_kinds for entry in entries
-            ) == 1
+            assert (
+                sum(entry.payload["kind"] in terminal_kinds for entry in entries) == 1
+            )
             assert entries[-1].payload["kind"] in terminal_kinds
 
     asyncio.run(scenario())

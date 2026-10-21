@@ -6,12 +6,16 @@ from pathlib import Path
 import pytest
 
 import loushang.tui.render_loop as render_loop_module
-from loushang.observability import configure_debug_logging, reset_observability
+from loushang.foundation.observability._router import (
+    configure_debug_logging,
+    reset_observability,
+)
 from loushang.tui import (
     CURSOR_MARKER,
     CursorDeclaration,
     FakeTerminalPort,
     ProcessTerminalPort,
+    RenderBaselineReset,
     RenderConstraints,
     RenderLine,
     RenderLoop,
@@ -82,6 +86,28 @@ class FlatFrameRoot:
             tuple(RenderLine(line) for line in self.lines),
             constraints=constraints,
             cursor=self.cursor,
+        )
+
+
+class VisibleHeightRoot(FlatFrameRoot):
+    def render(self, constraints: RenderConstraints) -> RenderResult:
+        visible_height = constraints.visible_height
+        if visible_height is None:
+            return super().render(constraints)
+        start = max(0, len(self.lines) - visible_height)
+        cursor = self.cursor
+        visible_cursor = (
+            None
+            if cursor is None
+            else CursorDeclaration(
+                row=max(0, cursor.row - start),
+                column=cursor.column,
+            )
+        )
+        return RenderResult.from_lines(
+            tuple(RenderLine(line) for line in self.lines[start:]),
+            constraints=constraints,
+            cursor=visible_cursor,
         )
 
 
@@ -489,6 +515,7 @@ def test_render_plan_context_carries_cursor_and_diff_facts() -> None:
 
 def test_default_render_strategy_order_matches_design() -> None:
     assert DEFAULT_STRATEGY_ORDER == (
+        RenderPlanStrategyKind.SCROLLBACK_REPLAY,
         RenderPlanStrategyKind.FIRST_RENDER,
         RenderPlanStrategyKind.TRANSCRIPT_WINDOW_TRIMMED_RESET,
         RenderPlanStrategyKind.BASELINE_RESET,
@@ -556,6 +583,143 @@ def test_ordinary_baseline_reset_precedes_resize_repaint() -> None:
 
     assert step.operation_class == "baseline_repaint"
     assert step.repaint_reason == "transcript_window_replaced:resume"
+
+
+def test_scrollback_replay_seeds_hidden_prefix_once_and_positions_cursor() -> None:
+    lines = tuple(f"history {index}" for index in range(5)) + (
+        "› draft",
+        "status",
+    )
+    root = FlatFrameRoot(
+        lines,
+        cursor=CursorDeclaration(row=5, column=7),
+    )
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=4))
+    loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    loop.reset_baseline(
+        RenderBaselineReset(
+            reason="transcript_window_replaced:resume",
+            replay_hidden_prefix=True,
+        )
+    )
+    runtime = TuiRuntime(render_loop=loop, terminal=port)
+
+    replay = runtime.render_now()
+
+    replay.assert_operation_class("scrollback_replay")
+    replay.assert_no_clear_scrollback()
+    operation_kinds = tuple(operation.kind for operation in replay.diagnostics.operations)
+    assert operation_kinds[:4] == (
+        "hide_cursor",
+        "begin_synchronized_update",
+        "reset_scroll_region",
+        "clear_screen",
+    )
+    assert operation_kinds[-3:] == (
+        "end_synchronized_update",
+        "move_cursor",
+        "show_cursor",
+    )
+    assert tuple(port.screen.scrollback_lines) == lines[:3]
+    assert port.screen.visible_lines == lines[3:]
+    assert (port.screen.cursor_row, port.screen.cursor_column) == (2, 7)
+    assert loop.scrollback_viewport_top == 3
+
+    scrollback_after_replay = tuple(port.screen.scrollback_lines)
+    unchanged = runtime.render_now()
+
+    unchanged.assert_operation_class("noop")
+    assert tuple(port.screen.scrollback_lines) == scrollback_after_replay
+
+
+def test_scrollback_replay_expands_a_normally_viewport_bounded_root_once() -> None:
+    lines = tuple(f"history {index}" for index in range(5)) + (
+        "› draft",
+        "status",
+    )
+    root = VisibleHeightRoot(
+        lines,
+        cursor=CursorDeclaration(row=5, column=7),
+    )
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=4))
+    loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    loop.reset_baseline(
+        RenderBaselineReset(
+            reason="transcript_window_replaced:resume",
+            replay_hidden_prefix=True,
+        )
+    )
+    runtime = TuiRuntime(render_loop=loop, terminal=port)
+
+    replay = runtime.render_now()
+
+    replay.assert_operation_class("scrollback_replay")
+    assert tuple(replay.diagnostics.current_logical_lines) == lines[-4:]
+    assert tuple(port.screen.scrollback_lines) + port.screen.visible_lines == lines
+
+    unchanged = runtime.render_now()
+
+    unchanged.assert_operation_class("noop")
+    assert tuple(port.screen.scrollback_lines) + port.screen.visible_lines == lines
+
+
+def test_live_scrollback_replay_does_not_displace_old_composer_into_history() -> None:
+    root = FlatFrameRoot(
+        ("old answer", "› old draft"),
+        cursor=CursorDeclaration(row=1, column=11),
+    )
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=4))
+    loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    runtime = TuiRuntime(render_loop=loop, terminal=port)
+    runtime.render_now()
+
+    resumed_lines = tuple(f"resumed {index}" for index in range(6)) + (
+        "› new draft",
+        "status",
+    )
+    root.lines = resumed_lines
+    root.cursor = CursorDeclaration(row=6, column=11)
+    loop.reset_baseline(
+        RenderBaselineReset(
+            reason="transcript_window_replaced:resume",
+            replay_hidden_prefix=True,
+        )
+    )
+
+    replay = runtime.render_now()
+
+    replay.assert_operation_class("scrollback_replay")
+    physical_lines = tuple(port.screen.scrollback_lines) + port.screen.visible_lines
+    assert physical_lines == resumed_lines
+    assert "› old draft" not in physical_lines
+
+
+def test_failed_scrollback_replay_flush_retries_without_advancing_baseline() -> None:
+    lines = tuple(f"history {index}" for index in range(7))
+    root = FlatFrameRoot(lines, cursor=CursorDeclaration(row=6, column=9))
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=4))
+    loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    runtime = TuiRuntime(render_loop=loop, terminal=port)
+    loop.reset_baseline(
+        RenderBaselineReset(
+            reason="transcript_window_replaced:resume",
+            replay_hidden_prefix=True,
+        )
+    )
+    screen_before = port.screen
+    port.fail_next_flush(RuntimeError("write failed"))
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        runtime.render_now()
+
+    assert port.screen == screen_before
+    assert loop.committed_frame_revision == 0
+
+    retried = runtime.render_now()
+
+    retried.assert_operation_class("scrollback_replay")
+    assert tuple(port.screen.scrollback_lines) + port.screen.visible_lines == lines
+    runtime.render_now().assert_operation_class("noop")
 
 
 def test_runtime_render_now_does_not_emit_tui_render_frame_when_scope_is_disabled() -> None:
@@ -1277,7 +1441,88 @@ def test_changed_range_above_viewport_rewrites_managed_viewport_without_clearing
     step.assert_operation_class("managed_viewport_repaint")
     step.assert_no_clear_scrollback()
     assert TerminalOperation.clear_screen() not in step.diagnostics.operations
+    assert TerminalOperation.clear_from_cursor() not in step.diagnostics.operations
     assert step.diagnostics.repaint_reason == "changed_range_above_viewport"
+
+
+@pytest.mark.parametrize("viewport_advance", (5, 6, 15))
+def test_changed_range_above_viewport_commits_large_advance_without_gaps(
+    viewport_advance: int,
+) -> None:
+    initial_lines = tuple(f"line {index}" for index in range(5))
+    root = StaticRoot(initial_lines)
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=5))
+    runtime = TuiRuntime(
+        render_loop=RenderLoop(root, clear_scrollback_policy="disabled"),
+        terminal=port,
+    )
+    runtime.render_now()
+    root.lines = (
+        "LINE 0",
+        *tuple(f"line {index}" for index in range(1, 5 + viewport_advance)),
+    )
+
+    step = runtime.render_now()
+
+    step.assert_operation_class("managed_viewport_repaint")
+    step.assert_no_clear_scrollback()
+    assert TerminalOperation.clear_screen() not in step.diagnostics.operations
+    assert TerminalOperation.clear_from_cursor() not in step.diagnostics.operations
+    assert step.diagnostics.repaint_reason == "changed_range_above_viewport"
+    assert step.diagnostics.viewport_top - step.diagnostics.previous_viewport_top == viewport_advance
+    assert port.screen.scrollback_lines + port.screen.visible_lines == root.lines
+
+
+def test_trimmed_transcript_rebases_scrollback_before_protected_append() -> None:
+    history = tuple(f"history {index}" for index in range(12))
+    footer = (
+        "",
+        "working 1.00s",
+        "",
+        f"› {CURSOR_MARKER}",
+        "",
+        "status running",
+    )
+    root = TextRoot("\n".join((*history, *footer)))
+    port = FakeTerminalPort(size=TerminalSize(columns=40, rows=8))
+    render_loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    runtime = TuiRuntime(render_loop=render_loop, terminal=port)
+    runtime.render_now()
+    physical_before_trim = port.screen.scrollback_lines + port.screen.visible_lines
+
+    root.text = "\n".join((*history[-2:], *footer))
+    render_loop.reset_baseline("transcript_window_trimmed:active_line_budget")
+    rebase = runtime.render_now()
+
+    rebase.assert_operation_class("managed_viewport_repaint")
+    rebase.assert_no_clear_scrollback()
+    assert TerminalOperation.clear_screen() not in rebase.diagnostics.operations
+    assert TerminalOperation.clear_from_cursor() not in rebase.diagnostics.operations
+    assert rebase.diagnostics.scrollback_frontier_rebased is True
+    assert port.screen.scrollback_lines + port.screen.visible_lines == physical_before_trim
+
+    root.text = "\n".join((*history[-2:], "append 0", "append 1", *footer))
+    first_append = runtime.render_now()
+    root.text = "\n".join(
+        (*history[-2:], "append 0", "append 1", "append 2", "append 3", *footer)
+    )
+    second_append = runtime.render_now()
+
+    first_append.assert_operation_class("protected_append_update")
+    second_append.assert_operation_class("protected_append_update")
+    assert port.screen.scrollback_lines + port.screen.visible_lines == (
+        *history,
+        "append 0",
+        "append 1",
+        "append 2",
+        "append 3",
+        "",
+        "working 1.00s",
+        "",
+        "›",
+        "",
+        "status running",
+    )
 
 
 def test_baseline_reset_repaints_active_screen_without_diffing_against_old_lines() -> None:
@@ -1292,10 +1537,42 @@ def test_baseline_reset_repaints_active_screen_without_diffing_against_old_lines
 
     step.assert_operation_class("baseline_repaint")
     step.assert_no_clear_scrollback()
+    assert TerminalOperation.clear_screen() not in step.diagnostics.operations
+    assert TerminalOperation.clear_from_cursor() not in step.diagnostics.operations
+    assert TerminalOperation.clear_line() in step.diagnostics.operations
     assert step.diagnostics.repaint_kind == "recovery"
     assert step.diagnostics.repaint_reason == "transcript_window_replaced"
+    assert step.diagnostics.scrollback_frontier_rebased is True
     assert step.diagnostics.previous_rendered_lines == ("old transcript", "status")
     assert step.diagnostics.current_logical_lines == ("compacted summary", "recent suffix", "status")
+
+
+def test_failed_trimmed_rebase_flush_does_not_advance_scrollback_frontier() -> None:
+    initial_lines = tuple(f"history {index}" for index in range(20))
+    root = StaticRoot(initial_lines)
+    port = FakeTerminalPort(size=TerminalSize(columns=30, rows=5))
+    render_loop = RenderLoop(root, clear_scrollback_policy="disabled")
+    runtime = TuiRuntime(render_loop=render_loop, terminal=port)
+    runtime.render_now()
+    committed_revision = render_loop.committed_frame_revision
+    committed_frontier = render_loop.scrollback_viewport_top
+    screen_before = port.screen
+
+    root.lines = initial_lines[-5:]
+    render_loop.reset_baseline("transcript_window_trimmed:active_line_budget")
+    port.fail_next_flush(RuntimeError("write failed"))
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        runtime.render_now()
+
+    assert render_loop.committed_frame_revision == committed_revision
+    assert render_loop.scrollback_viewport_top == committed_frontier
+    assert port.screen == screen_before
+
+    retry = runtime.render_now()
+
+    assert retry.diagnostics.scrollback_frontier_rebased is True
+    assert render_loop.scrollback_viewport_top == retry.diagnostics.viewport_top
 
 
 def test_failed_runtime_flush_does_not_advance_render_loop_snapshot() -> None:

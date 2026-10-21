@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import ast
+import sys
+from pathlib import Path
+
+HOSTING_ROOT = Path("src/loushang/hosting")
+H0_PUBLIC_MODULES = {
+    HOSTING_ROOT / "__init__.py",
+    HOSTING_ROOT / "contracts.py",
+    HOSTING_ROOT / "errors.py",
+    HOSTING_ROOT / "runtime.py",
+}
+H1_PRIVATE_MODULES = {
+    HOSTING_ROOT / "_process_backend.py",
+    HOSTING_ROOT / "_process_host.py",
+}
+H2_PRIVATE_MODULES = {
+    HOSTING_ROOT / "_platform.py",
+    HOSTING_ROOT / "_posix_process.py",
+    HOSTING_ROOT / "_win32_process.py",
+    HOSTING_ROOT / "_windows_process.py",
+}
+H3_PRIVATE_MODULES = {
+    HOSTING_ROOT / "_endpoint_backend.py",
+    HOSTING_ROOT / "_endpoint_host.py",
+    HOSTING_ROOT / "_endpoint_platform.py",
+    HOSTING_ROOT / "_posix_endpoint.py",
+    HOSTING_ROOT / "_windows_endpoint.py",
+}
+H4_PRIVATE_MODULES = {
+    HOSTING_ROOT / "_child_session_host.py",
+    HOSTING_ROOT / "_child_session_factory.py",
+}
+H6_PRIVATE_MODULES = {
+    HOSTING_ROOT / "_launch_preparation.py",
+    HOSTING_ROOT / "_posix_launch_preparation.py",
+    HOSTING_ROOT / "_windows_launch_preparation.py",
+    HOSTING_ROOT / "_windows_lpac_runtime.py",
+    # Narrow, Product-neutral Windows material read port; not in __init__.
+    HOSTING_ROOT / "windows_backend_material.py",
+    # Narrow friend read over one gated native child; not exported by Hosting.
+    HOSTING_ROOT / "gated_identity.py",
+}
+OPTIONAL_MANAGED_SERVICE_MODULES = {
+    # Linux lookup/observation only; still subject to the standard-library and
+    # product-neutral import checks below, not added to the public surface.
+    HOSTING_ROOT / "machine_identity.py",
+    HOSTING_ROOT / "service_group.py",
+    HOSTING_ROOT / "service.py",
+    HOSTING_ROOT / "service_handoff.py",
+    HOSTING_ROOT / "service_process.py",
+}
+FORBIDDEN_PUBLIC_TERMS = {
+    "Approval",
+    "Authorization",
+    "Capability",
+    "Plugin",
+    "Policy",
+    "Sandbox",
+    "Worker",
+}
+
+
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    result: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            result.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            result.add(node.module)
+    return result
+
+
+def test_hosting_package_is_standard_library_only_and_product_neutral() -> None:
+    modules = (
+        H0_PUBLIC_MODULES
+        | H1_PRIVATE_MODULES
+        | H2_PRIVATE_MODULES
+        | H3_PRIVATE_MODULES
+        | H4_PRIVATE_MODULES
+        | H6_PRIVATE_MODULES
+        | OPTIONAL_MANAGED_SERVICE_MODULES
+    )
+    assert {path for path in HOSTING_ROOT.rglob("*.py")} == modules
+
+    for path in modules:
+        for imported in _imports(path):
+            root = imported.partition(".")[0]
+            assert root in sys.stdlib_module_names, (path, imported)
+
+
+def test_h0_public_surface_exposes_no_platform_or_caller_authority_types() -> None:
+    public_surface = (HOSTING_ROOT / "__init__.py").read_text(encoding="utf-8")
+
+    assert all(term not in public_surface for term in FORBIDDEN_PUBLIC_TERMS)
+    for forbidden in (
+        "ProcessSpawner",
+        "PlatformBackend",
+        "InheritedHandle",
+        "RawHandle",
+        "pid",
+    ):
+        assert forbidden not in public_surface
+
+    assert all(path.name not in public_surface for path in H1_PRIVATE_MODULES)
+    assert "LinuxService" not in public_surface
+    assert "from .service import" not in public_surface
+    assert "ServiceChildHandoff" not in public_surface
+    assert "ServiceParentHandoff" not in public_surface
+    assert "from .service_handoff import" not in public_surface
+    assert "LinuxServiceProcess" not in public_surface
+    assert "from .service_process import" not in public_surface
+
+
+def test_h0_observation_contract_has_no_arbitrary_payload_or_environment() -> None:
+    contracts = (HOSTING_ROOT / "contracts.py").read_text(encoding="utf-8")
+    tree = ast.parse(contracts)
+    observation = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "HostingObservation"
+    )
+    fields = {
+        node.target.id
+        for node in observation.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+
+    assert fields == {
+        "component",
+        "transition",
+        "owner_id",
+        "session_id",
+        "backend_id",
+        "failure",
+    }
+    assert not fields.intersection({"payload", "details", "environment", "message"})
+
+
+def test_h0_validation_does_not_resolve_ambient_process_state() -> None:
+    contracts = (HOSTING_ROOT / "contracts.py").read_text(encoding="utf-8")
+
+    for ambient_operation in (
+        "os.environ",
+        "os.getcwd",
+        ".expanduser(",
+        ".resolve(",
+        "shlex",
+        "subprocess",
+    ):
+        assert ambient_operation not in contracts

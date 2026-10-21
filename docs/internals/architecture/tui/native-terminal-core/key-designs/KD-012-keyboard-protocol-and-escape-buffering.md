@@ -23,17 +23,57 @@ sequence as an arrow key, not as a standalone Escape followed by typed text.
 
 ### TerminalInputMode
 
-`TerminalInputMode` owns terminal mode setup and teardown:
+`TerminalInputMode` owns the shared setup and teardown sequence:
 
-- raw or cbreak input mode
 - bracketed paste enable and disable
 - focus event enable and disable
 - keyboard protocol query and cleanup writes
 - input drain on exit
 
+Native mode mutation is delegated through a platform mode lease. The POSIX
+backend owns cbreak/`termios` capture and restoration. On Windows, console
+flags are owned by the session-local `WindowsConsoleMode` selected as the
+`NativeConsoleMode`; the Windows input-mode lease is deliberately a no-op so
+that two objects never compete to restore the same console flags.
+
 It should not decide whether a partial `ESC` is a key, a prefix of a CSI
 sequence, or a prefix of an Alt-modified key. That decision belongs to the input
 assembler.
+
+### Native Platform Boundary
+
+Operating-system input transport is isolated below the shared input semantics:
+
+| Owner | Responsibility | Must not own |
+| --- | --- | --- |
+| `terminal_input.py` | protocol orchestration, TTY gate, async scheduling | `msvcrt`, `termios`, `select`, UTF-16 decoding |
+| `terminal_backends/__init__.py` | neutral protocols and lazy platform selection | concrete OS calls or product policy |
+| `terminal_backends/windows.py` | `msvcrt` reads, extended keys, UTF-16 surrogate normalization, Win32 console flags | composer, conversation, escape-sequence assembly |
+| `terminal_backends/posix.py` | file-descriptor reads, UTF-8 scalar boundaries, cbreak state lease | composer, conversation, escape-sequence assembly |
+| `terminal_backends/darwin.py` | Quartz/native Shift-key probing | input routing or product shortcuts |
+| `terminal_platform.py` | stable adapter protocol and delegation facade | `ctypes`, `msvcrt`, `termios`, Quartz calls |
+
+Platform composition uses two small ports, `NativeConsoleMode` and
+`NativeModifierKeys`, rather than one cross-platform interface containing every
+operating-system operation. Windows implements only the console-mode port,
+Darwin implements only the modifier-key port, and neutral no-op ports fill the
+unsupported capability. The public adapter retains its compatibility methods
+while the concrete implementations remain cohesive. `TerminalSession` consumes
+the neutral ports directly; a caller-provided legacy `TerminalPlatformAdapter`
+is converted once by `adapt_terminal_platform_adapter` at the session boundary.
+
+The dependency direction is one-way: shared input code selects a backend by
+platform name; a backend does not import the shared input orchestrator or any
+product layer. Concrete backends are imported lazily so importing
+`loushang.tui` on Windows never imports POSIX terminal modules, and importing it
+on POSIX never imports Windows console code.
+
+Windows Terminal exposes VT input through `msvcrt.getwch()` one UTF-16 unit at
+a time. The Windows transport may therefore retain a short, bounded burst after
+an initial `ESC` and forward that burst as one chunk. This is transport-level
+coalescing, not a second escape parser: the backend does not classify focus,
+paste, mouse, or keyboard sequences, and `InputReader` remains their only
+semantic owner.
 
 ### Keyboard Protocol Controller
 
@@ -100,6 +140,12 @@ sequences. The runtime handles that ambiguity with a pending-buffer deadline:
 
 The idle deadline is a last-resort decision for true standalone Escape. It is
 not a general delay added to every input event.
+
+The shared native loops currently use a centralized 30ms idle deadline. When a
+read and that deadline become ready on the same event-loop turn, the read gets
+one final scheduling opportunity before the pending buffer is flushed. This
+prevents a completed focus or bracketed-paste tail from being discarded at the
+deadline boundary while keeping terminal-runtime wakeups independent.
 
 ## Native Loop Contract
 
@@ -206,6 +252,10 @@ completeness rules.
 - absence of Kitty response enables modifyOtherKeys fallback.
 - bracketed paste remains atomic and is not affected by Escape idle flushing.
 - OSC, DCS, APC, mouse, and focus sequences can arrive split across chunks.
+- Windows `getwch()` focus and bracketed-paste bursts reach `InputReader`
+  without exposing `[I` or `[201~` as composer text.
+- screen-loop playback splits focus and bracketed-paste markers across the idle
+  boundary and submits only the pasted payload.
 - active surfaces receive normalized Escape before global abort handling.
 - slash completion closes on Escape without leaking raw escape fragments.
 - `/quit` or another exit command leaves no buffered tail that can corrupt the

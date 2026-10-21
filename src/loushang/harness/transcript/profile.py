@@ -11,6 +11,7 @@ from loushang.ai.types import (
     ImagePart,
     Message,
     TextPart,
+    ThinkingPart,
     ToolCall,
     ToolResultMessage,
     UserMessage,
@@ -27,6 +28,7 @@ from loushang.harness.conversation.replay import (
     ConversationCheckpoint,
     ConversationReplayFolder,
     ConversationReplayPorts,
+    ConversationReplayProjection,
 )
 from loushang.harness.conversation.types import (
     CommandExecutionRecord,
@@ -44,10 +46,17 @@ from loushang.harness.transcript.kinds import (
     CONTEXT_COMPACTION_CHECKPOINT_KIND,
     CONVERSATION_METADATA_PATCH_KIND,
     EXTENSION_DATA_KIND,
+    MODEL_CALL_ATTEMPT_USAGE_KIND,
+    MODEL_CALL_OUTCOME_KIND,
+    MODEL_INPUT_COMPONENT_KIND,
+    MODEL_INPUT_PREPARED_KIND,
     MODEL_SELECTION_KIND,
     RECORD_ANNOTATION_PATCH_KIND,
     STANDARD_AGENT_TRANSCRIPT_KINDS,
     THINKING_SELECTION_KIND,
+)
+from loushang.harness.transcript.model_input_v2_types import (
+    MODEL_INPUT_V2_PAYLOAD_VERSION,
 )
 from loushang.harness.transcript.types import (
     AgentTranscriptContext,
@@ -58,8 +67,15 @@ from loushang.harness.transcript.types import (
     ContextCompactionCheckpoint,
     ConversationMetadataPatch,
     ExtensionData,
+    ModelCallAttemptUsage,
+    ModelCallOutcome,
+    ModelInputComponent,
+    ModelInputNodeBundle,
+    ModelInputSnapshot,
+    ModelInputSnapshotV2,
     ModelSelectionSnapshot,
     RecordAnnotationPatch,
+    SessionImagePart,
     ThinkingSelectionSnapshot,
     application_message_content_blocks,
 )
@@ -201,11 +217,22 @@ class AgentTranscriptProfile:
         self,
         records: Sequence[AgentTranscriptRecord],
     ) -> AgentTranscriptContext:
-        projection = ConversationReplayFolder(self.replay_ports()).replay(records)
+        projection = self.replay_projection(records)
         return AgentTranscriptContext(
             messages=projection.items,
             state=projection.state,
         )
+
+    def replay_projection(
+        self,
+        records: Sequence[AgentTranscriptRecord],
+    ) -> ConversationReplayProjection[
+        AgentMessage,
+        AgentTranscriptState,
+    ]:
+        """Project context items together with their exact source record ids."""
+
+        return ConversationReplayFolder(self.replay_ports()).replay(records)
 
     def record_to_context_item(
         self,
@@ -378,6 +405,26 @@ class AgentTranscriptProfile:
                 reduce_state=_reduce_metadata_patch,
             ),
         )
+        self.register_record_profile(
+            MODEL_INPUT_COMPONENT_KIND,
+            RecordSemantics(
+                payload_types=(ModelInputComponent, ModelInputNodeBundle),
+            ),
+        )
+        self.register_record_profile(
+            MODEL_INPUT_PREPARED_KIND,
+            RecordSemantics(
+                payload_types=(ModelInputSnapshot, ModelInputSnapshotV2),
+            ),
+        )
+        self.register_record_profile(
+            MODEL_CALL_OUTCOME_KIND,
+            RecordSemantics(payload_types=(ModelCallOutcome,)),
+        )
+        self.register_record_profile(
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            RecordSemantics(payload_types=(ModelCallAttemptUsage,)),
+        )
 
 
 def record_to_context_item(
@@ -408,17 +455,29 @@ def command_execution_to_text(command: CommandExecutionRecord) -> str:
         text += "\n\n(command cancelled)"
     elif command.exit_code not in (None, 0):
         text += f"\n\nCommand exited with code {command.exit_code}"
-    if command.truncated and command.full_output_path:
-        text += f"\n\n[Output truncated. Full output: {command.full_output_path}]"
+    retained_outputs = command.output_blobs
+    if command.truncated and retained_outputs:
+        text += (
+            "\n\n[Output truncated. Full output retained as session blob"
+            + ("s" if len(retained_outputs) > 1 else "")
+            + ": "
+            + ", ".join(blob.logical_name for blob in retained_outputs)
+            + "]"
+        )
+    elif command.truncated and command.full_output_path:
+        text += "\n\n[Output truncated. Legacy full output is not portable.]"
     return text
 
 
 def application_message_to_user_message(
     message: ApplicationMessage,
 ) -> UserMessage:
+    content = application_message_content_blocks(message)
+    if any(isinstance(part, SessionImagePart) for part in content):
+        raise ValueError("durable Session images must be hydrated before AI projection")
     return UserMessage(
         role="user",
-        content=application_message_content_blocks(message),
+        content=cast(list[TextPart | ImagePart], content),
         timestamp=message.timestamp,
     )
 
@@ -461,7 +520,7 @@ def _replace_message_images(message: Message, *, placeholder: TextPart) -> Messa
 
     filtered: list[TextPart | ImagePart] = []
     for block in content:
-        if isinstance(block, ImagePart):
+        if isinstance(block, ImagePart | SessionImagePart):
             if not (
                 filtered
                 and isinstance(filtered[-1], TextPart)
@@ -490,6 +549,7 @@ def _reduce_agent_message(
         state,
         model_selection=ModelSelectionSnapshot(
             provider=message.provider,
+            endpoint_id=message.endpoint,
             model_id=message.model,
         ),
     )
@@ -642,11 +702,11 @@ def _payload_tokens(record: AgentTranscriptRecord) -> int:
         for part in payload.content:
             if isinstance(part, TextPart):
                 characters += len(part.text)
-            elif getattr(part, "type", None) == "thinking":
+            elif isinstance(part, ThinkingPart):
                 characters += len(part.thinking)
             elif isinstance(part, ToolCall):
                 characters += len(part.name) + len(str(part.arguments))
-            elif isinstance(part, ImagePart):
+            elif isinstance(part, ImagePart | SessionImagePart):
                 characters += 4_800
         return _characters_to_tokens(characters)
     if isinstance(payload, ToolResultMessage):
@@ -654,7 +714,9 @@ def _payload_tokens(record: AgentTranscriptRecord) -> int:
     return 0
 
 
-def _content_tokens(content: str | list[TextPart | ImagePart]) -> int:
+def _content_tokens(
+    content: str | Sequence[TextPart | ImagePart | SessionImagePart],
+) -> int:
     if isinstance(content, str):
         return _characters_to_tokens(len(content))
     characters = sum(
@@ -684,6 +746,28 @@ def _require_standard_payload_codecs(
         raise ValueError(
             "Agent transcript profile is missing standard payload codecs: "
             + ", ".join(missing)
+        )
+    model_input_kinds = (
+        MODEL_INPUT_COMPONENT_KIND,
+        MODEL_INPUT_PREPARED_KIND,
+    )
+    missing_v2 = [
+        kind
+        for kind in model_input_kinds
+        if (kind, MODEL_INPUT_V2_PAYLOAD_VERSION) not in registered
+    ]
+    if missing_v2:
+        raise ValueError(
+            "Agent transcript profile is missing Model Input v2 payload codecs: "
+            + ", ".join(missing_v2)
+        )
+    required_kinds = (*model_input_kinds, MODEL_CALL_ATTEMPT_USAGE_KIND)
+    required = set(registry.required_kinds)
+    missing_required = [kind for kind in required_kinds if kind not in required]
+    if missing_required:
+        raise ValueError(
+            "Agent transcript profile is missing required payload kinds: "
+            + ", ".join(missing_required)
         )
 
 

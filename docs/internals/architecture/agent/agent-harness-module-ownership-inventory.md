@@ -2,17 +2,12 @@
 
 ## Status
 
-Ownership inventory for
-[ARD-001: Agent Harness and Product Adapter Boundaries](ARD-001-agent-harness-and-product-adapters.md).
-Updated direction:
+Superseded as the current ownership inventory by the
+[Harness Current Owner Map](../harness/current-owner-map.md). This document is
+retained as the historical ownership input for
+[ARD-001: Agent Harness and Product Adapter Boundaries](ARD-001-agent-harness-and-product-adapters.md)
+and
 [ARD-002: Harness Product Adapter Substrate](ARD-002-harness-product-adapter-substrate.md).
-
-This document records module ownership for the prepared agent run contract. It is
-intentionally an inventory, not an implementation plan.
-It remains accurate for the current thin facade; future host/adapter substrate
-migration is tracked by the follow-up
-[Coding To Harness Migration Inventory](../harness/coding-to-harness-migration-inventory.md)
-before code moves.
 
 ## Scope
 
@@ -122,7 +117,7 @@ not harness candidates.
 | `policy` | Coding tool permission and approval policy | Product adapter | Do not move. |
 | `prompt` | Coding prompt assembly, preflight, templates | Product adapter | Do not move. |
 | `loader` / `resources` / `skill` | Resource discovery and Coding injection | Harness mechanism plus Product adapter | Move platform roots/layout, standard conventions, descriptors, discovery, merge, and reload to Harness. Keep content, activation, trust, and projection in Coding. |
-| `package` / `plugin` | Package/plugin lifecycle and materialization | Harness mechanism plus Product adapter | Move source/manifest/materialization and generic registry/resolver mechanics to Harness. Keep product policy, settings, and presentation in Coding. |
+| `package` / `plugin` | Resource Package lifecycle/materialization plus separate Plugin identity/source/enablement | Harness mechanism plus Product adapter | Move source/manifest/materialization and generic registry/resolver mechanics to Harness. Keep Product policy, settings, and presentation in Coding. |
 | `extensions` | Coding extension API, runner, policy, contributions | Product adapter | Do not move to agent. |
 | `domain` | Method-to-coding prepared turn bridge | Product adapter | Keep as product bridge. |
 | `control` | Settings, model controls, auth integration | Product adapter | Do not move. |
@@ -176,7 +171,8 @@ execution and must not become a mandatory harness dependency.
 | `method/applicability.py` | Applicability metadata parsing | Method primitive | Keep. |
 | `method/resources.py` | Product-neutral skill-like resource protocol and minimal skill discovery for method loading | Method primitive | Keep scoped to method needs. Do not absorb coding prompt/theme/extension loading. |
 | `method/loader.py` | Discover method resources and skill-backed methods | Method primitive | Keep independent from coding loader. |
-| `method/skill_adapter.py` | Adapt skill-like descriptors into method descriptors | Method primitive | Accept protocol-shaped resources; do not depend on coding descriptor classes. |
+| `method/skill_adapter.py` | Forward the historical import to the explicit legacy adapter until RCP5.5 | Method compatibility shim | Own no body logic or discovery authority. |
+| `method/legacy_skill_adapter.py` | Adapt explicitly legacy skill-like descriptors into method descriptors | Method compatibility primitive | Accept protocol-shaped resources; do not depend on coding descriptor classes or serve Catalog-default callers. |
 
 Known method cleanup candidates:
 

@@ -24,7 +24,7 @@ from loushang.harness.policy import (
 )
 from loushang.harness.policy_engine import PolicyEngine
 from loushang.harness.tools.workspace.authorization import (
-    execute_workspace_tool_action,
+    _execute_authorized_tool_action as execute_workspace_tool_action,
 )
 
 
@@ -51,9 +51,11 @@ def test_workspace_authorization_gateway_freezes_and_fingerprints_actions() -> N
     )
 
     assert first.fingerprint == second.fingerprint
-    assert first.arguments["edits"] == ({"old": "a", "new": "b"},)
+    assert first.authorization_arguments["edits"] == (
+        {"old": "a", "new": "b"},
+    )
     with pytest.raises(TypeError):
-        first.arguments["path"] = "/other"  # type: ignore[index]
+        first.authorization_arguments["path"] = "/other"  # type: ignore[index]
 
 
 @pytest.mark.parametrize("tool_name", ("read", "grep", "find", "ls"))
@@ -270,7 +272,10 @@ def test_workspace_gateway_includes_approval_in_the_same_audit_sequence(
         execute_workspace_tool_action(
             AskPolicy(),
             tool_name="write",
-            arguments={"path": str(tmp_path / "notes.txt"), "content": "hello"},
+            arguments={
+                "path": str(tmp_path / "notes.txt"),
+                "content": "private-audit-content",
+            },
             cwd=str(tmp_path),
             tool_call_id="call-2",
             approval_resolver=ActorBoundApprovalResolver(
@@ -294,6 +299,21 @@ def test_workspace_gateway_includes_approval_in_the_same_audit_sequence(
     assert events[2]["action_id"] == events[3]["action_id"]
     assert events[3]["approval_decision"] == "allow"
     assert {event["actor_id"] for event in events} == {"/root/reviewer#2"}
+    assert {event["tool_call_id"] for event in events} == {"call-2"}
+    assert len({event["action_fingerprint"] for event in events}) == 1
+    approval_id = events[2]["action_id"]
+    assert {
+        event["approval_action_id"]
+        for event in events
+        if event["type"]
+        in {
+            "tool_execution_started",
+            "tool_execution_completed",
+        }
+    } == {approval_id}
+    serialized = json.dumps(events)
+    assert "private-audit-content" not in serialized
+    assert str(tmp_path / "notes.txt") not in serialized
 
 
 def test_workspace_gateway_reuses_policy_scoped_session_approval(

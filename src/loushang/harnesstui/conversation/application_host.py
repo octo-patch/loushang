@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Protocol, TextIO
 
 from loushang.harnesstui.conversation.control import ConversationActionHost
 from loushang.harnesstui.conversation.host import (
     ConversationScreenRunProfile,
+)
+from loushang.harnesstui.conversation.input_policy import (
+    ConversationCapabilities,
+    ConversationInputCapabilities,
 )
 from loushang.harnesstui.conversation.plain_app import PlainConversationApp
 from loushang.harnesstui.conversation.run_context import (
@@ -40,7 +45,7 @@ class PreparedScreenSurfacePort(Protocol):
 
     async def handle_text(self, text: str) -> int | None: ...
 
-    async def handle_surface_intent(self, intent: InputIntent) -> int | None: ...
+    async def handle_surface_intent(self, intent: InputIntent[str]) -> int | None: ...
 
     def is_local_command(self, text: str) -> bool: ...
 
@@ -114,9 +119,13 @@ class PreparedScreenConversationRun:
     should_exit: ShouldExit
     trace: TraceFn
     keybindings: KeybindingManager | KeybindingConfig | None = None
+    input_capabilities: ConversationInputCapabilities = field(
+        default_factory=ConversationInputCapabilities
+    )
     history_records: tuple[DisplayRecord, ...] = ()
     transcript_source_factory: Callable[[], TranscriptSource] | None = None
     completion_provider: object | None = None
+    capability_provider: Callable[[], ConversationCapabilities] | None = field(default=None, kw_only=True)
     bind_presenter: CleanupBinder = _bind_no_cleanup
     bind_transition: CleanupBinder = _bind_no_cleanup
     on_history_installed: Callable[[InstalledConversationHistory], None] = (
@@ -141,7 +150,7 @@ async def run_prepared_screen_conversation(
     try:
         unbind_transition = run.bind_transition()
         listener = run.event_listener_factory()
-        with run.interaction_context:
+        with run.interaction_context, _capability_projection(run):
             unsubscribe = _no_cleanup
             try:
                 run.on_start()
@@ -175,11 +184,23 @@ async def run_prepared_screen_conversation(
                 unbind_presenter()
 
 
+@contextmanager
+def _capability_projection(run: PreparedScreenConversationRun) -> Iterator[None]:
+    """Borrow an explicit Product projection for exactly this screen run."""
+    previous = run.app.capability_provider, run.app.state.capabilities
+    try:
+        if run.capability_provider is not None:
+            run.app.capability_provider = run.capability_provider
+        yield
+    finally:
+        run.app.capability_provider, run.app.state.capabilities = previous
+
+
 def _install_screen_state(run: PreparedScreenConversationRun) -> None:
+    run.app.state.input_capabilities = run.input_capabilities
     run.app.transcript_source_factory = run.transcript_source_factory
     if run.history_records:
-        run.app.replace_transcript_window(run.history_records, reason="resume")
-        run.app.trim_active_transcript_window()
+        run.app.install_resumed_history(run.history_records)
         run.on_history_installed(
             InstalledConversationHistory(
                 record_count=len(run.history_records),

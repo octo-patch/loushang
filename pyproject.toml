@@ -15,6 +15,7 @@ dependencies = [
   "httpx>=0.28,<1",
   "markdown-it-py>=4.2,<5",
   "openai>=2.30.0",
+  "packaging>=24,<27",
   "pillow>=12.2.0",
   "pygments>=2.19,<3",
   "wcwidth==0.8.2",
@@ -23,6 +24,20 @@ dependencies = [
 [project.scripts]
 loushang = "loushang.coding.cli.__main__:main"
 loushang-tui = "loushang.coding.ui.cli:main"
+loushang-hosted = "loushang.coding.cli.hosted:main"
+loushang-hosted-tui = "loushang.coding.cli.hosted_client:main"
+loushang-mux = "loushang.coding.cli.mux:main"
+lmux = "loushang.coding.cli.lmux:main"
+loushang-plugin = "loushang.plugin.__main__:main"
+loushang-coding-plugin-smoke = "loushang.coding.plugin_author_smoke:main"
+loushang-coding-extension = "loushang.coding.extension_author:main"
+loushang-coding-plugin-status = "loushang.coding.plugin_support_status:main"
+loushang-package-cutover = "loushang.coding.cli.package_cutover:main"
+loushang-package-gc = "loushang.coding.cli.package_gc:main"
+loushang-package-repair = "loushang.coding.cli.package_repair:main"
+loushang-plugin-private-data = "loushang.coding.cli.plugin_private_data:main"
+loushang-worker-native = "loushang.coding.cli.package_worker_native:main"
+loushang-worker-windows-candidate = "loushang.coding.cli.package_worker_windows_candidate:main"
 
 [project.optional-dependencies]
 dev = [
@@ -30,15 +45,23 @@ dev = [
   "pytest-cov>=7,<8",
   "ruff>=0.11,<1",
   "mypy>=1.15,<2",
+  "types-Pygments>=2.19,<3",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
 addopts = ["--import-mode=importlib"]
+tmp_path_retention_count = 0
+tmp_path_retention_policy = "none"
 markers = [
+  "e2e_smoke: focused cross-package end-to-end scenario for boundary changes",
   "live: real provider verification that may require network access and credentials",
+  "requires_host_runtime: requires host loopback, process, or file-index capabilities unavailable in a restricted sandbox",
   "tui_render_contract: deterministic TUI render correctness, structural performance, and terminal-operation contract",
+  "tui_terminal_backend: native POSIX PTY or Windows ConPTY driver conformance",
+  "tui_terminal_contract: shared real CLI contract over the native terminal backend",
+  "tui_tmux_integration: tmux pane, history, and scrollback integration contract",
   "vendor_verification: vendor or endpoint compatibility verification cases",
 ]
 
@@ -83,4 +106,19 @@ where = ["src"]
 [tool.setuptools.package-data]
 "loushang" = ["py.typed"]
 "loushang.ai.model" = ["models.json"]
+"loushang.hosting" = ["native/*.c"]
+"loushang.coding._plugins.coding_lsp_default" = [
+  "plugin.json",
+  "declarations/*.json",
+]
+"loushang.coding._plugins.coding_arch_default" = [
+  "plugin.json",
+  "declarations/*.json",
+]
+"loushang.coding._plugins.coding_base" = [
+  "plugin.json",
+  "declarations/*.json",
+  "prompts/*.md",
+  "skills/*/*.md",
+]
 "loushang.harness.transcript.export" = ["*.html", "*.css", "*.js"]

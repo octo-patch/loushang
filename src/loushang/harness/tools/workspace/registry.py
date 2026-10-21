@@ -2,42 +2,48 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
-from loushang.agent.types import AgentTool, is_agent_tool_like
+from loushang.agent.types import AgentTool
 from loushang.harness.tools.contribution import (
     ToolContribution,
     ToolPackDefinition,
     ToolResolutionResult,
     resolve_tool_contributions,
 )
-from loushang.harness.tools.core import DecoratedTool, ToolDefinition
+from loushang.harness.tools.core import ToolContextProvider, ToolDefinition
 from loushang.harness.tools.core import ToolRegistry as CoreToolRegistry
+from loushang.harness.tools.execution import ToolExecutionHost
 
-from .context import ToolContextProvider
 from .factory import (
     ToolsOptions,
     WorkspaceToolProfile,
     create_profiled_workspace_tool_definitions,
 )
-from .normalize import tool_to_definition
-from .wrapper import wrap_tool_definition
 
 
 class WorkspaceToolRegistry(CoreToolRegistry):
-    """A generic registry for workspace definitions and decorated tools."""
+    """A generic registry for explicitly bound workspace definitions."""
+
+    def __init__(
+        self,
+        *,
+        execution_host: ToolExecutionHost | None = None,
+    ) -> None:
+        super().__init__(execution_host=execution_host)
 
     def register_tool(
         self,
-        tool: ToolDefinition | DecoratedTool | AgentTool[Any] | object,
+        tool: ToolDefinition,
         *,
         enabled: bool = True,
         source_info: object | None = None,
     ) -> ToolDefinition:
-        if isinstance(tool, ToolDefinition) or is_agent_tool_like(tool):
-            return super().register_tool(tool, enabled=enabled, source_info=source_info)
+        """Compatibility facade; live owners should use inherited ``bind_tool``."""
+
         return super().register_tool(
-            tool_to_definition(tool),
+            tool,
             enabled=enabled,
             source_info=source_info,
         )
@@ -48,9 +54,10 @@ class WorkspaceToolRegistry(CoreToolRegistry):
         *,
         context_provider: ToolContextProvider | None = None,
     ) -> AgentTool[Any]:
-        return wrap_tool_definition(
-            self.get_definition(name), context_provider=context_provider
-        )
+        return self.materialize_definitions(
+            [self.get_definition(name)],
+            context_provider=context_provider,
+        )[0]
 
     def materialize_definitions(
         self,
@@ -58,10 +65,10 @@ class WorkspaceToolRegistry(CoreToolRegistry):
         *,
         context_provider: ToolContextProvider | None = None,
     ) -> list[AgentTool[Any]]:
-        return [
-            wrap_tool_definition(definition, context_provider=context_provider)
-            for definition in definitions
-        ]
+        return super().materialize_definitions(
+            definitions,
+            context_provider=context_provider,
+        )
 
     def list_contributions(self) -> tuple[ToolContribution, ...]:
         enabled_names = {
@@ -75,6 +82,33 @@ class WorkspaceToolRegistry(CoreToolRegistry):
             )
             for definition in self.list_definitions()
         )
+
+    def copy(self) -> WorkspaceToolRegistry:
+        """Copy definitions and activation state without carrying runtime bindings."""
+
+        return self._copy_contributions(self.list_contributions())
+
+    def select(self, names: Iterable[str]) -> WorkspaceToolRegistry:
+        """Copy the named contributions in caller order into a fresh registry."""
+
+        contributions = {
+            contribution.definition.name: contribution
+            for contribution in self.list_contributions()
+        }
+        return self._copy_contributions(contributions[name] for name in names)
+
+    @staticmethod
+    def _copy_contributions(
+        contributions: Iterable[ToolContribution],
+    ) -> WorkspaceToolRegistry:
+        copied = WorkspaceToolRegistry()
+        for contribution in contributions:
+            copied.register_tool(
+                contribution.definition,
+                enabled=contribution.enabled,
+                source_info=contribution.source_info,
+            )
+        return copied
 
     def resolve_contributions(
         self,

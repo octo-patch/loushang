@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
 
-from loushang.protocol import JSONValue, require_json_mapping
+from loushang.foundation.json import JSONValue, require_json_mapping
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,10 @@ def serialize_context_usage_payload(value: object | None) -> dict[str, Any] | No
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(value)
     raw = require_json_mapping(value, name="context_usage")
-    return _camelize(raw)
+    serialized = _camelize(raw)
+    if not isinstance(serialized, dict):
+        raise TypeError("context usage serialization must produce a mapping")
+    return serialized
 
 
 def _camelize(value: JSONValue) -> JSONValue:

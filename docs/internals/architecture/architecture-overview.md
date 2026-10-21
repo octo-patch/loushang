@@ -1,139 +1,291 @@
-# Loushang Architecture Overview
+# Loushang Architecture Overview (AOD)
+
+## Status
+
+- Authority: normative — whole-system overview with evidence-linked Current summary
+- Design status: accepted
+- Implementation status: partial
+- Owner: Loushang architecture
 
 ## Scope
 
-本文档只描述 `loushang` 的技术架构。
-业务定位、愿景、使命与品牌叙事请参见 [Loushang Strategy](../strategy/strategy.md)。
+This Architecture Overview Document describes the top-level Loushang technical
+architecture. Product strategy, mission, and positioning live in
+[Loushang Strategy](../strategy/strategy.md). Detailed subsystem and component
+designs live in their own Architecture Scopes.
 
-## 架构原则
+Loushang's architecture governance is recorded in the
+[Architecture Governance Profile](governance-profile.md).
 
-`loushang` 采用“内核 + 协议 + 适配器 + 扩展点”的分层架构。内核定义系统的运行语义，协议定义系统与外部世界的沟通边界，适配器连接不同环境与终端形态，扩展点则在不破坏内核一致性的前提下开放可编程能力。四者共同构成 `loushang` 的基础架构：内核保证一致性，协议保证可连接性，适配器保证可达性，扩展点保证可演化性。
+## Architecture In One Sentence
 
-`loushang` 以内核承载语义，以协议连接边界，以适配器触达环境，以扩展点驱动演化。
+Loushang is a modular-monolith runtime platform for complex AI work: models
+reason, Agent owns the model-tool loop, Harness governs execution, Method
+defines work contracts, HarnessWork records authoritative fulfillment facts,
+Products compose those capabilities into user experiences, and AppHost owns
+explicit cross-Product routing and scoped Product Runtime lifetime.
 
-## Monorepo Subsystem Map
+## Truth And Authority Model
 
-`loushang` 采用 monorepo 组织。当前阶段按统一根 Python project 组织各子系统源码，而不是先拆成多个独立 package。
+Loushang separates five planes:
 
-当前已经落到 Python 包级源码的主要子系统包括：
+| Plane | Meaning |
+| --- | --- |
+| Conversation / Transcript | interaction history and model-facing records |
+| Runtime Event | execution facts emitted by Agent/Harness runtimes |
+| Work Event | authoritative business fulfillment facts |
+| Ontology Fact | versioned semantic facts and rebuildable projections |
+| Architecture Fact | observed source, dependency, entrypoint and contract-test facts |
 
-- `loushang.ai`
-- `loushang.agent`
-- `loushang.channel`
-- `loushang.coding`
-- `loushang.harness`
-- `loushang.method`
-- `loushang.tui`
-- `loushang.work`
-- `loushang.observability`
-- `loushang.ontology`
-- `loushang.protocol`
+These planes may project into one another through explicit adapters, but one is
+not a universal substitute for the others.
 
-`loushang.channel` 提供承载 `WorkOperation` / `WorkEvent` 以及已投影
-`RuntimeEventView` 的边界协议，及 `rpc_jsonl` 的 JSONL framing、request
-correlation、accepted ACK 和 event delivery。Channel 仅消费 Harness 的纯
-runtime-view 值契约，Harness 不反向依赖 Channel。现有
-`loushang.coding.mode.RpcMode` 仍是 Coding-local transitional surface；它的
-命令表和 UI payload 不属于 Channel。
+For architecture documentation, Facts, Current, Target, Delta, and History are
+also kept distinct. The generated
+[Current Package Dependency Graph](generated/current-package-dependencies.md)
+is authoritative for observed static imports; architecture tests are
+authoritative for allowed and forbidden direction.
 
-当前仓库结构应按已落地包理解：
+## Current Architecture
 
-```text
-loushang/
-  docs/
-  src/
-    loushang/
-      ai/
-      agent/
-      channel/
-      coding/
-      harness/
-      method/
-      tui/
-      work/
-      observability/
-      ontology/
-      protocol/
-  tests/
-```
+### Product and runtime chain
 
-`loushang.runtime` 不再作为保留子系统。若某个 worktree 在 command/effect
-迁移完成前仍存在该路径，它只是待删除的旧临时路径；相关类型迁到
-`loushang.harness.commands` 后应删除。
+The only installed user-facing console entrypoints currently compose the Coding
+Product. Their exact targets are listed in the generated Current facts.
 
-## Subsystem Documentation
-
-子系统划分与职责边界请参见 [Loushang Subsystems](./subsystem.md)。
-子系统关系图请参见 [Loushang Subsystem Diagram](./subsystem-diagram.md)。
-跨层架构判断准则请参见 [Loushang Architecture Principles](./loushang-architecture-principles.md)。
-文档分层与阅读规则请参见 [Loushang Documentation Model](./loushang-documentation-model.md)。
-`loushang-tui` 子系统文档请参见 [Loushang-TUI Architecture](./tui/README.md)。
-`loushang-harness` 的产品适配器 substrate 方向请参见
-[ARD-002: Harness Product Adapter Substrate](./agent/ARD-002-harness-product-adapter-substrate.md)。
-`loushang-work` 的业务工作与方法履约边界请参见
-[Loushang Work Architecture](./work/README.md)。
-
-## Architecture Stack
-
-当前 V1 coding 产品的核心运行链路为：
+The primary Coding execution chain is:
 
 ```text
-CLI / TUI
-  -> loushang.coding bootstrap / runtime / session
-  -> loushang.agent loop
-  -> loushang.ai provider adapters
-  -> tools / events / store / diagnostics / modes
+CLI / TUI / SDK host
+  -> loushang.coding Product composition
+       -> loushang.harness Session / Host / prepared run
+            -> loushang.agent loop
+                 -> loushang.ai provider and streaming adapters
+            -> tools / policy / approval / sandbox / runtime events
+       -> loushang.harnesstui -> loushang.tui
+       -> loushang.harnesswork for durable Work lifecycle where selected
+       -> loushang.method for method resources and plans where selected
+       -> loushang.channel for selected boundary protocols
 ```
 
-相邻能力层：
+Harness calls the one Agent loop through the narrow prepared-run boundary; it
+does not own a second loop. Products own final policy choices, prompts,
+presentation, domain language, and composition.
 
-- `loushang.method` 提供 method resource、compile、projection 和 fixed
-  `MethodPlan` 语义；method 是面向一类任务的结构化工作契约
-- `loushang.work` 接受具有可判定终局的业务意图，拥有 `WorkRun`、可选 method
-  plan/step 的真实履约、权威终态、`WorkEvent`、event log、query 和 replay
-- `loushang.tui` 提供通用 terminal-native UI primitives；
-  `loushang.harnesstui` 组合 product-neutral Harness conversation 与 TUI；
-  Coding feature-local adapter 解释产品状态，`loushang.coding.ui` 只保留最终
-  UI 装配、具体 surface 与 terminal binding
-- `loushang.channel` 提供 Work boundary protocol 和窄 JSONL framing adapter；
-  capability negotiation 与 interaction request/response 仍是后续工作
+### Current top-level scope ownership
 
-其中：
+| Scope | Current ownership |
+| --- | --- |
+| `loushang.foundation` | strict JSON and product-neutral observability foundations |
+| `loushang.ai` | models, providers, request/response and streaming/tool-call compatibility |
+| `loushang.agent` | the model-tool loop, Agent messages, tool calls and Agent events |
+| `loushang.harness` | reusable Session, Host, tools, policy, approval, sandbox, resources, extensions, runtime, presentation and continuity mechanisms |
+| `loushang.harnesstui` | Product-neutral Harness conversation interaction and TUI composition |
+| `loushang.tui` | terminal rendering, input, layout, surfaces and playback substrate |
+| `loushang.method` | method resources, compilation, fixed plans and projections |
+| `loushang.harnesswork` | durable Work lifecycle, authoritative terminal state, event log, query and replay |
+| `loushang.work` | migration-period compatibility/integration namespace over HarnessWork |
+| `loushang.channel` | Work/runtime-view boundary values and narrow JSONL framing/delivery adapters |
+| `loushang.coding` | Coding Product semantics, LSP/Arch capabilities, prompts, product tools, CLI and final UI composition |
+| `loushang.ontology` | versioned semantic schema, immutable facts/provenance, projections and typed queries |
+| `loushang.hosting` | H0--H6.4 Product-neutral process, endpoint, child-session, and private managed-preparation mechanisms with Linux/Windows evidence; Harness consumption remains default-dark |
+| `loushang.apphost` | Product catalog/router, canonical live-binding runtime, embedded/hosted profile lifecycle, and the optional G12 foreground application owner; installed default paths remain dark |
+| `loushang.appserver` | A0.4 structural Product ports plus the G11 strict protocol and transport-neutral client contract; no service, listener, connection, or transport runtime |
+| `loushang.appservice` | G11 Product-neutral named-mux, hosted Session, attachment and in-process AppClient semantics; G12 composes it only from the optional AppHost application edge |
 
-- `agent` 定义 agent loop 与运行语义
-- `ai` 定义模型/provider/streaming/tool-call 兼容层
-- `method` 提供方法资产与 plan/projection，定义角色、阶段、流程、约束、工作产物与验收预期
-- `work` 提供业务 work 的 acceptance、run/plan/step lifecycle、terminal
-  outcome、event log、query 和 replay；Method 可选
-- `tui` 提供通用终端 UI primitives
-- `harnesstui` 提供可跨产品复用的 Harness/TUI conversation interaction 与
-  presentation composition；依赖 `harness` 和 `tui`，不依赖 `coding`
-- `coding` 提供产品化装配；产品语义留在 feature-local adapter，
-  `loushang.coding.ui` 只完成最终 UI composition 与 terminal binding
-- `channel` 定义边界通信协议类型，当前已落地最小 envelope / endpoint surface
-- `protocol` 提供不依赖产品、Harness、Agent 或 AI 的严格 JSON wire-value
-  algebra，供上述层共同使用
+`loushang.resource` remains a small compatibility surface over Harness resource
+ownership and appears in the generated physical graph while Python source
+exists there. Empty retired directories are not architecture scopes.
 
-## Agent and Channel Documentation
+### Current semantic scope map
 
-当前 agent / channel 相关文档包括：
+The following diagram shows interpreted ownership and the main runtime path. It
+is not the exact physical import graph.
 
-- [Loushang-AI Architecture](./ai/README.md)
-- [Loushang Channel Architecture](./channel/README.md)
-- [Loushang AI Glossary](../glossary/loushang-ai.md)
-- [Loushang AI Types](../glossary/loushang-ai-types.md)
-- [Loushang Agent](../glossary/loushang-agent.md)
-- [Loushang Agent Types](../glossary/loushang-agent-types.md)
-- [Loushang Channel Glossary](../glossary/loushang-channel.md)
-- [Loushang Product And OEM Glossary](../glossary/loushang-product.md)
-- [Loushang Product And OEM Chinese Terms](../glossary/loushang-product-zh.md)
-- [Legacy Channel Boundary Protocol](../legacy/loushang-channel-boundary-protocol.md)
+```mermaid
+flowchart TD
+    CODING["Coding Product"]
+    HARNESS["Harness"]
+    AGENT["Agent"]
+    AI["AI"]
+    HTUI["HarnessTUI"]
+    TUI["TUI"]
+    HWORK["HarnessWork"]
+    WORK["Work compatibility"]
+    METHOD["Method"]
+    CHANNEL["Channel"]
+    ONTOLOGY["Ontology"]
+    HOSTING["Hosting H0-H6.4\ndefault-dark local mechanism"]
+    APPHOST["AppHost G12\nexplicit foreground application composition"]
+    APPSERVER["AppServer G11\nprotocol + client contract"]
+    APPSERVICE["AppService G11\nin-process hosted semantics"]
+    FOUNDATION["Foundation"]
 
-## Next Steps
+    CODING -->|composes| HARNESS
+    HARNESS -->|prepared run| AGENT
+    AGENT -->|model calls| AI
+    CODING -->|conversation UI composition| HTUI
+    HTUI -->|terminal primitives| TUI
+    CODING -->|optional durable work binding| HWORK
+    WORK -->|compatibility namespace| HWORK
+    CODING -->|optional plans and resources| METHOD
+    CODING -->|selected boundary adapters| CHANNEL
+    CHANNEL -->|work/runtime contracts| HWORK
+    ONTOLOGY -->|strict values| FOUNDATION
+    HARNESS -->|explicit default-dark Worker adapter| HOSTING
+    CODING -->|default-dark Product integration| APPHOST
+    APPHOST -.->|optional hosted binder only| APPSERVER
+    APPHOST -->|optional foreground application owner| APPSERVICE
+    CODING -->|explicit hosted Session adapter| APPSERVICE
+    APPSERVICE -->|typed contract| APPSERVER
+    HTUI -.->|explicit Hosted Mux AppClient| APPSERVER
+```
 
-下一步建议继续完善：
+Hosting has one private Harness Worker consumer seam, but Current remains the
+default and no installed Product/native Worker profile activates it. AppHost
+G8 now has a Coding-owned Product integration over the exact Worker receipt,
+but it remains intentionally uncomposed. The dotted AppHost-to-AppServer edge
+is an optional in-process wiring dependency, not a production runtime route.
+G11 separately implements AppServer's strict protocol/client contract,
+Product-neutral in-process AppService semantics, one Coding hosted adapter,
+and an explicit Harnesstui Hosted Mux Profile. G12 explicitly composes those
+semantics through an optional AppHost application owner and a Coding-owned
+foreground Session resolver. No installed route selects that profile, and
+there is still no listener, transport, IPC, Hosting owner, or daemon runtime.
 
-1. `loushang.work` 的 run-bound plan binding、动态输入与 outcome 验证
-2. channel capability negotiation and interaction request/response contracts
-3. TUI method status layer 与 `WorkEvent` / `WorkPlanRun` projection
-4. public CLI reference 对 method/work/package surface 的补齐
+Direct and transitive Python imports differ from this semantic view. Consult
+the generated Current graph before making a physical dependency claim.
+
+### Nested Architecture Scopes
+
+Current established nested scopes include:
+
+- `coding.lsp`: Coding-owned semantic code-intelligence Product Capability;
+- `coding.arch`: Coding-owned deterministic repository architecture-analysis
+  Product Capability;
+- `harness.multiagent`: Harness-owned technical child-agent execution and
+  coordination capability.
+
+They own internal architecture without becoming top-level subsystems. Their
+placement and sibling dependencies are governed by their parent scope.
+
+## Accepted Target Architecture
+
+The implemented G13 hosted-continuity slice adds an optional
+one-writer AppService coordination record under an admitted exact root. A fresh
+AppHost application recovers only desired MuxSpace/member identities and
+reopens canonical Product Sessions under the current generation. G14/G16 add
+separately accepted connection and deployment contracts, tracked by
+[AppServer](appserver/README.md) and [AppHost](apphost/README.md). Their acceptance
+does not extend to broader Hosting service control, active-execution recovery
+or default activation. Those extensions require their own accepted contracts.
+
+Accepted Target directions include:
+
+- Resume separates readable historical facts from current execution authority;
+  [ARD-004](decisions/accepted/ARD-004-resume-history-and-current-authority.md),
+  [ARD-005](decisions/accepted/ARD-005-resume-continuation-commit.md), and
+  [ARD-006](decisions/accepted/ARD-006-hosted-resume-readiness-and-admission.md)
+  accept same-ID continuation, one-message Binding/evidence commit, and Hosted
+  readiness inside one Product binding. Live admission, recovery, and background
+  performance remain incomplete in the [Delta ledger](current-target-gap-ledger.md);
+- Product-to-Harness-to-Agent-to-AI remains the one-way execution spine;
+- Harness mechanisms remain Product-neutral and Products retain domain policy
+  and final composition;
+- Method defines required work structure while HarnessWork owns actual Work
+  fulfillment facts and terminal outcomes;
+- Capability dependencies, binding, Mount lifecycle and graph projection use
+  the implemented Harness Planner/Binder/Runtime/Projector owners without
+  creating a global mutable service locator; Product Capability rollout and
+  refresh semantics remain explicitly bounded;
+- Channel grows only from demonstrated boundary-protocol needs and does not
+  become a mandatory bus for every Session interaction;
+- Ontology evolves through versioned facts, immutable projections and typed
+  queries without becoming a universal facade over Product or Work state;
+- Hosting owns Product-neutral local process, inherited peer endpoint, and
+  atomic child-session mechanisms while Harness retains Policy, Approval,
+  Sandbox, Worker protocol, and domain publication authority;
+- AppHost owns admitted cross-Product catalog/routing, canonical scoped Product
+  Runtime bindings, and deployment-profile selection while its core remains
+  independent of concrete Products, AppServer, Hosting, and UI frameworks;
+- AppServer owns the client-safe contract while AppService independently owns
+  hosted Session/MuxSpace coordination over injected Product ports; neither
+  owns Product policy, AppHost lifecycle, Hosting, or presentation state;
+- AI, Agent, TUI and other reusable scopes preserve narrow public contracts and
+  independent evolution.
+
+An accepted Target is not an implementation claim. The
+[Harness Current Owner Map](harness/current-owner-map.md) records both the
+implemented Mount runtime and the remaining Capability rollout boundaries.
+
+Unresolved proposals under `drafts/`, including broader future-V3.1 material,
+remain candidate directions until the governing owner accepts the specific
+contract through a decision or canonical scope document. The AOD's own
+accepted status does not accept those candidates. Follow the
+[Target acceptance rule](governance-profile.md#target-acceptance-in-loushang).
+
+## Major Current-To-Target Deltas
+
+These gaps compare Current with accepted contracts. The linked ledger records
+acceptance evidence and owners; candidate extensions are kept separately.
+
+| Target | Current delta |
+| --- | --- |
+| accepted owner-scoped Capability bundle rollout | Planner, Binder, Runtime, Projector and selected production bundles are implemented; the Capability boundary records remaining Process-scoped continuity rollout; broader refresh is a candidate extension |
+| accepted observable WorkHandle and persisted typed-result boundaries | HarnessWork has an implemented kernel; these accepted boundaries remain partial, while crash-resume design requires a separate decision |
+| Ontology ARD-012 source-backed write-back and reconciliation | ontology-owned Action planning and Fact commits are implemented; Product-hosted source mutation remains unimplemented |
+| AppHost A0.5/G15 foreground launcher | G8 joins A0.4 catalog/runtime mechanics to one Coding-owned exact-receipt Product adapter; G9.1--G9.2 implement the explicit composition and drill; G9.3 accepts a source-backed `RETAIN` decision; G9.4 promotes the capability default-dark; G10 implements one exact installed short-lived canary without changing normal Current routes; later G14/G16 routes do not implement the accepted G15 launcher |
+| architecture governance coverage | generated facts and selected documentation gates exist; adoption across canonical scopes remains incremental |
+
+Detailed gaps belong to the owning scope rather than expanding this AOD.
+Cross-system deltas are indexed in the
+[Current-To-Target Gap Ledger](current-target-gap-ledger.md#accepted-target-deltas).
+
+## Candidate Directions
+
+The ledger separately records
+[candidate directions](current-target-gap-ledger.md#candidate-directions),
+including a second Product, physical installation optionality, broader Channel
+protocols, crash recovery, graph refresh and activation beyond accepted routes.
+It also tracks the complete LSP/Arch scope proposals without demoting their
+already accepted individual contracts. Broader persistent-approval,
+remote/mixed-placement agent and managed-runtime proposals likewise need
+acceptance of their specific scope contracts before becoming Target deltas.
+Candidate absence is not implementation debt; rejection or deferral does not
+close an implementation gap.
+
+## Architecture Evaluation Lens
+
+Loushang intentionally keeps mutable cognitive scaffolding out of the stable
+runtime substrate. A model may internalize planning, reflection, todo reminders
+or verification heuristics; it does not eliminate permissions, side-effect
+control, evidence, persistence, coordination, recovery, or Work truth.
+
+Key distinctions are:
+
+| Stable distinction | Architectural value |
+| --- | --- |
+| AI versus Agent | provider/model change does not redefine the loop contract |
+| Agent versus Harness | loop semantics remain small while execution governance evolves above them |
+| Method versus Work | required contract is separate from actual fulfillment facts |
+| Policy versus Approval versus Enforcement | decisions, user grants and side-effect control remain auditable |
+| TUI versus HarnessTUI versus Product UI | terminal mechanics, conversation interaction and Product semantics evolve independently |
+| final screen versus terminal playback | intermediate frames, cursor, resize, scrollback and operation budgets become executable contracts |
+| semantic facts versus operational state | Ontology projections do not silently become Session or Work authority |
+
+See [Architecture Principles](loushang-architecture-principles.md) for the
+normative cross-layer rules.
+
+## Architecture Documentation
+
+- [Architecture Catalog And Reading Order](README.md)
+- [Loushang Architecture Governance Profile](governance-profile.md)
+- [Architecture Principles](loushang-architecture-principles.md)
+- [Subsystems And Architecture Scopes](subsystem.md)
+- [Subsystem Diagram](subsystem-diagram.md)
+- [Generated Current Package Dependencies](generated/current-package-dependencies.md)
+- [Current-To-Target Gap Ledger](current-target-gap-ledger.md)
+
+Each top-level and sufficiently complex nested scope owns its detailed
+requirements, boundary, component, interaction, dependency, decision,
+traceability, validation and history material.

@@ -7,15 +7,16 @@ how the Coding product selects and configures that reusable capability.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any, cast
 
 from loushang.agent.types import AgentTool
-from loushang.harness.approval import ApprovalResolver
 from loushang.harness.diagnostics.service import DiagnosticsService
+from loushang.harness.environment import HostEnvironment, LocalHostEnvironmentProbe
+from loushang.harness.tools.authoring import ToolContextProvider
 from loushang.harness.tools.contribution import ToolPackDefinition
 from loushang.harness.tools.core import ToolDefinition
-from loushang.harness.tools.workspace.context import ToolContextProvider
 from loushang.harness.tools.workspace.external_tools import (
     ExternalToolDownloader,
     ExternalToolPolicy,
@@ -30,7 +31,6 @@ from loushang.harness.tools.workspace.factory import (
     create_profiled_workspace_tool_definitions,
     create_profiled_workspace_tools,
 )
-from loushang.harness.tools.workspace.policy import ToolPolicyEvaluator
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 from loushang.harness.workspace.exec import ExecService
 from loushang.harness.workspace.operations import ToolOperations
@@ -45,36 +45,29 @@ CODING_BUILTIN_TOOL_NAMES: tuple[ToolName, ...] = (
     "write",
     "edit",
 )
+CODING_RESERVED_BASE_TOOL_NAMES: tuple[str, ...] = (
+    *CODING_BUILTIN_TOOL_NAMES,
+    "shell",
+)
+CODING_DEFAULT_ACTIVE_TOOL_NAMES: tuple[str, ...] = (
+    "read",
+    "ls",
+    "find",
+    "grep",
+    "bash",
+    "edit",
+    "write",
+)
 
+# File tools keep their Harness-owned argument descriptions and prompt snippets.
 _CODING_TOOL_TEXT: dict[ToolName, tuple[str, str]] = {
-    "read": (
-        "Read text files and images from the coding workspace. "
-        "For large text files, use offset and limit to continue reading.",
-        "- read: Read text files and images from the coding workspace.",
-    ),
     "bash": (
         "Execute a shell command through the coding exec service.",
         "- bash: Execute shell commands. Prefer a single command string; use cwd for the working directory.",
     ),
-    "edit": (
-        "Apply exact text replacements to a file in the coding workspace.",
-        "- edit: Apply exact text replacements to a file in the coding workspace.",
-    ),
-    "write": (
-        "Write a text file in the coding workspace.",
-        "- write: Write a text file in the coding workspace.",
-    ),
-    "grep": (
-        "Search file contents in the coding workspace.",
-        "- grep: Search file contents for patterns in the coding workspace.",
-    ),
-    "find": (
-        "Find file paths in the coding workspace.",
-        "- find: Find file paths by glob pattern in the coding workspace.",
-    ),
-    "ls": (
-        "List directory entries in the coding workspace.",
-        "- ls: List directory entries in the coding workspace.",
+    "shell": (
+        "Execute a PowerShell script through the coding exec service. Use Windows PowerShell 5.1-compatible syntax unless PowerShell 7 availability is known.",
+        "- shell: Execute PowerShell scripts on Windows using PowerShell syntax.",
     ),
 }
 
@@ -82,9 +75,10 @@ _CODING_TOOL_TEXT: dict[ToolName, tuple[str, str]] = {
 def _decorate_coding_tool_definition(
     definition: ToolDefinition,
 ) -> ToolDefinition:
-    description, prompt_snippet = _CODING_TOOL_TEXT[
-        cast(ToolName, definition.name)
-    ]
+    tool_text = _CODING_TOOL_TEXT.get(cast(ToolName, definition.name))
+    if tool_text is None:
+        return definition
+    description, prompt_snippet = tool_text
     return replace(
         definition,
         description=description,
@@ -105,6 +99,61 @@ CODING_BUILTIN_TOOL_PACK = ToolPackDefinition(
 )
 
 
+def coding_workspace_tool_profile(
+    environment: HostEnvironment,
+) -> WorkspaceToolProfile:
+    """Select the command tool from execution-target facts."""
+
+    if environment.os_family != "windows":
+        return CODING_WORKSPACE_TOOL_PROFILE
+    return replace(
+        CODING_WORKSPACE_TOOL_PROFILE,
+        tool_names=tuple(
+            "shell" if name == "bash" else name for name in CODING_TOOL_NAMES
+        ),
+        builtin_tool_names=tuple(
+            "shell" if name == "bash" else name for name in CODING_BUILTIN_TOOL_NAMES
+        ),
+    )
+
+
+def coding_default_active_tool_names(
+    environment: HostEnvironment,
+) -> tuple[str, ...]:
+    """Return Coding's Product-selected default Tool intent for one host."""
+
+    return coding_platform_tool_names(CODING_DEFAULT_ACTIVE_TOOL_NAMES, environment)
+
+
+def coding_platform_tool_names(
+    tool_names: Iterable[str],
+    environment: HostEnvironment,
+) -> tuple[str, ...]:
+    """Resolve platform-neutral Coding Tool intents for one execution host."""
+
+    resolved: list[str] = []
+    seen: set[str] = set()
+    for name in tool_names:
+        platform_name = (
+            "shell"
+            if environment.os_family == "windows" and name == "bash"
+            else name
+        )
+        if platform_name not in seen:
+            resolved.append(platform_name)
+            seen.add(platform_name)
+    return tuple(resolved)
+
+
+def _profile_from_options(options: ToolsOptions | None) -> WorkspaceToolProfile:
+    environment = options.host_environment if options is not None else None
+    return (
+        coding_workspace_tool_profile(environment)
+        if environment is not None
+        else CODING_WORKSPACE_TOOL_PROFILE
+    )
+
+
 def create_coding_tool_definition(
     tool_name: ToolName,
     *,
@@ -113,7 +162,7 @@ def create_coding_tool_definition(
     """Create a workspace definition with Coding's selected copy."""
 
     return create_profiled_workspace_tool_definition(
-        CODING_WORKSPACE_TOOL_PROFILE,
+        _profile_from_options(options),
         tool_name,
         options=options,
     )
@@ -123,8 +172,22 @@ def create_coding_tool_definitions(
     *, options: ToolsOptions | None = None
 ) -> list[ToolDefinition]:
     return create_profiled_workspace_tool_definitions(
-        CODING_WORKSPACE_TOOL_PROFILE,
+        _profile_from_options(options),
         options=options,
+    )
+
+
+def create_coding_builtin_tool_definitions(
+    *,
+    options: ToolsOptions | None = None,
+) -> list[ToolDefinition]:
+    """Create the complete admitted ``coding.builtin`` pack generation."""
+
+    profile = _profile_from_options(options)
+    return create_profiled_workspace_tool_definitions(
+        profile,
+        options=options,
+        tool_names=profile.builtin_tool_names,
     )
 
 
@@ -136,7 +199,7 @@ def create_coding_tools(
     model: object | None = None,
 ) -> list[AgentTool[Any]]:
     return create_profiled_workspace_tools(
-        CODING_WORKSPACE_TOOL_PROFILE,
+        _profile_from_options(options),
         cwd=cwd,
         options=options,
         context_provider=context_provider,
@@ -147,8 +210,6 @@ def create_coding_tools(
 def register_coding_builtin_tools(
     registry: WorkspaceToolRegistry,
     *,
-    policy_engine: ToolPolicyEvaluator | None = None,
-    approval_resolver: ApprovalResolver | None = None,
     exec_service: ExecService | None = None,
     diagnostics_service: DiagnosticsService | None = None,
     operations: ToolOperations | None = None,
@@ -157,10 +218,19 @@ def register_coding_builtin_tools(
     external_tool_policy: ExternalToolPolicy | None = None,
     allow_external_tool_downloads: bool = False,
     require_external_tools: bool = False,
+    host_environment: HostEnvironment | None = None,
+    shell_path: str | None = None,
+    command_prefix: str | None = None,
 ) -> WorkspaceToolRegistry:
+    """Compatibility helper for standalone registries, not Coding Sessions.
+
+    Catalog-owned Coding construction rejects these reserved identities when
+    supplied through ``tool_registry`` or ``tools``. New callers should use
+    the public tool-definition factories for non-Session authoring.
+    """
+    resolved_environment = host_environment or LocalHostEnvironmentProbe().detect()
+    profile = coding_workspace_tool_profile(resolved_environment)
     options = ToolsOptions(
-        policy_engine=policy_engine,
-        approval_resolver=approval_resolver,
         exec_service=exec_service or ExecService(),
         diagnostics_service=diagnostics_service,
         operations=operations,
@@ -169,9 +239,12 @@ def register_coding_builtin_tools(
         external_tool_policy=external_tool_policy,
         allow_external_tool_downloads=allow_external_tool_downloads,
         require_external_tools=require_external_tools,
+        host_environment=resolved_environment,
+        shell_path=shell_path,
+        command_prefix=command_prefix,
     )
     return registry.register_profile(
-        CODING_WORKSPACE_TOOL_PROFILE,
+        profile,
         options=options,
     )
 
@@ -179,10 +252,15 @@ def register_coding_builtin_tools(
 __all__ = [
     "CODING_BUILTIN_TOOL_NAMES",
     "CODING_BUILTIN_TOOL_PACK",
+    "CODING_DEFAULT_ACTIVE_TOOL_NAMES",
+    "CODING_RESERVED_BASE_TOOL_NAMES",
     "CODING_TOOL_NAMES",
     "CODING_WORKSPACE_TOOL_PROFILE",
+    "coding_default_active_tool_names",
+    "coding_platform_tool_names",
+    "coding_workspace_tool_profile",
     "create_coding_tool_definition",
     "create_coding_tool_definitions",
+    "create_coding_builtin_tool_definitions",
     "create_coding_tools",
-    "register_coding_builtin_tools",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from loushang.harness.workspace.exec import (
     ExecResult,
     materialize_exec_request,
 )
+from loushang.harness.workspace.process import ProcessLaunchRequest
 
 
 def _linux_environment() -> HostEnvironment:
@@ -59,10 +61,103 @@ def _successful_probe(
     argv: tuple[str, ...],
     timeout_seconds: float,
 ) -> subprocess.CompletedProcess[str]:
+    if argv[-1] == "--help":
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            "--ro-bind-data FD DEST\n--ro-bind-fd FD DEST\n",
+            "",
+        )
     assert "--unshare-user" in argv
     assert "--unshare-net" in argv
     assert timeout_seconds > 0
     return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_linux_backend_probe_requires_managed_bind_options(tmp_path: Path) -> None:
+    captured: list[ExecRequest] = []
+
+    async def local_backend(request, **kwargs):
+        del kwargs
+        captured.append(request)
+        return ExecResult(exit_code=0, stdout="ordinary")
+
+    def missing_feature(
+        argv: tuple[str, ...],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        if argv[-1] == "--help":
+            return subprocess.CompletedProcess(argv, 0, "--ro-bind-data", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    backend = LinuxBubblewrapBackend(
+        bwrap_path=_fake_bwrap(tmp_path),
+        probe_runner=missing_feature,
+        local_backend=local_backend,
+    )
+    status = backend.probe(_linux_environment())
+
+    async def scenario() -> None:
+        scope = await backend.open_scope(
+            SandboxScopeRequest(
+                cwd=tmp_path,
+                readable_roots=(tmp_path,),
+            )
+        )
+        result = await scope(
+            materialize_exec_request(
+                ExecRequest(command=("/usr/bin/true",), cwd=str(tmp_path)),
+                environ={},
+            )
+        )
+        assert result.stdout == "ordinary"
+        await scope.close()
+
+    asyncio.run(scenario())
+
+    assert status.state == "available"
+    assert backend._managed_process_bindings is False
+    assert "--ro-bind-fd" in (backend._managed_process_unavailable_reason or "")
+    assert len(captured) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_reason"),
+    [
+        ("nonzero", "feature probe failed: unsupported option"),
+        ("timeout", "feature probe timed out"),
+        ("oserror", "feature probe failed: help unavailable"),
+    ],
+)
+def test_linux_backend_managed_feature_probe_diagnostics_do_not_disable_exec(
+    tmp_path: Path,
+    mode: str,
+    expected_reason: str,
+) -> None:
+    def feature_failure(
+        argv: tuple[str, ...],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        if argv[-1] != "--help":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if mode == "timeout":
+            raise subprocess.TimeoutExpired(argv, 1)
+        if mode == "oserror":
+            raise OSError("help unavailable")
+        return subprocess.CompletedProcess(argv, 1, "", "unsupported option")
+
+    backend = LinuxBubblewrapBackend(
+        bwrap_path=_fake_bwrap(tmp_path),
+        probe_runner=feature_failure,
+    )
+
+    status = backend.probe(_linux_environment())
+
+    assert status.state == "available"
+    assert backend._managed_process_bindings is False
+    assert expected_reason in (backend._managed_process_unavailable_reason or "")
 
 
 def test_linux_backend_is_not_applicable_without_resolving_bwrap(
@@ -131,6 +226,10 @@ def test_linux_backend_probe_reports_enforcement_capabilities(tmp_path: Path) ->
     )
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="asserts the Linux-only bubblewrap backend command shape",
+)
 def test_linux_scope_wraps_the_materialized_request_and_common_exec_backend(
     tmp_path: Path,
 ) -> None:
@@ -225,6 +324,57 @@ def test_linux_scope_wraps_the_materialized_request_and_common_exec_backend(
         "VISIBLE": "yes",
     }
     assert updates == [ExecOutputChunk(stream="stdout", text="sandboxed\n")]
+
+
+def test_linux_hosted_plan_reuses_the_one_shot_bubblewrap_command_builder(
+    tmp_path: Path,
+) -> None:
+    captured: list[ExecRequest] = []
+
+    async def local_backend(request, **kwargs):
+        del kwargs
+        captured.append(request)
+        return ExecResult(exit_code=0)
+
+    backend = LinuxBubblewrapBackend(
+        bwrap_path=_fake_bwrap(tmp_path),
+        probe_runner=_successful_probe,
+        local_backend=local_backend,
+    )
+    backend.probe(_linux_environment())
+    scope_request = SandboxScopeRequest(
+        cwd=tmp_path,
+        readable_roots=(tmp_path,),
+        writable_roots=(tmp_path,),
+        network="restricted",
+    )
+    environment = (("MODE", "test"),)
+
+    async def scenario() -> None:
+        scope = await backend.open_scope(scope_request)
+        await scope(
+            ExecRequest(
+                command=("server", "--stdio"),
+                cwd=str(tmp_path),
+                effective_environment=environment,
+            )
+        )
+        plan = await backend._plan_hosted_process(
+            ProcessLaunchRequest(
+                command=("server", "--stdio"),
+                cwd=str(tmp_path),
+                effective_environment=environment,
+            ),
+            scope_request,
+        )
+
+        assert plan.request.command == captured[0].command
+        assert plan.request.cwd == str(tmp_path)
+        assert plan.request.effective_environment == environment
+        await plan.close()
+        await scope.close()
+
+    asyncio.run(scenario())
 
 
 def test_linux_scope_allowed_network_does_not_claim_or_add_isolation(

@@ -99,6 +99,10 @@ def test_standard_session_command_pack_delegates_identity_and_transcript_operati
         calls.append(("export", ("jsonl", path)))
         return "/tmp/session.jsonl"
 
+    def _export_bundle(path: str | None) -> str:
+        calls.append(("export", ("bundle", path)))
+        return "/tmp/session.zip"
+
     async def _import(path: str, cwd: str | None) -> dict[str, object]:
         calls.append(("import", (path, cwd)))
         return {"session_id": "session-2"}
@@ -106,6 +110,7 @@ def test_standard_session_command_pack_delegates_identity_and_transcript_operati
     ports = StandardSessionCommandPorts(
         set_session_name=_set_name,
         export_jsonl=_export_jsonl,
+        export_bundle=_export_bundle,
         import_session=_import,
     )
 
@@ -114,6 +119,9 @@ def test_standard_session_command_pack_delegates_identity_and_transcript_operati
     )
     export = asyncio.run(
         execute_standard_session_command_async("export", "saved.jsonl", ports)
+    )
+    bundle_export = asyncio.run(
+        execute_standard_session_command_async("export", "saved.zip", ports)
     )
     imported = asyncio.run(
         execute_standard_session_command_async(
@@ -130,6 +138,10 @@ def test_standard_session_command_pack_delegates_identity_and_transcript_operati
     assert export.value == StandardSessionExport(
         format="jsonl", path="/tmp/session.jsonl"
     )
+    assert bundle_export is not None
+    assert bundle_export.value == StandardSessionExport(
+        format="bundle", path="/tmp/session.zip"
+    )
     assert imported is not None
     assert imported.value == {"session_id": "session-2"}
     assert invalid_import is not None
@@ -137,6 +149,7 @@ def test_standard_session_command_pack_delegates_identity_and_transcript_operati
     assert calls == [
         ("rename", "Alpha"),
         ("export", ("jsonl", "saved.jsonl")),
+        ("export", ("bundle", "saved.zip")),
         ("import", ("saved.jsonl", "/tmp/project")),
     ]
 
@@ -195,8 +208,12 @@ def test_standard_session_command_pack_parses_lifecycle_and_tree_arguments() -> 
         asyncio.run(
             execute_standard_session_command_async("resume", "session-2", ports)
         ),
+        asyncio.run(execute_standard_session_command_async("fork", "", ports)),
         asyncio.run(
             execute_standard_session_command_async("fork", "entry-1 before", ports)
+        ),
+        asyncio.run(
+            execute_standard_session_command_async("branch", "entry-2 at", ports)
         ),
         asyncio.run(execute_standard_session_command_async("clone", "", ports)),
         asyncio.run(
@@ -216,6 +233,9 @@ def test_standard_session_command_pack_parses_lifecycle_and_tree_arguments() -> 
     invalid_fork = asyncio.run(
         execute_standard_session_command_async("fork", "entry-1 elsewhere", ports)
     )
+    missing_branch = asyncio.run(
+        execute_standard_session_command_async("branch", "", ports)
+    )
 
     assert all(
         result is not None and result.disposition == "completed" for result in results
@@ -230,10 +250,15 @@ def test_standard_session_command_pack_parses_lifecycle_and_tree_arguments() -> 
     assert invalid_fork.disposition == "invalid_arguments"
     assert invalid_fork.error_code == "invalid_fork_position"
     assert invalid_fork.value == "elsewhere"
+    assert missing_branch is not None
+    assert missing_branch.disposition == "invalid_arguments"
+    assert missing_branch.error_code == "missing_record_id"
     assert calls == [
         ("new", None),
         ("resume", ("session-2", None)),
+        ("clone", None),
         ("fork", ("entry-1", {"position": "before"})),
+        ("fork", ("entry-2", {"position": "at"})),
         ("clone", None),
         (
             "tree",
@@ -268,6 +293,71 @@ def test_standard_new_command_projects_cancelled_operation_explicitly() -> None:
         "result": {"cancelled": True},
         "message": "New session creation cancelled.",
     }
+
+
+def test_standard_session_command_projects_compaction_observability() -> None:
+    result = asyncio.run(
+        execute_standard_session_command_async(
+            "session",
+            "",
+            StandardSessionCommandPorts(
+                get_session_info=lambda: {
+                    "session_id": "session-1",
+                    "cwd": "/tmp/project",
+                    "compaction": {
+                        "is_compacting": False,
+                        "last_reason": "threshold",
+                        "last_stage": "committed",
+                        "last_summary_mode": "stream",
+                        "last_tokens_before": 90_000,
+                        "last_tokens_after": 12_000,
+                    },
+                    "context": {
+                        "tokens": 12_000,
+                        "context_window": 131_072,
+                        "reserve_tokens": 8_192,
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result is not None
+    projected = project_standard_session_command_result(result)
+    assert projected["message"] == (
+        "Session: session-1 | CWD: /tmp/project | "
+        "Compact: threshold/committed, stream, 90000→12000 tokens | "
+        "Context: 12000/131072 tokens, reserve 8192"
+    )
+
+
+def test_standard_session_command_exposes_context_measurement_quality() -> None:
+    result = asyncio.run(
+        execute_standard_session_command_async(
+            "session",
+            "",
+            StandardSessionCommandPorts(
+                get_session_info=lambda: {
+                    "session_id": "session-1",
+                    "context": {
+                        "tokens": 12_000,
+                        "context_window": 131_072,
+                        "reserve_tokens": 8_192,
+                        "source": "estimated",
+                        "accuracy": "estimated",
+                        "structural_envelope_status": "logical_mismatch",
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result is not None
+    projected = project_standard_session_command_result(result)
+    assert projected["message"] == (
+        "Session: session-1 | Context: ≈12000/131072 tokens, reserve 8192, "
+        "estimated, source estimated, logical envelope changed"
+    )
 
 
 def test_standard_session_command_pack_manages_tools_without_coding() -> None:
@@ -361,8 +451,13 @@ def test_standard_session_command_pack_forwards_changelog_request() -> None:
 
 
 def test_standard_session_command_pack_has_no_coding_import() -> None:
-    module_path = (
+    session_root = (
         Path(__file__).parents[3] / "src/loushang/harness/session/command_pack.py"
-    )
+    ).parent
+    module_paths = [session_root / "command_pack.py"]
+    module_paths.extend(sorted((session_root / "commands").glob("*.py")))
 
-    assert "loushang.coding" not in module_path.read_text(encoding="utf-8")
+    assert all(
+        "loushang.coding" not in path.read_text(encoding="utf-8")
+        for path in module_paths
+    )

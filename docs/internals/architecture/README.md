@@ -4,43 +4,250 @@
 
 ## Status
 
-Architecture workspace.
+- Authority: normative — architecture catalog and reading-order policy
+- Design status: accepted
+- Implementation status: implemented
+- Owner: Loushang architecture
 
-This directory contains both live architecture sources and historical/draft
-architecture material. Not every file here has the same authority.
+This directory contains normative architecture, descriptive Current
+architecture, generated facts, proposed designs, validation, references, and
+history. Their authority is intentionally different.
 
-## Reading Rule
+Loushang's architecture governance rules are recorded in the
+[Architecture Governance Profile](governance-profile.md).
 
-Read in this order for current implementation decisions:
+## Start Here
 
-1. [Architecture Overview](architecture-overview.md)
-2. [Subsystems](subsystem.md)
-3. Accepted ARDs under subsystem directories, especially
-   [agent harness boundaries](agent/ARD-001-agent-harness-and-product-adapters.md),
-   [harness product adapter substrate](agent/ARD-002-harness-product-adapter-substrate.md), and
-   [coding](coding/ARD-001-coding-product-boundaries.md)
-4. Component interfaces and core data object notes for the subsystem being edited
-5. Draft/history/reference material only when extra rationale is needed
+For a whole-system architecture reading:
 
-When files conflict, prefer current code/tests and accepted ARDs over drafts,
-history, experimental notes, or legacy documents.
+1. [Architecture Overview (AOD)](architecture-overview.md)
+2. [Cross-Layer Architecture Principles](loushang-architecture-principles.md)
+3. [Architecture Governance Profile](governance-profile.md)
+4. [Subsystems And Architecture Scopes](subsystem.md)
+5. [Current Observed Package Dependencies](generated/current-package-dependencies.md)
+6. [Current-To-Target Gap Ledger](current-target-gap-ledger.md)
+7. the relevant scope README and its accepted decisions
 
-## Live Architecture Areas
+For a current implementation question:
+
+1. source and executable tests;
+2. generated Current facts;
+3. current owner maps, especially
+   [Harness Current Owner Map](harness/current-owner-map.md);
+4. accepted boundaries and ARDs;
+5. proposed designs, plans, ledgers, reports, references, and history.
+
+For a design question:
+
+1. strategy and requirements;
+2. the AOD and architecture principles;
+3. parent-scope placement and boundary;
+4. scope requirements, specification and final component model;
+5. accepted key designs and ARDs;
+6. proposed and validation material.
+
+## Truth Planes
+
+| Plane | Role | Normal location |
+| --- | --- | --- |
+| Facts | Objective repository state produced by source, tests, or generators | `generated/`, source, tests |
+| Current | Evidence-linked interpretation of implemented ownership and runtime shape | owner maps and scope README Current sections |
+| Target | Accepted normative architecture | AOD, principles, requirements, specifications, component models, accepted ARDs |
+| Delta | Explicit Current-to-Target difference | scope gap ledgers and concise README summaries |
+| History | Superseded decisions and completed migration material | `history/`, ledgers, reports |
+
+Do not treat Target as implemented, Current as automatically desirable, or
+History as a current ownership source. When Current and Target differ, record a
+Delta rather than blending the two in one unlabeled diagram.
+
+Drafts, proposals and undecided extensions are candidate directions. Keep them
+separate from accepted Target and do not count their absence as implementation
+debt. The [Target acceptance rule](governance-profile.md#target-acceptance-in-loushang)
+define acceptance evidence and ledger promotion.
+
+## Architecture Scope Tree
+
+The top-level scopes are:
 
 - [AI](ai/README.md)
 - [Agent](agent/README.md)
 - [Channel](channel/README.md)
-- [Coding](coding/loushang-coding-system-context.md)
+- [Coding](coding/README.md)
+- [Harness](harness/README.md)
+- [Harness TUI](harnesstui/README.md)
+- [HarnessWork](harnesswork/README.md)
 - [Method](method/README.md)
-- [Work](work/README.md)
 - [TUI](tui/README.md)
-- [Monorepo Conventions](loushang-monorepo-conventions.md)
+- [Work compatibility/integration](work/README.md)
+- [Ontology](ontology/README.md)
+- [Hosting](hosting/README.md)
+- [AppHost](apphost/README.md)
+- [AppServer](appserver/README.md)
+- [AppService](appservice/README.md)
+- Foundation, represented in the AOD and subsystem map because it is a small
+  product-neutral base rather than a large independent architecture package
 
-## Non-Live Reference Areas
+Cross-scope Architecture Decisions are recorded in the
+[Cross-Scope Architecture Decisions](decisions/README.md) catalog, which owns
+consequential choices that span two or more top-level scopes. A decision owned
+by exactly one scope stays in that scope's own `decisions/` or ARD files.
 
-- [Architecture Drafts](drafts/README.md)
-- [TUI History](tui/history/README.md)
+Established nested Architecture Scopes include:
 
-Historical terminology and old paths may be preserved in non-live areas. Do not
-rewrite those files just to match current package names unless a live migration
-plan explicitly asks for it.
+- [Coding LSP](coding/lsp/README.md), a Coding-owned Product Capability;
+- [Coding Arch](coding/arch/README.md), a Coding-owned architecture-analysis
+  Product Capability;
+- [Harness Multi-Agent](harness/multiagent/README.md), a Harness-owned technical
+  capability.
+
+The [Harness Plugin Architecture](harness/plugin/README.md) is the active
+nested-scope catalog for a proposed canonical V2 target plus implemented
+incremental contracts. Its presence in the scope tree does not advance that
+target to accepted status.
+
+The accepted [AppHost Top-Level Placement](decisions/ARD-003-apphost-top-level-placement.md)
+gives the existing cross-Product Platform Host role one physical owner.
+AppHost G8 contains A0.4 catalog/routing, canonical live bindings, embedded
+profile lifecycle, the optional hosted binder over AppServer-owned
+contract-only structural ports, and one Coding-owned exact-receipt Product
+integration. It remains default-dark and does not move Product semantics,
+AppService, server runtime, or Hosting mechanics into AppHost. The accepted
+[G9 closure](apphost/hosted-product-v1-closure-g9.md) makes installed
+composition, activation, omitted-owner policy, Current deletion, and main
+promotion independent decisions. G9.1--G9.2 implement the sole explicit Coding
+composition and rollback/crash drill; G9.3 accepts a source-backed `RETAIN`
+decision without changing the Current route. G9.4 independently promotes the
+capability to `main` while preserving default-dark activation.
+The implemented
+[G10 explicit canary](apphost/installed-explicit-canary-g10.md) adds one exact,
+default-dark installed Coding command that traverses the G9 composition into a
+short-lived native Hosting child. Product-owned durable control, bounded
+reports, and separate Linux/Windows evidence leave normal CLI/TUI/SDK
+ownership, the G9.3 `RETAIN` decision, AppServer/AppService, and named mux
+unchanged.
+The implemented
+[G11 in-process hosted application](appserver/hosted-application-g11.md)
+is the first named-mux extraction trigger.  It keeps AppServer protocol,
+AppService semantics, Product adapters, and Harnesstui presentation in separate
+owners and explicitly excludes listeners, IPC, daemon control, default-route
+changes, and Current deletion.
+The implemented
+[G12 foreground hosted application](apphost/foreground-hosted-application-g12.md)
+adds the first explicit AppHost-owned lifecycle composition over AppService and
+a Coding-owned foreground Session resolver. It remains an uninstalled
+process-local library; AppServer transport, IPC, Hosting, daemon continuity and
+default-route decisions remain absent.
+The implemented
+[G13 durable hosted continuity](apphost/durable-hosted-application-continuity-g13.md)
+defines a one-writer durable AppService coordination record and canonical
+Session rehydration around that same explicit library edge. It persists no
+Product generation or live execution and still grants no listener, daemon or
+installed activation.
+
+The implemented [G14 foreground stdio profile](appserver/foreground-stdio-hosted-app-g14.md)
+adds AppServer-owned bounded connections and a transport AppClient over
+injected byte IO. Its optional AppHost edge orders application settlement;
+its explicit installed Product command composes canonical Sessions. This does not
+change embedded defaults, grant a listener/daemon, or move G13 recovery into
+the transport. Real Product interaction, shutdown and fresh-process recovery
+are verified on Linux, macOS and Windows; the G14 record links the exact
+native evidence and integration PR.
+
+The [accepted G15 foreground Hosted TUI design](apphost/foreground-hosted-tui-g15.md)
+defines the optional A0.5 launcher and explicit client presentation boundary.
+Its launcher and global Session-discovery picker remain design-only. G16
+delivers the shared terminal shell under a separate detachable connection
+lifetime, without activating G15 foreground process ownership.
+
+The implemented G16 local workspace supplies authenticated local connections,
+application-owned work that can outlive a client, and the installed
+`loushang-mux` Product route. Its
+[final delivery record](appserver/detachable-local-workspace-g16.md#final-delivery-acceptance)
+records native and isolated-wheel acceptance on Linux/macOS/Windows and main
+promotion, separately from the post-merge Hosting regression tracked by G17.0.
+Embedded defaults and G14's foreground EOF behavior remain unchanged.
+
+A nested scope is not automatically a top-level subsystem. The parent owns its
+placement, composition policy, and sibling relationships; the child owns its
+black-box contract and internal component model.
+
+## Scope Documentation Rule
+
+Each scope expands only its direct children. The AOD does not describe LSP
+Client internals, Coding does not duplicate Harness internals, and nested scopes
+represent their parent and neighboring scopes as black boxes.
+
+Complex scopes may use glossary, local principles, requirements, system
+context, boundary, specification, component model, interaction, dependency,
+traceability, interfaces, key designs, decisions, generated facts, validation,
+reference, and history. Glossary and principles inherit from the parent; local
+files contain only domain-specific additions. Smaller scopes should combine
+these concerns rather than create empty files.
+Follow the [Loushang Architecture Governance Profile](governance-profile.md)
+when establishing or normalizing a scope entrypoint.
+
+## Current Facts And Architecture Gates
+
+[Current Observed Package Dependencies](generated/current-package-dependencies.md)
+is generated from Python source. It is an observed physical import graph, not a
+normative dependency policy or semantic runtime sequence.
+
+Architecture tests under `tests/architecture/` enforce intended, required, and
+forbidden dependency direction. Generated facts and normative gates complement
+each other:
+
+- facts reveal what exists;
+- gates decide what is allowed;
+- current owner maps explain ownership;
+- target designs describe accepted evolution.
+
+Run `make check-architecture-docs` to verify the generated package graph,
+canonical document status metadata, repository-relative links, and retired-mode
+drift guards.
+
+## Current And Target Examples
+
+- [Harness Current Owner Map](harness/current-owner-map.md) is the descriptive
+  owner-map pattern.
+- [Harness Capability Dependency And Mount Lifecycle](harness/capability-dependency-and-mount-lifecycle.md)
+  is an accepted Target whose graph owners are implemented while accepted
+  Capability IDs may still differ from production-mounted coverage.
+- [TUI Traceability Matrix](tui/native-terminal-core/traceability-matrix.md)
+  demonstrates requirements-to-design-to-test traceability.
+- [Coding LSP](coding/lsp/README.md) demonstrates a nested Product Capability
+  architecture package.
+- [Hosting H0 Contract Model](hosting/contract-model-h0.md) demonstrates an
+  accepted top-level mechanism scope entering implementation through a pure
+  contract slice before resource-owner migration.
+- [AppHost A0 Contract Model](apphost/contract-model-a0.md) demonstrates a
+  cross-Product composition scope entering implementation through immutable,
+  standard-library-only values and required ports before routing or activation.
+
+## Draft, Validation, Reference, And History
+
+- [Architecture Drafts](drafts/README.md) contain unresolved proposals and are
+  not accepted requirements. New identified ARDs follow their owning scope's
+  `decisions/draft/` or `decisions/proposed/` lifecycle; general exploration and
+  delivery plans retain their own locations.
+- `validation/` records architecture conclusions drawn from tests, comparisons,
+  or spikes.
+- `reference/` records external or comparative material and is never Loushang
+  architecture authority.
+- `history/` preserves superseded designs and terminology for traceability.
+  Decision records using state directories retain superseded rationale in
+  `decisions/superseded/` without a duplicate history copy.
+
+Historical terminology and old paths may remain in non-live material. Do not
+rewrite history merely to match current package names, but make its historical
+status unmistakable and keep it out of the current reading path.
+
+## Change Governance
+
+A change that crosses an Architecture Scope boundary must update the affected
+child and its nearest common parent. New sibling dependencies require both
+child contracts, the parent dependency graph, and an executable architecture
+gate. Top-level ownership changes also require the AOD, subsystem map, and an
+ARD or accepted boundary decision.
+
+Completed migration records remain traceability evidence but must not be used
+as the resulting architecture specification.

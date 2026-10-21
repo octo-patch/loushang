@@ -13,9 +13,10 @@ from loushang.ai.options import (
     get_reasoning_budget_tokens,
 )
 from loushang.ai.output_budget import resolve_output_token_budget
+from loushang.ai.prepared_request import invoke_prepared_request
 from loushang.ai.protocols._anthropic import AnthropicMessagesProtocol
 from loushang.ai.protocols._helpers import canonicalize_sdk_headers
-from loushang.ai.provider import ProviderRequest
+from loushang.ai.provider import PreparedModelRequest, ProviderRequest
 from loushang.ai.provider.errors import (
     provider_error_part,
     provider_error_part_from_raw,
@@ -27,6 +28,7 @@ from loushang.ai.tool.helpers import (
 )
 from loushang.ai.trace import emit_trace as _emit_trace
 from loushang.ai.utils import parse_streaming_json, sanitize_surrogates
+from loushang.ai.utils.async_iter import DirectAsyncIterator, close_async_source
 
 
 def _build_anthropic_message_payloads(
@@ -247,6 +249,14 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
         将 Anthropic SDK 的 streaming 事件映射到 RawPart。
         当前实现覆盖文本、thinking、signature、redacted thinking、工具增量、usage、stop_reason 与完成事件。
         """
+        source = invoke_prepared_request(self, request)
+        try:
+            async for part in source:
+                yield part
+        finally:
+            await close_async_source(source)
+
+    def prepare_request(self, request: ProviderRequest) -> PreparedModelRequest:
         model = request.model
         options = request.options
         resolved = request
@@ -260,48 +270,30 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
 
         normalized = request.context
         adapter_config = _request_adapter_config(resolved)
-
-        headers = resolved.headers or {}
-
-        # 延迟导入官方 SDK，避免未安装时报错影响其它路径
-        try:
-            from anthropic import AsyncAnthropic, Omit  # type: ignore
-        except Exception as e:  # pragma: no cover
-            raise RuntimeError(
-                "anthropic SDK is not installed. Install via `pip install anthropic`"
-            ) from e
-
-        default_headers = canonicalize_sdk_headers(headers)
-        # 门闸：按 typed protocol/headers 决定是否注入 beta（与 httpx 对齐）
+        # Resolved headers mix transport configuration and credentials.  They
+        # are never eligible for durable/model-visible projection because
+        # provenance has already been erased at this boundary.  Only behavior
+        # headers generated from typed adapter inputs are frozen and replayed.
+        protocol_headers: dict[str, str] = {}
         need_ilt = self.should_inject_interleaved_thinking(
             reasoning_enabled=resolved.reasoning_enabled,
             adapter_config=adapter_config,
         )
         need_fg = self.should_inject_fine_grained_tools(
             adapter_config=adapter_config,
-            headers=default_headers,
+            headers=None,
         )
         if need_ilt or need_fg:
-            default_headers = self.apply_beta_headers(
-                existing_headers=default_headers,
+            protocol_headers = self.apply_beta_headers(
+                existing_headers=protocol_headers,
                 need_interleaved_beta=need_ilt,
                 force_fine_grained_tools=need_fg,
             )
-
-        client = self._client or AsyncAnthropic(  # type: ignore[call-arg]
-            api_key="",
-            auth_token="",
-            base_url=resolved.base_url,
-        )
-        _debug(
-            "client",
-            {
-                "api": model.api,
-                "provider": model.provider_id,
-                "endpoint": model.endpoint_id,
-                "model": model.id,
-            },
-        )
+        model_visible_headers = {
+            name: value
+            for name, value in protocol_headers.items()
+            if name.casefold() == "anthropic-beta"
+        }
 
         messages_param, system_param = _build_anthropic_message_payloads(normalized)
         upstream_model_id = model.upstream_id or model.id
@@ -417,9 +409,92 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
                 "tool_count": len(tools_param or []),
             },
         )
+        return PreparedModelRequest.from_provider_request(
+            request,
+            payload=params,
+            model_visible_headers=model_visible_headers,
+        )
+
+    async def invoke_prepared_raw(
+        self,
+        request: ProviderRequest,
+        prepared: PreparedModelRequest,
+    ) -> AsyncIterator[RawPart]:
+        try:
+            from anthropic import AsyncAnthropic, Omit  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise RuntimeError(
+                "anthropic SDK is not installed. Install via `pip install anthropic`"
+            ) from e
+
+        if self._client is None:
+            client = AsyncAnthropic(  # type: ignore[call-arg]
+                api_key="",
+                auth_token="",
+                base_url=request.base_url,
+            )
+            owns_client = True
+        else:
+            client = self._client
+            owns_client = False
+
+        source = self._invoke_prepared_raw_with_client(
+            request,
+            prepared,
+            client=client,
+            omit=Omit,
+        )
+        try:
+            async for part in source:
+                yield part
+        finally:
+            try:
+                await close_async_source(source)
+            finally:
+                if owns_client:
+                    await close_async_source(client)
+
+    async def _invoke_prepared_raw_with_client(
+        self,
+        request: ProviderRequest,
+        prepared: PreparedModelRequest,
+        *,
+        client: Any,
+        omit: Any,
+    ) -> AsyncIterator[RawPart]:
+        model = request.model
+        options = request.options
+        resolved = request
+
+        def _debug(event: str, data: dict | None = None) -> None:
+            payload = {"type": f"sdk:{event}"}
+            if data:
+                for key, value in data.items():
+                    payload["event_type" if key == "type" else key] = value
+            _emit_trace(options, payload)
+
+        default_headers = canonicalize_sdk_headers(resolved.headers or {})
+        default_headers = {
+            name: value
+            for name, value in default_headers.items()
+            if name.casefold() != "anthropic-beta"
+        }
+        default_headers.update(prepared.model_visible_headers_for_transport())
+
+        _debug(
+            "client",
+            {
+                "api": model.api,
+                "provider": model.provider_id,
+                "endpoint": model.endpoint_id,
+                "model": model.id,
+            },
+        )
+
+        params: dict[str, Any] = prepared.payload_for_transport()
         params["extra_headers"] = {
-            "X-Api-Key": Omit(),
-            "Authorization": Omit(),
+            "X-Api-Key": omit(),
+            "Authorization": omit(),
             **default_headers,
         }
 
@@ -446,7 +521,8 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
         active_tool_blocks: dict[int | None, _AnthropicToolStreamState] = {}
         try:
             async with stream_ctx as stream:
-                async for event in stream:
+                events = DirectAsyncIterator(stream)
+                async for event in events:
                     etype = getattr(event, "type", None)
                     if etype == "message_start":
                         msg = getattr(event, "message", None)
@@ -608,6 +684,7 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
                             mapped = _map_stop_reason(stop_reason)
                             yield {"type": "stop_reason", "stop_reason": mapped}
                             if mapped == "error":
+                                await _drain_terminal_events(events)
                                 yield provider_error_part_from_raw(
                                     f"provider stop_reason={stop_reason}",
                                     code=stop_reason,
@@ -621,12 +698,14 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
                                 yield usage_part
                         continue
                     if etype == "message_stop":
+                        await _drain_terminal_events(events)
                         yield {"type": "response_done"}
                         return
                     if etype == "error":
                         err = getattr(event, "error", None)
                         msg = getattr(err, "message", None) if err is not None else None
                         code = getattr(err, "type", None) if err is not None else None
+                        await _drain_terminal_events(events)
                         yield provider_error_part_from_raw(
                             msg or "Unknown error",
                             code=code,
@@ -643,6 +722,18 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
         except Exception as e:
             _debug("stream_iter_error", {"exceptionType": type(e).__name__})
             yield provider_error_part(e, source=self.api)
+
+
+async def _drain_terminal_events(events: AsyncIterator[object]) -> None:
+    """Reach transport EOF before exposing an Anthropic terminal part."""
+
+    try:
+        async for _ in events:
+            pass
+    except Exception:
+        # The Anthropic terminal event already determines the request outcome.
+        # A trailing transport failure must not replace that outcome.
+        pass
 
 
 def _map_stop_reason(reason: str) -> str:

@@ -58,5 +58,5 @@ def test_screen_app_real_status_bar_uses_shared_status_line_builder() -> None:
     assert actual.lines[0].text == expected.lines[0].text
     assert actual.lines[0].text == (
         "moonshot/kimi-for-coding · repo · main · abcd · idle · "
-        "queued=0 steer=0 · no status · perm=standard"
+        "queued=0 steer=0 · no status · standard"
     )

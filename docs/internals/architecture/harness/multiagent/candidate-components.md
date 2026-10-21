@@ -1,12 +1,10 @@
 # Loushang Multi-Agent Candidate Components
 
-> Status: **draft proposal**（目标设计，未经接受）。按
-> [Loushang Documentation Model](../../loushang-documentation-model.md)，
-> 本文表达 should-be 的组件候选，不描述当前实现状态。
->
-> 本版已按评审修订：核对 harness 现有模块（`host/queue.py`、
-> `host/runtime.py`、`approval.py`、`session/`）后，组件按**复用关系**
-> 定义，不平行重造已有机制。
+> Status: **implemented**（已实现，候选组件已收敛为实际模块）。按
+> [Loushang Architecture Governance Profile](../../governance-profile.md)，
+> 本文记录最终实现前的组件候选分析；实际实现已压缩到五个内核文件
+> （types / registry / control / run_handle / context）加 recipes / executor /
+> workspace / delegation，不按候选逐一造组件。
 
 ## Scope
 
@@ -276,7 +274,10 @@ ToolSurfaceAdapter
 - **事件持久化与 replay**：multiagent 只发射技术事实；持久化属装配层
   或 work
 - **UI 面板**：属 harnesstui / 产品 UI，消费 LifecycleProjection 的事实
-- **远端子 agent transport**：未来扩展，由 channel 承载
+- **远端 Agent client / wire transport**：由 Product/Host 装配并注入；
+  Channel 不承载 Agent RPC。一次性 capability 与异步 job 不进入
+  multiagent，持续协作 adapter 也不成为 multiagent 内核组件，见
+  [Remote Agent Capability Boundary](remote-agent-capability-boundary.md)
 
 ## Open Questions（留待拍板 / 组件设计）
 

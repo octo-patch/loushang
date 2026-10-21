@@ -106,15 +106,28 @@ class RecordingTarget:
         error_message: str | None,
         summary: str,
         tokens_before: int | None,
+        tokens_after: int | None = None,
+        duration_ms: int | float | None = None,
+        aborted: bool = False,
+        will_retry: bool = False,
+        stage: str | None = None,
     ) -> None:
         self.events.append(
-            ("compaction_finished", error_message, summary, tokens_before)
+            (
+                "compaction_finished",
+                error_message,
+                summary,
+                tokens_before,
+                tokens_after,
+                duration_ms,
+                aborted,
+                will_retry,
+                stage,
+            )
         )
 
 
-def test_projection_binding_forwards_product_events_and_exposes_shared_state() -> (
-    None
-):
+def test_projection_binding_forwards_product_events_and_exposes_shared_state() -> None:
     target = RecordingTarget()
     projector = ConversationProjector(target)
     seen: list[object] = []
@@ -213,6 +226,11 @@ def test_session_event_adapter_routes_structural_events_without_product_types() 
         {
             "type": "compaction_end",
             "result": {"summary": "condensed", "tokens_before": 120},
+            "tokens_after": 40,
+            "duration_ms": 254_000,
+            "aborted": False,
+            "will_retry": True,
+            "stage": "committed",
         }
     )
 
@@ -220,7 +238,17 @@ def test_session_event_adapter_routes_structural_events_without_product_types() 
         ("run_started", 2.0),
         ("queues_updated", ("adjust",), ("next",)),
         ("user_message", "hello"),
-        ("compaction_finished", None, "condensed", 120),
+        (
+            "compaction_finished",
+            None,
+            "condensed",
+            120,
+            40,
+            254_000,
+            False,
+            True,
+            "committed",
+        ),
     ]
     assert target.last_delta == "part"
 
@@ -569,5 +597,15 @@ def test_neutral_lifecycle_facts_are_forwarded_without_product_policy() -> None:
         ("assistant_started",),
         ("retry_started", 2, 3, 250.0, "rate limited"),
         ("compaction_started", "token budget"),
-        ("compaction_finished", None, "Earlier context", 8192),
+        (
+            "compaction_finished",
+            None,
+            "Earlier context",
+            8192,
+            None,
+            None,
+            False,
+            False,
+            None,
+        ),
     ]

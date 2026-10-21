@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
+from functools import partial
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -32,9 +33,10 @@ from loushang.ai.types import (
 )
 from tests.protocols._runtime import (
     bound_test_model,
+    invoke_raw_parts_for_test,
     make_provider_request,
-    provider_request_for_test,
-    start_test_provider_stream,
+    normalized_context_for_test,
+    stream_for_test,
 )
 
 FINE_GRAINED_TOOLS = "fineGrainedTools"
@@ -55,57 +57,9 @@ def _registry_with_endpoint(provider_id: str, endpoint: Endpoint) -> ModelRegist
     )
 
 
-def _normalized_context(model, context, options=None):
-    if not isinstance(model, Model) or not model.api:
-        model = bound_test_model(
-            model,
-            api="anthropic-messages",
-            options=options,
-        )
-    pairing_mode = (
-        "strict" if getattr(options, "pairing_mode", "strict") == "strict" else "repair"
-    )
-    return normalize_context(context, model=model, pairing_mode=pairing_mode)
-
-
-def _invoke_raw_parts(
-    provider,
-    model,
-    context,
-    options=None,
-    request=None,
-    *,
-    mode: str = "stream",
-):
-    normalized_context = _normalized_context(
-        request.model if request is not None else model,
-        context,
-        options,
-    )
-    provider_request = provider_request_for_test(
-        provider,
-        model,
-        normalized_context,
-        options=options,
-        request=request,
-    )
-    if mode != "stream":
-        provider_request = replace(provider_request, mode=mode)
-    return provider.invoke_raw(provider_request)
-
-
-async def _stream(provider, model, context, options=None, request=None):
-    return start_test_provider_stream(
-        provider,
-        model,
-        _normalized_context(
-            request.model if request is not None else model,
-            context,
-            options,
-        ),
-        options,
-        request=request,
-    )
+_normalized_context = partial(normalized_context_for_test, "anthropic-messages")
+_invoke_raw_parts = partial(invoke_raw_parts_for_test, "anthropic-messages")
+_stream = partial(stream_for_test, "anthropic-messages")
 
 
 def test_stop_reason_mapping_tool_use():
@@ -250,6 +204,96 @@ def test_anthropic_provider_complete_mode_maps_non_stream_response(
     assert parts[5]["id"] == "tool_call_2"
     assert parts[6]["delta"] == '{"x":1}'
     assert parts[9] == {"type": "stop_reason", "stop_reason": "error"}
+
+
+def test_anthropic_drains_nested_stream_before_terminal_and_closes_owned_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_anthropic_module(
+        monkeypatch,
+        [
+            SimpleNamespace(type="message_stop"),
+            RuntimeError("trailing transport failure"),
+        ],
+    )
+
+    async def _run() -> None:
+        source = _invoke_raw_parts(
+            AnthropicMessagesAdapter(),
+            _Model(),
+            {
+                "messages": [
+                    UserMessage(role="user", content="hello", timestamp=0.0)
+                ]
+            },
+            CallOptions(auth=ApiKeyAuth("test-key")),
+        )
+
+        assert (await anext(source))["type"] == "response_done"
+        assert _FakeStreamContext.last_instance is not None
+        assert _FakeStreamContext.last_instance.inner_close_calls == 1
+        assert _FakeStreamContext.last_instance.iter_calls == 0
+
+        await source.aclose()
+
+        assert _FakeStreamContext.last_instance.exit_calls == 1
+        assert _FakeAsyncAnthropic.last_instance is not None
+        assert _FakeAsyncAnthropic.last_instance.close_calls == 1
+
+    asyncio.run(_run())
+
+
+def test_anthropic_does_not_close_injected_client_at_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_anthropic_module(monkeypatch, [SimpleNamespace(type="message_stop")])
+    client = _FakeAsyncAnthropic()
+
+    asyncio.run(
+        _collect_parts(
+            _invoke_raw_parts(
+                AnthropicMessagesAdapter(client=client),
+                _Model(),
+                {
+                    "messages": [
+                        UserMessage(role="user", content="hello", timestamp=0.0)
+                    ]
+                },
+                CallOptions(auth=ApiKeyAuth("test-key")),
+            )
+        )
+    )
+
+    assert client.close_calls == 0
+
+
+def test_anthropic_closes_owned_client_after_stream_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _fake_anthropic_module(
+        monkeypatch,
+        [],
+        stream_error=RuntimeError("stream failed"),
+    )
+
+    parts = asyncio.run(
+        _collect_parts(
+            _invoke_raw_parts(
+                AnthropicMessagesAdapter(),
+                _Model(),
+                {
+                    "messages": [
+                        UserMessage(role="user", content="hello", timestamp=0.0)
+                    ]
+                },
+                CallOptions(auth=ApiKeyAuth("test-key")),
+            )
+        )
+    )
+
+    assert [part["type"] for part in parts] == ["response_error"]
+    assert _FakeAsyncAnthropic.last_instance is not None
+    assert _FakeAsyncAnthropic.last_instance.close_calls == 1
 
 
 def test_fine_grained_tool_beta_uses_adapter_config() -> None:
@@ -485,6 +529,7 @@ def test_anthropic_payload_maps_images_tools_and_groups_tool_results() -> None:
                         ],
                         api="anthropic-messages",
                         provider="anthropic",
+                        endpoint="test-endpoint",
                         model="claude",
                         response_id=None,
                         usage=Usage(
@@ -821,6 +866,10 @@ def test_anthropic_provider_payload_snapshot_for_mixed_assistant_and_tool_result
                         ),
                         {
                             "role": "assistant",
+                            "api": "anthropic-messages",
+                            "provider": "anthropic",
+                            "endpoint": "anthropic-messages",
+                            "model": "claude-sonnet-4-5",
                             "content": [
                                 TextPart(type="text", text="working on it"),
                                 ThinkingPart(
@@ -1327,6 +1376,7 @@ def test_anthropic_payload_groups_consecutive_tool_results_from_same_turn() -> N
                         ],
                         api="anthropic-messages",
                         provider="anthropic",
+                        endpoint="test-endpoint",
                         model="claude-test",
                         response_id=None,
                         usage=Usage(
@@ -1495,12 +1545,16 @@ def _fake_anthropic_module(
     events: list[object],
     *,
     response: object | None = None,
+    stream_error: Exception | None = None,
 ) -> None:
     _FakeAsyncAnthropic.events = events
     _FakeAsyncAnthropic.response = response
+    _FakeAsyncAnthropic.stream_error = stream_error
+    _FakeAsyncAnthropic.last_instance = None
     _FakeAsyncAnthropic.last_init_kwargs = {}
     _FakeAsyncAnthropic.last_stream_kwargs = {}
     _FakeAsyncAnthropic.last_create_kwargs = {}
+    _FakeStreamContext.last_instance = None
     module = ModuleType("anthropic")
     module.AsyncAnthropic = _FakeAsyncAnthropic
     module.Omit = _FakeOmit
@@ -1514,13 +1568,20 @@ class _FakeOmit:
 class _FakeAsyncAnthropic:
     events: list[object] = []
     response: object | None = None
+    stream_error: Exception | None = None
+    last_instance: _FakeAsyncAnthropic | None = None
     last_init_kwargs: dict[str, object] = {}
     last_stream_kwargs: dict[str, object] = {}
     last_create_kwargs: dict[str, object] = {}
 
     def __init__(self, **kwargs) -> None:
+        type(self).last_instance = self
         type(self).last_init_kwargs = kwargs
+        self.close_calls = 0
         self.messages = _FakeMessages(type(self))
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 class _FakeMessages:
@@ -1529,6 +1590,8 @@ class _FakeMessages:
 
     def stream(self, **kwargs):
         self._owner.last_stream_kwargs = kwargs
+        if self._owner.stream_error is not None:
+            raise self._owner.stream_error
         return _FakeStreamContext(self._owner.events)
 
     async def create(self, **kwargs):
@@ -1537,28 +1600,46 @@ class _FakeMessages:
 
 
 class _FakeStreamContext:
+    last_instance: _FakeStreamContext | None = None
+
     def __init__(self, events: list[object]) -> None:
+        type(self).last_instance = self
         self._events = events
+        self._iterator = self._iterate_events()
+        self.exit_calls = 0
+        self.iter_calls = 0
+        self.iter_close_calls = 0
+        self.inner_close_calls = 0
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        self.exit_calls += 1
         return False
 
     def __aiter__(self):
-        return _FakeStreamIterator(self._events)
+        return self._iterate()
 
+    async def _iterate(self):
+        self.iter_calls += 1
+        try:
+            while True:
+                yield await self.__anext__()
+        finally:
+            self.iter_close_calls += 1
 
-class _FakeStreamIterator:
-    def __init__(self, events: list[object]) -> None:
-        self._events = iter(events)
+    async def _iterate_events(self):
+        try:
+            for event in self._events:
+                if isinstance(event, BaseException):
+                    raise event
+                yield event
+        finally:
+            self.inner_close_calls += 1
 
     async def __anext__(self):
-        try:
-            return next(self._events)
-        except StopIteration as exc:
-            raise StopAsyncIteration from exc
+        return await self._iterator.__anext__()
 
 
 @dataclass(frozen=True)

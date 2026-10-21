@@ -87,6 +87,7 @@ def test_get_auth_missing_oauth_is_structured_and_never_starts_login() -> None:
     assert exc_info.value.info.details["available_actions"] == ["login"]
 
 
+@pytest.mark.requires_host_runtime
 def test_login_returns_session_without_opening_browser(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -186,6 +187,22 @@ def test_auth_registry_prefers_model_route_then_endpoint_fallback() -> None:
             auth.AuthRoute("oauth", "example", "other-endpoint"),
             _ExternalSource(id=endpoint_source.id),
         )
+
+
+def test_auth_registry_explicit_replace_compatibility_baseline() -> None:
+    route = auth.AuthRoute("oauth", "example", "oauth")
+    first = _ExternalSource(id="first-oauth")
+    replacement = _ExternalSource(id="replacement-oauth")
+    registry = auth.AuthRegistry()
+
+    assert registry.register_auth_adapter(route, first) is None
+    assert registry.register_auth_adapter(route, replacement, replace=True) is None
+
+    assert registry.get_auth_adapter(route) is replacement
+    assert dict(registry.credential_sources) == {
+        first.id: first,
+        replacement.id: replacement,
+    }
 
 
 def test_public_auth_registry_helpers_share_the_default_registry(

@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 
+import pytest
+
 from loushang.harness.commands import CommandDef, CommandKind
 from loushang.harness.continuity import ContinuityTarget
 from loushang.harnesstui.settings.workflow import SettingsApplyResult
@@ -261,7 +263,7 @@ def _workflow(
                 if text.strip() == "/resume"
                 else (
                     ScreenSurfaceCommand("fork_session")
-                    if text.strip() == "/fork"
+                    if text.strip() == "/branch"
                     else (
                         ScreenSurfaceCommand("rename_session")
                         if text.strip() == "/rename"
@@ -392,6 +394,11 @@ def test_surface_workflow_applies_model_and_keeps_recoverable_error_surface_open
     assert workflow.current is model_surface
     assert state.statuses == ["recoverable:catalog offline"]
     assert state.model_refreshes == 0
+    assert isinstance(model_surface, ScreenSurfaceView)
+    assert model_surface.feedback == "recoverable:catalog offline"
+    assert model_surface.feedback_hint == (
+        "Choose another model, or press Esc to keep the current model."
+    )
 
     state.fail_model = False
     asyncio.run(
@@ -470,12 +477,13 @@ def test_surface_workflow_opens_agent_tree_page() -> None:
     assert surface.purpose == "agent_tree"
 
 
-def test_surface_workflow_opens_fork_picker_and_restores_selected_prompt() -> None:
+def test_surface_workflow_opens_branch_picker_and_restores_selected_prompt() -> None:
     workflow, state = _workflow()
 
-    assert workflow.is_local_command("/fork") is True
+    assert workflow.is_local_command("/branch") is True
+    assert workflow.is_local_command("/fork") is False
     assert workflow.is_local_command("/fork entry-1 before") is False
-    asyncio.run(workflow.handle_text("/fork"))
+    asyncio.run(workflow.handle_text("/branch"))
 
     picker = workflow.current
     assert isinstance(picker, ScreenSurfaceView)
@@ -659,6 +667,8 @@ def test_surface_workflow_adapts_approval_decision_and_product_status_copy() -> 
     ]
     assert state.statuses == ["stale"]
     assert workflow.current is None
+
+
 def test_surface_workflow_opens_and_applies_session_permissions() -> None:
     workflow, state = _workflow()
 
@@ -668,10 +678,103 @@ def test_surface_workflow_opens_and_applies_session_permissions() -> None:
     assert workflow.current.purpose == "permissions"
 
     asyncio.run(
-        workflow.handle_intent(
-            InputIntent(kind="select", text="revoke:grant-1")
-        )
+        workflow.handle_intent(InputIntent(kind="select", text="revoke:grant-1"))
     )
 
     assert state.permission_actions == ["revoke:grant-1"]
     assert state.statuses[-1] == "Session permission revoked."
+
+
+def test_profile_selection_keeps_session_and_saved_default_feedback_on_the_page():
+    workflow, state = _workflow()
+    asyncio.run(workflow.handle_text("/permissions"))
+    asyncio.run(workflow.handle_intent(InputIntent(
+        kind="permission_profile_action", text="set-profile:user:full_access",
+    )))
+    assert state.permission_actions == ["set-profile:user:full_access"]
+    assert workflow.current.feedback == (
+        "Permissions updated to Full Access for this session. Saved as the user default."
+    )
+
+
+def test_surface_workflow_cancels_in_flight_continuity_activation() -> None:
+    class _ActivationContent:
+        selected_target = "typed-target"
+
+        def __init__(self) -> None:
+            self.activating = False
+            self.cancelled = False
+            self.closed = False
+
+        def begin_activation(self) -> bool:
+            if self.activating:
+                return False
+            self.activating = True
+            return True
+
+        def cancel_activation(self) -> bool:
+            if not self.activating:
+                return False
+            self.activating = False
+            self.cancelled = True
+            return True
+
+        def fail_activation(self, error: Exception) -> None:
+            self.activating = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def scenario() -> None:
+        workflow, state = _workflow()
+        gate = asyncio.Event()
+
+        async def activate(target: object) -> str:
+            await gate.wait()
+            return "resumed:typed-target"
+
+        workflow.ports = replace(workflow.ports, activate_continuity=activate)
+        content = _ActivationContent()
+        picker = ScreenSurfaceView(
+            title="Resume",
+            purpose="session",
+            content=content,
+            presentation="page",
+        )
+        workflow.open(picker)
+
+        await workflow.handle_surface_intent(
+            InputIntent(kind="select", text="opaque-render-value")
+        )
+        assert content.activating is True
+        task = workflow._session_activation_task
+        assert task is not None and not task.done()
+
+        await workflow.handle_surface_intent(
+            InputIntent(
+                kind="consumed",
+                note="continuity_cancel_activation",
+            )
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The picker stays open, the surface was reset for a retry, and the
+        # status line reports the cancellation instead of an error.
+        assert workflow.current is picker
+        assert content.cancelled is True
+        assert content.closed is False
+        assert state.statuses == ["Resume cancelled"]
+
+        # A retry still works after the cancellation.
+        gate.set()
+        await workflow.handle_surface_intent(
+            InputIntent(kind="select", text="opaque-render-value")
+        )
+        retry = workflow._session_activation_task
+        assert retry is not None
+        await retry
+        assert workflow.current is None
+        assert state.statuses[-1] == "resumed:typed-target"
+
+    asyncio.run(scenario())

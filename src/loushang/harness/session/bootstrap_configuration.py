@@ -1,0 +1,346 @@
+"""Standard Agent session configuration over shared resource services."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Generic, TypeVar
+
+from loushang.harness.bootstrap import (
+    StandardExtensionRuntime,
+    create_standard_resource_bootstrap_runtime,
+)
+from loushang.harness.config.agent import ControlConfig, SettingsManager
+from loushang.harness.diagnostics.service import (
+    DiagnosticsService,
+    run_standard_startup_checks,
+)
+from loushang.harness.diagnostics.types import StartupCheckResult
+from loushang.harness.model_catalog import ModelCatalog
+from loushang.harness.resources.activation import SkillActivationRuntime
+from loushang.harness.resources.loader import ResourceLoader
+from loushang.harness.resources.packages.catalog_diagnostics import (
+    record_package_lockfile_diagnostics,
+)
+from loushang.harness.resources.packages.materializer import PackageMaterializer
+from loushang.harness.resources.packages.product_contract import (
+    PackageProductLifecycleInventoryPort,
+    PackageProductLifecycleMode,
+    PackageProductLifecycleOperationPort,
+)
+from loushang.harness.resources.packages.roots import (
+    SelectedPluginPackageInput,
+    configure_resource_loader_roots,
+)
+from loushang.harness.resources.packages.source_resolver import (
+    PackageSourceResolver,
+)
+from loushang.harness.resources.types import ResourceBundle
+from loushang.harness.session.bootstrap_activation import (
+    StandardAgentSessionActivationEffects,
+    activate_standard_agent_session_configuration,
+)
+from loushang.harness.session.cwd_audit import (
+    CwdBoundServicesAudit,
+    audit_cwd_bound_services,
+    project_root_from_settings_base,
+    record_cwd_bound_services_audit,
+)
+
+StandardExtensionT = TypeVar("StandardExtensionT", bound=StandardExtensionRuntime)
+
+ExtensionFlagValues = Mapping[str, bool | str]
+SourceIdentityCheck = Callable[[str], StartupCheckResult]
+CatalogBootstrapProjectionPreparer = Callable[[ResourceLoader, Path], ResourceBundle]
+
+
+class PackageProductStartupSourceError(RuntimeError):
+    """A configured Source was durably refused by the Product startup route."""
+
+    code = "package_product_startup_source_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class StandardAgentSessionConfigurationRequest(Generic[StandardExtensionT]):
+    """Concrete shared services for one standard Agent session activation."""
+
+    settings: ControlConfig
+    settings_manager: SettingsManager
+    model_registry: ModelCatalog
+    resource_loader: ResourceLoader
+    diagnostics_service: DiagnosticsService
+    package_materializer: PackageMaterializer | None
+    skill_activation_runtime: SkillActivationRuntime
+    session_id: str
+    cwd: str
+    create_extension_runtime: Callable[[ResourceBundle], StandardExtensionT]
+    source_identity_check: SourceIdentityCheck
+    extension_flag_values: ExtensionFlagValues | None = None
+    catalog_authoritative: bool = False
+    prepare_catalog_bootstrap_projection: (
+        CatalogBootstrapProjectionPreparer | None
+    ) = None
+    selected_plugin_packages: tuple[SelectedPluginPackageInput, ...] = ()
+    package_product_lifecycle: PackageProductLifecycleOperationPort | None = None
+    package_product_inventory: PackageProductLifecycleInventoryPort | None = None
+    package_product_lifecycle_mode: PackageProductLifecycleMode = "legacy"
+
+    def __post_init__(self) -> None:
+        selected_plugin_packages = tuple(self.selected_plugin_packages)
+        if any(
+            not isinstance(item, SelectedPluginPackageInput)
+            for item in selected_plugin_packages
+        ):
+            raise TypeError("Selected Plugin package inputs are invalid")
+        object.__setattr__(
+            self,
+            "selected_plugin_packages",
+            selected_plugin_packages,
+        )
+        if not isinstance(self.catalog_authoritative, bool):
+            raise TypeError("Catalog authority selection must be a bool")
+        if self.catalog_authoritative and not callable(
+            self.prepare_catalog_bootstrap_projection
+        ):
+            raise ValueError(
+                "Catalog authority requires a bootstrap projection preparer"
+            )
+        if (
+            not self.catalog_authoritative
+            and self.prepare_catalog_bootstrap_projection is not None
+        ):
+            raise ValueError(
+                "Legacy authority cannot receive a Catalog projection preparer"
+            )
+        if self.package_materializer is None and (
+            self.package_product_lifecycle is None
+            or self.package_product_lifecycle_mode != "enforced"
+        ):
+            raise ValueError(
+                "Session without a materializer requires enforced Product activation"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class StandardAgentSessionConfigurationResult(Generic[StandardExtensionT]):
+    resource_bundle: ResourceBundle
+    extension_runtime: StandardExtensionT
+    cwd_bound_services_audit: CwdBoundServicesAudit
+
+
+@dataclass
+class _StandardAgentSessionConfigurationContext(Generic[StandardExtensionT]):
+    request: StandardAgentSessionConfigurationRequest[StandardExtensionT]
+    resource_bundle: ResourceBundle | None = None
+    extension_runtime: StandardExtensionT | None = None
+    cwd_bound_services_audit: CwdBoundServicesAudit | None = None
+
+
+class StandardAgentSessionConfigurationRuntime(Generic[StandardExtensionT]):
+    """Bind standard Harness resource services to the activation graph."""
+
+    def configure(
+        self,
+        request: StandardAgentSessionConfigurationRequest[StandardExtensionT],
+    ) -> StandardAgentSessionConfigurationResult[StandardExtensionT]:
+        context = _StandardAgentSessionConfigurationContext[StandardExtensionT](
+            request=request
+        )
+        activate_standard_agent_session_configuration(
+            request.settings,
+            context,
+            effects=StandardAgentSessionActivationEffects(
+                startup_checks=self._startup_checks,
+                package_sources=self._package_sources,
+                resource_roots=self._resource_roots,
+                resources=self._resources,
+                extensions=self._extensions,
+                cwd_audit=self._cwd_audit,
+                model_registry=self._model_registry,
+            ),
+        )
+        if context.resource_bundle is None:
+            raise RuntimeError("Session resources have not been configured.")
+        if context.extension_runtime is None:
+            raise RuntimeError("Session extensions have not been configured.")
+        if context.cwd_bound_services_audit is None:
+            raise RuntimeError("Session cwd-bound services have not been audited.")
+        return StandardAgentSessionConfigurationResult(
+            resource_bundle=context.resource_bundle,
+            extension_runtime=context.extension_runtime,
+            cwd_bound_services_audit=context.cwd_bound_services_audit,
+        )
+
+    def _startup_checks(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        if request.package_materializer is not None:
+            record_package_lockfile_diagnostics(
+                request.package_materializer.get_lockfile_diagnostics(),
+                diagnostics_service=request.diagnostics_service,
+                session_id=request.session_id,
+            )
+        run_standard_startup_checks(
+            request.diagnostics_service,
+            cwd=request.cwd,
+            package_roots=request.settings.package_roots,
+            additional_checks=(lambda: request.source_identity_check(request.cwd),),
+            session_id=request.session_id,
+        )
+
+    def _package_sources(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        resolved = PackageSourceResolver(
+            settings_manager=request.settings_manager,
+            materializer=request.package_materializer,
+            diagnostics_service=request.diagnostics_service,
+            session_id=request.session_id,
+            product_lifecycle=request.package_product_lifecycle,
+            product_lifecycle_mode=request.package_product_lifecycle_mode,
+        ).resolve_configured_sources_sync(
+            missing_source_action="install",
+            phase="startup",
+        )
+        if request.package_product_lifecycle_mode == "enforced" and resolved.failed_sources:
+            raise PackageProductStartupSourceError(
+                "Package Product startup source was refused"
+            )
+
+    def _resource_roots(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        configure_resource_loader_roots(
+            resource_loader=request.resource_loader,
+            settings_manager=request.settings_manager,
+            materializer=request.package_materializer,
+            diagnostics_service=request.diagnostics_service,
+            session_id=request.session_id,
+            selected_plugin_packages=request.selected_plugin_packages,
+            include_configured_package_sources=(
+                request.package_product_lifecycle_mode != "enforced"
+            ),
+        )
+
+    def _resources(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        runtime = create_standard_resource_bootstrap_runtime(
+            create_extension_runtime=request.create_extension_runtime,
+            diagnostics_service=request.diagnostics_service,
+            session_id=request.session_id,
+        )
+        catalog_preparer = request.prepare_catalog_bootstrap_projection
+        result = runtime.discover(
+            loader=request.resource_loader,
+            cwd=request.cwd,
+            discover_resources=(
+                (
+                    lambda _loader, cwd: catalog_preparer(
+                        request.resource_loader,
+                        cwd,
+                    )
+                )
+                if catalog_preparer is not None
+                else None
+            ),
+            transform_bundle=lambda bundle: request.skill_activation_runtime.apply(
+                bundle,
+                request.settings.disabled_skills,
+            ),
+        )
+        request.diagnostics_service.record_many(result.diagnostics)
+        context.resource_bundle = result.resource_bundle
+
+    def _extensions(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        if context.resource_bundle is None:
+            raise RuntimeError("Session resources have not been configured.")
+        result = create_standard_resource_bootstrap_runtime(
+            create_extension_runtime=request.create_extension_runtime,
+            diagnostics_service=request.diagnostics_service,
+            session_id=request.session_id,
+        ).activate_extensions(
+            resource_bundle=context.resource_bundle,
+            extension_flags=request.extension_flag_values,
+            transform_bundle=lambda bundle: request.skill_activation_runtime.apply(
+                bundle,
+                request.settings.disabled_skills,
+            ),
+        )
+        request.diagnostics_service.record_many(result.flag_diagnostics)
+        request.diagnostics_service.record_many(result.extension_diagnostics)
+        context.resource_bundle = result.resource_bundle
+        context.extension_runtime = result.extension_runtime
+
+    def _cwd_audit(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        if context.resource_bundle is None:
+            raise RuntimeError("Session resources have not been configured.")
+        audit = audit_cwd_bound_services(
+            session_cwd=request.cwd,
+            project_root=project_root_from_settings_base(
+                request.settings_manager.project_base_dir
+            ),
+            resource_cwd=context.resource_bundle.cwd,
+        )
+        record_cwd_bound_services_audit(
+            audit,
+            diagnostics_service=request.diagnostics_service,
+            session_id=request.session_id,
+        )
+        context.cwd_bound_services_audit = audit
+
+    def _model_registry(
+        self,
+        selection: object,
+        context: _StandardAgentSessionConfigurationContext[StandardExtensionT],
+    ) -> None:
+        del selection
+        request = context.request
+        if context.resource_bundle is None:
+            raise RuntimeError("Session resources have not been configured.")
+        project_root = (
+            context.resource_bundle.agents_path.parent
+            if context.resource_bundle.agents_path is not None
+            else Path(request.cwd)
+        )
+        request.model_registry.reload_if_project_layer(
+            user_dir=Path.home() / ".loushang" / "models",
+            project_dir=project_root / ".loushang" / "models",
+        )
+
+
+__all__ = [
+    "PackageProductStartupSourceError",
+    "StandardAgentSessionConfigurationRequest",
+    "StandardAgentSessionConfigurationResult",
+    "StandardAgentSessionConfigurationRuntime",
+]

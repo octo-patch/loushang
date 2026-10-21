@@ -2,39 +2,98 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import math
+import os
 import shutil
+import time
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractContextManager, suppress
-from typing import Any, Protocol, TextIO
+from contextlib import AbstractContextManager, ExitStack, nullcontext
+from dataclasses import dataclass, field, replace
+from typing import Any, Protocol, TextIO, TypeAlias, assert_never
 
+from loushang.harnesstui.conversation.copy_coordinator import CopyCoordinator
 from loushang.harnesstui.conversation.input import (
+    ConversationAbortResult,
+    ConversationClipboardResult,
+    ConversationCopyTextResult,
+    ConversationExitResult,
+    ConversationFollowupResult,
+    ConversationInputHandled,
+    ConversationInputIgnored,
+    ConversationInputResult,
     ConversationInputRouter,
+    ConversationInputRouterFactoryPort,
+    ConversationInputRouterPort,
+    ConversationLocalResult,
+    ConversationPromptResult,
     ConversationScreenInputPort,
+    ConversationSteerResult,
+    ConversationSurfaceResult,
 )
 from loushang.harnesstui.surface.controller import promote_pending_page_surface
 from loushang.tui import _runner_utils
 from loushang.tui.core import RenderConstraints, RenderResult
 from loushang.tui.framework import SurfaceHost
-from loushang.tui.input import InputEvent, InputIntent, InputReader
+from loushang.tui.input import InputIntent, InputReader
 from loushang.tui.keybindings import KeybindingConfig, KeybindingManager
+from loushang.tui.mouse_policy import (
+    MouseEnvironment,
+    MousePolicy,
+    probe_tmux_mouse,
+    requested_mouse_policy,
+    resolve_mouse_policy,
+)
 from loushang.tui.render_loop import RenderLoop
 from loushang.tui.runtime import TuiRuntime
 from loushang.tui.scheduler import RenderRequestKind
 from loushang.tui.terminal import ProcessTerminalPort, TerminalSize
-from loushang.tui.terminal_capabilities import TerminalRuntimeCapabilities
+from loushang.tui.terminal_capabilities import (
+    TerminalRuntimeCapabilities,
+    detect_terminal_capabilities,
+    terminal_environment_from_env,
+)
 from loushang.tui.terminal_diagnostics import format_terminal_diagnostics
-from loushang.tui.terminal_input import read_input_chunk_or_render_tick
+from loushang.tui.terminal_input import (
+    ESCAPE_SEQUENCE_IDLE_TIMEOUT_MS,
+    InputChunkReader,
+    read_input_chunk_or_render_tick,
+)
 from loushang.tui.terminal_session import TerminalSession
+from loushang.tui.text_clipboard import (
+    TextClipboardWriter,
+    select_text_clipboard_writer,
+    user_clipboard_route_available,
+)
 
 HandlerResult = Awaitable[int | None] | int | None
 PromptHandler = Callable[..., HandlerResult]
 TextHandler = Callable[..., HandlerResult]
-SurfaceIntentHandler = Callable[[InputIntent], HandlerResult]
+SurfaceIntentHandler = Callable[[InputIntent[str]], HandlerResult]
 AbortHandler = Callable[[], Awaitable[object] | object]
 ShouldExit = Callable[[str], bool]
 LocalCommandPredicate = Callable[[str], bool]
 TerminalModeFactory = Callable[[TextIO, TextIO], AbstractContextManager[object]]
 TerminalSizeProvider = Callable[[], TerminalSize]
+
+
+class ConversationScreenLifecycle(Protocol):
+    """Optional owned preparation; contains no Product runtime or session."""
+
+    def start(self, wake: Callable[[], None]) -> None: ...
+
+    def resume(self, wake: Callable[[], None]) -> None: ...
+
+    def poll(self) -> int | None: ...
+
+    @property
+    def wait_task(self) -> asyncio.Task[int] | None: ...
+
+    async def settle(
+        self,
+        exit_code: int,
+        active_task: asyncio.Task[int | None] | None,
+        dispose_router: Callable[[], None],
+    ) -> None: ...
 
 
 class ConversationRenderablePort(Protocol):
@@ -62,67 +121,39 @@ class ConversationScreenPort(ConversationScreenInputPort, Protocol):
 
     def add_error(self, summary: str, diagnostics: str = "") -> None: ...
 
+    def set_status(self, message: str | None) -> None: ...
+
     def complete_run(self, *, elapsed_seconds: float | None = None) -> None: ...
 
     def elapsed_seconds(self) -> float: ...
 
 
-class ConversationInputResultPort(Protocol):
-    """Neutral routed action consumed by a conversation screen runner."""
-
-    @property
-    def prompt_text(self) -> str | None: ...
-
-    @property
-    def prompt_attachments(self) -> tuple[object, ...] | None: ...
-
-    @property
-    def local_text(self) -> str | None: ...
-
-    @property
-    def steer_text(self) -> str | None: ...
-
-    @property
-    def steer_attachments(self) -> tuple[object, ...] | None: ...
-
-    @property
-    def followup_text(self) -> str | None: ...
-
-    @property
-    def followup_attachments(self) -> tuple[object, ...] | None: ...
-
-    @property
-    def surface_intent(self) -> InputIntent | None: ...
-
-    @property
-    def abort_requested(self) -> bool: ...
-
-    @property
-    def exit_code(self) -> int | None: ...
-
-    @property
-    def render_requested(self) -> bool: ...
+ConversationInputResultPort: TypeAlias = ConversationInputResult
 
 
-class ConversationInputRouterPort(Protocol):
-    """Route one decoded terminal input event to a neutral action."""
+@dataclass
+class ConversationScreenContinuation:
+    """Single-use state borrowed after the previous screen owner has joined.
 
-    def handle(self, event: InputEvent) -> ConversationInputResultPort: ...
+    The caller retains the terminal lease through runner settlement. Creating
+    this value does not stop or join a previous owner; the caller must do that
+    before constructing it or accessing the application.
+    """
 
+    app: ConversationScreenPort
+    parser: InputReader
+    runtime: TuiRuntime
+    terminal_context: Any
+    input_chunk_reader: InputChunkReader
+    pending_idle_deadline: float | None = None
+    before_input_read: Callable[[bool], None] | None = None
+    resume_preparation: bool = False
+    _claimed: bool = field(default=False, init=False)
 
-class ConversationInputRouterFactoryPort(Protocol):
-    """Construct the product's conversation input adapter."""
-
-    def __call__(
-        self,
-        *,
-        app: ConversationScreenPort,
-        should_exit: ShouldExit,
-        is_local_command: LocalCommandPredicate,
-        keybindings: KeybindingManager | KeybindingConfig | None,
-        width: int,
-        height: int,
-    ) -> ConversationInputRouterPort: ...
+    def claim(self, app: ConversationScreenPort) -> None:
+        if self._claimed or app is not self.app:
+            raise RuntimeError("invalid or already consumed screen continuation")
+        self._claimed = True
 
 
 _finish_tui_exit = _runner_utils.finish_tui_exit
@@ -152,6 +183,11 @@ async def run_conversation_screen(
     interruption_message: str,
     cancellation_message: str,
     input_router_factory: ConversationInputRouterFactoryPort | None = None,
+    input_chunk_reader: InputChunkReader | None = None,
+    lifecycle: ConversationScreenLifecycle | None = None,
+    continuation: ConversationScreenContinuation | None = None,
+    mouse_policy: MousePolicy | None = None,
+    text_clipboard_writer: TextClipboardWriter | None = None,
 ) -> int:
     """Run one product-neutral interactive conversation screen.
 
@@ -161,68 +197,241 @@ async def run_conversation_screen(
     storage.
     """
 
-    reader = InputReader()
-    size_provider = terminal_size_provider or terminal_size
-    initial_size = size_provider()
-    local_predicate = is_local_command or (lambda _text: False)
-    if input_router_factory is None:
-        router: ConversationInputRouterPort = ConversationInputRouter(
-            app=app,
-            should_exit=should_exit,
-            is_local_command=local_predicate,
-            keybindings=keybindings,
-            width=initial_size.columns,
-            height=initial_size.rows,
-        )
-    else:
-        router = input_router_factory(
-            app=app,
-            should_exit=should_exit,
-            is_local_command=local_predicate,
-            keybindings=keybindings,
-            width=initial_size.columns,
-            height=initial_size.rows,
-        )
-    runtime = TuiRuntime(
-        render_loop=RenderLoop(app),
-        terminal=ProcessTerminalPort(
-            output=stdout,
-            size_provider=size_provider,
-            track_screen=False,
-        ),
-    )
-    app.surface_host = runtime.overlay_host()
-    promote_pending_page_surface(app)
-    mode_factory = terminal_mode_factory or (
-        lambda input_stream, output_stream: TerminalSession(
-            stdin=input_stream,
-            stdout=output_stream,
-        )
-    )
+    if continuation is not None:
+        if terminal_mode_factory is not None or input_chunk_reader is not None:
+            raise ValueError(
+                "screen continuation already owns terminal/input selection"
+            )
+        continuation.claim(app)
+        input_chunk_reader = continuation.input_chunk_reader
+    router: ConversationInputRouterPort | None = None
     active_task: asyncio.Task[int | None] | None = None
+    aborting_task: asyncio.Task[None] | None = None
+    interrupt_pending_steer: str | None = None
     active_prompt_started_at: float | None = None
-    render_wakeup = asyncio.Event()
+    previous_surface_host = app.surface_host
     previous_render_requester = app.render_requester
     previous_terminal_diagnostics_provider = app.terminal_diagnostics_provider
     previous_terminal_capabilities = app.terminal_capabilities
 
-    def request_app_render(kind: RenderRequestKind) -> None:
-        if previous_render_requester is not None:
-            previous_render_requester(kind)
-        runtime.request_render(kind)
-        render_wakeup.set()
+    terminal_owner = ExitStack()
+    copy_coordinator: CopyCoordinator | None = None
+    screen_exit_code = 0
 
-    app.render_requester = request_app_render
+    def finish(*, runtime: TuiRuntime, stdout: TextIO, exit_code: int) -> int:
+        nonlocal screen_exit_code
+        screen_exit_code = exit_code
+        return _finish_tui_exit(runtime=runtime, stdout=stdout, exit_code=exit_code)
+
     try:
-        with mode_factory(stdin, stdout) as terminal_context:
+        reader = continuation.parser if continuation is not None else InputReader()
+        pending_idle_deadline = (
+            continuation.pending_idle_deadline if continuation is not None else None
+        )
+        size_provider = terminal_size_provider or terminal_size
+        initial_size = size_provider()
+        local_predicate = is_local_command or (lambda _text: False)
+        router = (input_router_factory or ConversationInputRouter)(
+            app=app,
+            should_exit=should_exit,
+            is_local_command=local_predicate,
+            keybindings=keybindings,
+            width=initial_size.columns,
+            height=initial_size.rows,
+        )
+        runtime = (
+            continuation.runtime
+            if continuation is not None
+            else TuiRuntime(
+                render_loop=RenderLoop(app),
+                terminal=ProcessTerminalPort(
+                    output=stdout,
+                    size_provider=size_provider,
+                    track_screen=False,
+                ),
+            )
+        )
+
+        async def settle_aborting_task(
+            *, resume_pending: bool = True
+        ) -> ConversationInputResult | None:
+            nonlocal aborting_task, active_task, active_prompt_started_at
+            nonlocal interrupt_pending_steer
+            if aborting_task is None:
+                return None
+            await aborting_task
+            aborting_task = None
+            active_task = None
+            active_prompt_started_at = None
+            runtime.render_now()
+            if resume_pending and interrupt_pending_steer is not None:
+                app.start_pending_prompt(interrupt_pending_steer)
+                active_task = asyncio.create_task(
+                    run_prompt_handler(handle_prompt, interrupt_pending_steer)
+                )
+                active_prompt_started_at = app.state.active_started_at
+                interrupt_pending_steer = None
+                runtime.render_now()
+            resume_submission = getattr(router, "resume_paused_submission", None)
+            if resume_pending and callable(resume_submission):
+                return resume_submission()
+            pause_submissions = getattr(router, "set_submission_paused", None)
+            if callable(pause_submissions):
+                pause_submissions(False)
+            return None
+
+        app.surface_host = runtime.overlay_host()
+        promote_pending_page_surface(app)
+        env_values = dict(os.environ)
+        effective_mouse_policy = mouse_policy or requested_mouse_policy(env_values)
+        environment = terminal_environment_from_env(env_values)
+        clipboard_writer = text_clipboard_writer or select_text_clipboard_writer(
+            env_values
+        )
+        resolution = resolve_mouse_policy(
+            effective_mouse_policy,
+            MouseEnvironment(
+                tmux_mouse=probe_tmux_mouse(env_values),
+                user_clipboard_available=user_clipboard_route_available(
+                    clipboard_writer, env_values
+                ),
+            ),
+        )
+        capabilities = replace(
+            detect_terminal_capabilities(environment),
+            mouse_selection_owner=resolution.owner,
+            enable_mouse=resolution.owner == "application",
+        )
+        mode_factory = terminal_mode_factory or (
+            lambda input_stream, output_stream: TerminalSession(
+                stdin=input_stream,
+                stdout=output_stream,
+                environment=environment,
+                capabilities=capabilities,
+            )
+        )
+        render_wakeup = asyncio.Event()
+
+        def request_app_render(kind: RenderRequestKind) -> None:
+            if previous_render_requester is not None:
+                previous_render_requester(kind)
+            runtime.request_render(kind)
+            render_wakeup.set()
+
+        app.render_requester = request_app_render
+        mode = (
+            nullcontext(continuation.terminal_context)
+            if continuation is not None
+            else mode_factory(stdin, stdout)
+        )
+        # Startup settlement must finish while terminal ownership is still held.
+        terminal_mode = (
+            nullcontext(terminal_owner.enter_context(mode))
+            if lifecycle is not None
+            else mode
+        )
+        with terminal_mode as terminal_context:
+            mouse_observed = False
+            if text_clipboard_writer is None:
+                write_control = getattr(
+                    terminal_context, "write_control_if_active", None
+                )
+                clipboard_writer = select_text_clipboard_writer(
+                    env_values,
+                    write_control=write_control if callable(write_control) else None,
+                )
+            copy_coordinator = CopyCoordinator(
+                clipboard_writer,
+                present=lambda message: (
+                    app.present_copy_status(message)  # type: ignore[attr-defined]
+                    if callable(getattr(app, "present_copy_status", None))
+                    else app.set_status(message)  # type: ignore[attr-defined]
+                ),
+            )
             app.terminal_diagnostics_provider = lambda context=terminal_context: (
                 format_terminal_diagnostics(context)
+                + f"\nmouse_policy: {effective_mouse_policy}"
+                + f"\nmouse_policy_reason: {resolution.reason}"
+                + f"\ntmux_mouse: {resolution.tmux_mouse}"
+                + f"\nmouse_event_observed: {mouse_observed}"
             )
-            configure_runtime_for_terminal_context(runtime, app, terminal_context)
-            write_startup_welcome(app=app, runtime=runtime, stdout=stdout)
+            if continuation is None:
+                configure_runtime_for_terminal_context(runtime, app, terminal_context)
+                write_startup_welcome(app=app, runtime=runtime, stdout=stdout)
             runtime.render_now()
+            if lifecycle is not None:
+                if continuation is not None and continuation.resume_preparation:
+                    lifecycle.resume(render_wakeup.set)
+                else:
+                    lifecycle.start(render_wakeup.set)
             while True:
-                if active_task is not None and active_task.done():
+                if lifecycle is not None:
+                    startup_exit = lifecycle.poll()
+                    if startup_exit is not None:
+                        return finish(
+                            runtime=runtime, stdout=stdout, exit_code=startup_exit
+                        )
+                if aborting_task is not None and aborting_task.done():
+                    resumed = await settle_aborting_task()
+                    if isinstance(resumed, ConversationPromptResult):
+                        active_prompt_started_at = app.state.active_started_at
+                        active_task = asyncio.create_task(
+                            run_prompt_handler(
+                                handle_prompt,
+                                resumed.text,
+                                attachments=resumed.attachments,
+                            )
+                        )
+                    elif isinstance(resumed, ConversationExitResult):
+                        return finish(
+                            runtime=runtime,
+                            stdout=stdout,
+                            exit_code=resumed.exit_code,
+                        )
+                    elif isinstance(resumed, ConversationLocalResult):
+                        if handle_local is not None:
+                            exit_code = await run_text_handler(
+                                handle_local, resumed.text
+                            )
+                            if exit_code is not None:
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(resumed, ConversationSteerResult):
+                        if handle_steer is not None:
+                            exit_code = await run_text_handler(
+                                handle_steer,
+                                resumed.text,
+                                attachments=resumed.attachments,
+                            )
+                            if exit_code is not None:
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(resumed, ConversationFollowupResult):
+                        if handle_followup is not None:
+                            exit_code = await run_text_handler(
+                                handle_followup,
+                                resumed.text,
+                                attachments=resumed.attachments,
+                            )
+                            if exit_code is not None:
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    if resumed is not None and resumed.render_requested:
+                        _request_runtime_render(runtime, "input")
+                if (
+                    aborting_task is None
+                    and active_task is not None
+                    and active_task.done()
+                ):
                     exit_code = await finish_active_task(
                         app=app,
                         active_task=active_task,
@@ -233,24 +442,62 @@ async def run_conversation_screen(
                     active_prompt_started_at = None
                     runtime.render_now()
                     if exit_code is not None:
-                        return _finish_tui_exit(
+                        return finish(
                             runtime=runtime,
                             stdout=stdout,
                             exit_code=exit_code,
                         )
 
+                if (
+                    continuation is not None
+                    and continuation.before_input_read is not None
+                ):
+                    # No read task exists here and all previous batch events have
+                    # been routed. Admission must never change halfway through a batch.
+                    continuation.before_input_read(reader.has_pending)
                 data = await read_input_chunk_or_render_tick(
                     stdin,
                     runtime=runtime,
-                    active_task=active_task,
+                    active_task=(
+                        aborting_task or active_task
+                        if (
+                            aborting_task is not None
+                            or active_task is not None
+                            or lifecycle is None
+                        )
+                        else lifecycle.wait_task
+                    ),
+                    input_chunk_reader=input_chunk_reader,
                     render_wakeup=render_wakeup,
-                    pending_input_idle_ms=10 if reader.has_pending else None,
+                    return_on_render_wakeup=(
+                        continuation is not None
+                        and continuation.before_input_read is not None
+                    ),
+                    pending_input_idle_ms=(
+                        (
+                            max(
+                                0,
+                                math.ceil(
+                                    (pending_idle_deadline - time.monotonic()) * 1000
+                                ),
+                            )
+                            if pending_idle_deadline is not None
+                            else ESCAPE_SEQUENCE_IDLE_TIMEOUT_MS
+                        )
+                        if reader.has_pending
+                        else None
+                    ),
                     idle_wakeup_ms=_terminal_runtime_wakeup_ms(terminal_context),
                 )
                 input_events: tuple[Any, ...]
                 if data is None:
                     _poll_terminal_runtime(terminal_context)
                     if not reader.has_pending:
+                        continue
+                    if (
+                        pending_idle_deadline is not None
+                        and time.monotonic() < pending_idle_deadline
+                    ):
                         continue
                     input_events = _flush_pending_input(
                         reader,
@@ -262,6 +509,8 @@ async def run_conversation_screen(
                         terminal_context=terminal_context,
                     )
                 elif data == "":
+                    if aborting_task is not None:
+                        await settle_aborting_task()
                     if active_task is not None:
                         exit_code = await finish_active_task(
                             app=app,
@@ -270,13 +519,13 @@ async def run_conversation_screen(
                             cancellation_message=cancellation_message,
                         )
                         runtime.render_now()
-                        return _finish_tui_exit(
+                        return finish(
                             runtime=runtime,
                             stdout=stdout,
                             exit_code=exit_code if exit_code is not None else 0,
                         )
                     runtime.render_now()
-                    return _finish_tui_exit(
+                    return finish(
                         runtime=runtime,
                         stdout=stdout,
                         exit_code=0,
@@ -288,106 +537,183 @@ async def run_conversation_screen(
                         terminal_context=terminal_context,
                     )
 
+                pending_idle_deadline = (
+                    time.monotonic() + ESCAPE_SEQUENCE_IDLE_TIMEOUT_MS / 1000
+                    if reader.has_pending
+                    else None
+                )
+
                 for event in input_events:
+                    if event.kind == "mouse":
+                        mouse_observed = True
+                        set_viewport = getattr(router, "set_transcript_viewport_top", None)
+                        if callable(set_viewport):
+                            set_viewport(runtime.render_loop.previous_viewport_top)
                     result = router.handle(event)
-                    if result.exit_code is not None:
+                    if isinstance(result, ConversationExitResult):
+                        if aborting_task is not None:
+                            await settle_aborting_task(resume_pending=False)
                         runtime.render_now()
-                        return _finish_tui_exit(
+                        return finish(
                             runtime=runtime,
                             stdout=stdout,
                             exit_code=result.exit_code,
                         )
-                    if result.abort_requested:
+                    if isinstance(result, ConversationAbortResult):
+                        if aborting_task is not None:
+                            continue
                         interrupt_pending_steer = pop_interrupt_pending_steer(app)
-                        await abort_active(
-                            app=app,
-                            active_task=active_task,
-                            on_abort=on_abort,
-                            interruption_message=interruption_message,
-                        )
-                        active_task = None
-                        active_prompt_started_at = None
+                        # Show acknowledgement before the Product waits for a
+                        # tool process and the active turn to settle.
+                        begin_stopping = getattr(app, "begin_stopping", None)
+                        if callable(begin_stopping):
+                            begin_stopping()
+                        else:
+                            app.set_status("Stopping…")
                         runtime.render_now()
-                        if interrupt_pending_steer is not None:
-                            app.start_pending_prompt(interrupt_pending_steer)
-                            active_task = asyncio.create_task(
-                                run_prompt_handler(
-                                    handle_prompt,
-                                    interrupt_pending_steer,
-                                )
+                        pause_submissions = getattr(
+                            router, "set_submission_paused", None
+                        )
+                        if callable(pause_submissions):
+                            pause_submissions(True)
+                        aborting_task = asyncio.create_task(
+                            abort_active(
+                                app=app,
+                                active_task=active_task,
+                                on_abort=on_abort,
+                                interruption_message=interruption_message,
                             )
-                            active_prompt_started_at = app.state.active_started_at
-                            runtime.render_now()
+                        )
                         continue
-                    if result.prompt_text is not None:
+                    if isinstance(result, ConversationPromptResult):
                         active_prompt_started_at = app.state.active_started_at
                         active_task = asyncio.create_task(
                             run_prompt_handler(
                                 handle_prompt,
-                                result.prompt_text,
-                                attachments=result.prompt_attachments,
+                                result.text,
+                                attachments=result.attachments,
                             )
                         )
-                    if result.local_text is not None and handle_local is not None:
-                        exit_code = await run_text_handler(
-                            handle_local,
-                            result.local_text,
-                        )
-                        if exit_code is not None:
-                            runtime.render_now()
-                            return _finish_tui_exit(
-                                runtime=runtime,
-                                stdout=stdout,
-                                exit_code=exit_code,
+                    elif isinstance(result, ConversationLocalResult):
+                        if handle_local is not None:
+                            exit_code = await run_text_handler(
+                                handle_local,
+                                result.text,
                             )
-                    if result.steer_text is not None and handle_steer is not None:
-                        exit_code = await run_text_handler(
-                            handle_steer,
-                            result.steer_text,
-                            attachments=result.steer_attachments,
-                        )
-                        if exit_code is not None:
-                            runtime.render_now()
-                            return _finish_tui_exit(
-                                runtime=runtime,
-                                stdout=stdout,
-                                exit_code=exit_code,
+                            if exit_code is not None:
+                                runtime.render_now()
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(result, ConversationSteerResult):
+                        if handle_steer is not None:
+                            exit_code = await run_text_handler(
+                                handle_steer,
+                                result.text,
+                                attachments=result.attachments,
                             )
-                    if result.followup_text is not None and handle_followup is not None:
-                        exit_code = await run_text_handler(
-                            handle_followup,
-                            result.followup_text,
-                            attachments=result.followup_attachments,
-                        )
-                        if exit_code is not None:
-                            runtime.render_now()
-                            return _finish_tui_exit(
-                                runtime=runtime,
-                                stdout=stdout,
-                                exit_code=exit_code,
+                            if exit_code is not None:
+                                runtime.render_now()
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(result, ConversationFollowupResult):
+                        if handle_followup is not None:
+                            exit_code = await run_text_handler(
+                                handle_followup,
+                                result.text,
+                                attachments=result.attachments,
                             )
-                    if (
-                        result.surface_intent is not None
-                        and handle_surface_intent is not None
-                    ):
-                        exit_code = await run_surface_intent_handler(
-                            handle_surface_intent,
-                            result.surface_intent,
-                        )
-                        if exit_code is not None:
-                            runtime.render_now()
-                            return _finish_tui_exit(
-                                runtime=runtime,
-                                stdout=stdout,
-                                exit_code=exit_code,
+                            if exit_code is not None:
+                                runtime.render_now()
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(result, ConversationSurfaceResult):
+                        if handle_surface_intent is not None:
+                            exit_code = await run_surface_intent_handler(
+                                handle_surface_intent,
+                                result.intent,
                             )
+                            if exit_code is not None:
+                                runtime.render_now()
+                                return finish(
+                                    runtime=runtime,
+                                    stdout=stdout,
+                                    exit_code=exit_code,
+                                )
+                    elif isinstance(result, ConversationClipboardResult):
+                        pass
+                    elif isinstance(result, ConversationCopyTextResult):
+                        copy_coordinator.submit(result.text)
+                    elif isinstance(result, ConversationInputHandled):
+                        pass
+                    elif isinstance(result, ConversationInputIgnored):
+                        pass
+                    else:
+                        assert_never(result)
                     if result.render_requested:
                         _request_runtime_render(runtime, "input")
+    except BaseException as error:
+        screen_exit_code = (
+            130 if isinstance(error, (KeyboardInterrupt, asyncio.CancelledError)) else 1
+        )
+        raise
     finally:
-        app.surface_host = None
-        app.terminal_diagnostics_provider = previous_terminal_diagnostics_provider
-        app.terminal_capabilities = previous_terminal_capabilities
-        app.render_requester = previous_render_requester
+        cancel_context_usage_refresh = getattr(
+            app, "cancel_context_usage_refresh", None
+        )
+        if callable(cancel_context_usage_refresh):
+            cancel_context_usage_refresh()
+        try:
+            if aborting_task is not None:
+                await _join_owned_abort(aborting_task)
+        finally:
+            try:
+                if copy_coordinator is not None:
+                    await copy_coordinator.close()
+
+                def dispose_router() -> None:
+                    dispose = getattr(router, "dispose", None)
+                    if callable(dispose):
+                        dispose()
+
+                try:
+                    if lifecycle is not None:
+                        await lifecycle.settle(
+                            screen_exit_code, active_task, dispose_router
+                        )
+                    else:
+                        dispose_router()
+                finally:
+                    terminal_owner.close()
+            finally:
+                app.surface_host = previous_surface_host
+                app.terminal_diagnostics_provider = (
+                    previous_terminal_diagnostics_provider
+                )
+                app.terminal_capabilities = previous_terminal_capabilities
+                app.render_requester = previous_render_requester
+
+
+async def _join_owned_abort(task: asyncio.Task[None]) -> None:
+    """Keep the cancellation owner alive until its cleanup has settled."""
+
+    interrupted: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            interrupted = error
+    task.result()
+    if interrupted is not None:
+        raise interrupted
 
 
 async def finish_active_task(
@@ -459,12 +785,13 @@ async def abort_active(
     interruption_message: str,
 ) -> None:
     await maybe_await(on_abort())
-    if active_task is not None and not active_task.done():
-        active_task.cancel()
-        with suppress(asyncio.CancelledError):
+    if active_task is not None:
+        try:
             await active_task
-    elif active_task is not None:
-        await active_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:
+            app.add_error(str(error) or error.__class__.__name__)
     app.state.abort(
         message=interruption_message,
         elapsed_seconds=app.elapsed_seconds(),
@@ -516,7 +843,7 @@ async def call_text_handler(
 
 async def run_surface_intent_handler(
     handler: SurfaceIntentHandler,
-    intent: InputIntent,
+    intent: InputIntent[str],
 ) -> int | None:
     result = await maybe_await(handler(intent))
     return result if isinstance(result, int) else None

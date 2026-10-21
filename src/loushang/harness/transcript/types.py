@@ -8,14 +8,24 @@ from typing import Literal, TypeAlias, cast
 
 from loushang.agent.types import AgentMessage, CustomAgentMessage
 from loushang.ai.types import ImagePart, Message, TextPart
+from loushang.foundation.json import JSONValue, require_json_mapping, require_json_value
+from loushang.harness.artifacts import SessionBlobRef
 from loushang.harness.conversation.types import (
     CommandExecutionRecord,
     ConversationRecord,
     OpaquePayload,
 )
-from loushang.protocol import JSONValue, require_json_mapping, require_json_value
+from loushang.harness.transcript.model_call_types import ModelCallOutcome
+from loushang.harness.transcript.model_input_types import (
+    ModelInputComponent,
+    ModelInputSnapshot,
+)
+from loushang.harness.transcript.model_input_v2_types import (
+    ModelInputNodeBundle,
+    ModelInputSnapshotV2,
+)
+from loushang.harness.transcript.model_usage_types import ModelCallAttemptUsage
 
-ContentBlock: TypeAlias = TextPart | ImagePart
 ApplicationDeliveryMode: TypeAlias = Literal[
     "direct",
     "trigger_turn",
@@ -24,6 +34,29 @@ ApplicationDeliveryMode: TypeAlias = Literal[
     "next_turn",
 ]
 AnnotationOperation: TypeAlias = Literal["set", "remove"]
+
+
+@dataclass(frozen=True, slots=True)
+class SessionImagePart:
+    """Harness-owned durable image placeholder, never an AI wire image."""
+
+    type: Literal["image"]
+    blob: SessionBlobRef
+
+    def __post_init__(self) -> None:
+        if self.type != "image":
+            raise ValueError("session image part type must be 'image'")
+        if not isinstance(self.blob, SessionBlobRef):
+            raise TypeError("session image part blob must be a SessionBlobRef")
+        if not self.blob.media_type.startswith("image/"):
+            raise ValueError("session image blob must have an image media type")
+
+    @property
+    def mime_type(self) -> str:
+        return self.blob.media_type
+
+
+ContentBlock: TypeAlias = TextPart | ImagePart | SessionImagePart
 
 
 def _require_text(value: object, *, name: str) -> str:
@@ -36,6 +69,17 @@ def _require_optional_text(value: object, *, name: str) -> str | None:
     if value is None:
         return None
     return _require_text(value, name=name)
+
+
+def _model_input_lineage(value: object) -> tuple[str, ...]:
+    if not isinstance(value, tuple):
+        raise TypeError("Model Input snapshot lineage must be a tuple")
+    normalized = tuple(
+        _require_text(item, name="Model Input snapshot lineage id") for item in value
+    )
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Model Input snapshot lineage ids must be unique")
+    return normalized
 
 
 def _require_non_negative_int(value: object, *, name: str) -> int:
@@ -72,16 +116,13 @@ class ThinkingSelectionSnapshot:
 @dataclass(frozen=True)
 class ModelSelectionSnapshot:
     provider: str
+    endpoint_id: str
     model_id: str
-    endpoint_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.provider, name="model selection provider")
+        _require_text(self.endpoint_id, name="model selection endpoint id")
         _require_text(self.model_id, name="model selection model id")
-        _require_optional_text(
-            self.endpoint_id,
-            name="model selection endpoint id",
-        )
 
 
 @dataclass(frozen=True)
@@ -91,6 +132,7 @@ class ContextCompactionCheckpoint:
     tokens_before: int
     details: JSONValue = None
     from_hook: bool | None = None
+    model_input_snapshot_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.summary, str):
@@ -107,9 +149,18 @@ class ContextCompactionCheckpoint:
             raise TypeError("compaction from_hook must be a boolean or None")
         object.__setattr__(
             self,
+            "model_input_snapshot_ids",
+            _model_input_lineage(self.model_input_snapshot_ids),
+        )
+        object.__setattr__(
+            self,
             "details",
             require_json_value(self.details, name="compaction details"),
         )
+
+    @property
+    def derivation_verifiable(self) -> bool:
+        return bool(self.model_input_snapshot_ids)
 
 
 @dataclass(frozen=True)
@@ -118,6 +169,7 @@ class BranchContextSummary:
     summary: str
     details: JSONValue = None
     from_hook: bool | None = None
+    model_input_snapshot_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _require_text(self.from_record_id, name="branch summary source record id")
@@ -127,9 +179,18 @@ class BranchContextSummary:
             raise TypeError("branch summary from_hook must be a boolean or None")
         object.__setattr__(
             self,
+            "model_input_snapshot_ids",
+            _model_input_lineage(self.model_input_snapshot_ids),
+        )
+        object.__setattr__(
+            self,
             "details",
             require_json_value(self.details, name="branch summary details"),
         )
+
+    @property
+    def derivation_verifiable(self) -> bool:
+        return bool(self.model_input_snapshot_ids)
 
 
 @dataclass(frozen=True)
@@ -155,7 +216,8 @@ class ApplicationMessage(CustomAgentMessage):
         if isinstance(self.content, str):
             content: str | list[ContentBlock] = self.content
         elif isinstance(self.content, list) and all(
-            isinstance(part, TextPart | ImagePart) for part in self.content
+            isinstance(part, TextPart | ImagePart | SessionImagePart)
+            for part in self.content
         ):
             content = list(self.content)
         else:
@@ -255,6 +317,12 @@ AgentTranscriptPayload: TypeAlias = (
     | ExtensionData
     | RecordAnnotationPatch
     | ConversationMetadataPatch
+    | ModelInputComponent
+    | ModelInputSnapshot
+    | ModelInputNodeBundle
+    | ModelInputSnapshotV2
+    | ModelCallOutcome
+    | ModelCallAttemptUsage
 )
 DecodedAgentTranscriptPayload: TypeAlias = AgentTranscriptPayload | OpaquePayload
 AgentTranscriptRecord: TypeAlias = ConversationRecord[DecodedAgentTranscriptPayload]
@@ -316,13 +384,11 @@ class AgentTranscriptContext:
         selection = self.state.model_selection
         if selection is None:
             return None
-        result = {
+        return {
             "provider": selection.provider,
+            "endpoint_id": selection.endpoint_id,
             "model_id": selection.model_id,
         }
-        if selection.endpoint_id is not None:
-            result["endpoint_id"] = selection.endpoint_id
-        return result
 
 
 def application_message_content_blocks(
@@ -354,7 +420,9 @@ __all__ = [
     "DecodedAgentTranscriptPayload",
     "ExtensionData",
     "ModelSelectionSnapshot",
+    "ModelCallOutcome",
     "RecordAnnotationPatch",
+    "SessionImagePart",
     "ThinkingSelectionSnapshot",
     "application_message_content_blocks",
     "require_agent_transcript_record",

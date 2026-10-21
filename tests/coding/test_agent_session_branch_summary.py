@@ -6,6 +6,7 @@ import pytest
 
 from loushang.ai.model import Capabilities, Model
 from loushang.ai.types import AssistantMessage, TextPart, Usage, UserMessage
+from loushang.harness.session import operations_runtime as operations_runtime_module
 
 
 def _usage() -> Usage:
@@ -40,6 +41,7 @@ def _assistant_text_message(
     model_id: str = "faux-model",
 ) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text=text)],
         api="anthropic-messages",
@@ -134,6 +136,53 @@ def test_navigate_tree_to_message_switches_leaf_and_rebuilds_context(tmp_path) -
     assert session.agent.state.messages[1].content[0].text == "reply 1"
 
 
+def test_navigate_tree_emits_one_aggregate_performance_event(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+
+    events: list[tuple[str, str, dict[str, object]]] = []
+
+    class _TimingLog:
+        def debug_event(self, scope: str, name: str, **data: object) -> None:
+            events.append((scope, name, data))
+
+    monkeypatch.setattr(
+        operations_runtime_module,
+        "_SESSION_NAVIGATION_PERFORMANCE_LOG",
+        _TimingLog(),
+    )
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+    )
+    target_id = asyncio.run(
+        manager.append_message(UserMessage(role="user", content="root", timestamp=0.0))
+    )
+    asyncio.run(manager.append_message(_assistant_text_message("reply")))
+    session = AgentSession(
+        agent=Agent(
+            initial_state={
+                "system_prompt": "",
+                "model": _model(),
+                "thinking_level": "off",
+            }
+        ),
+        session_manager=manager,
+    )
+
+    asyncio.run(session.navigate_tree(target_id))
+
+    assert len(events) == 1
+    scope, name, data = events[0]
+    assert (scope, name) == ("session.navigation.performance", "navigate")
+    assert data["outcome"] == "completed"
+    assert data["target_id"] == target_id
+    assert set(data["phases"]) == {"prepare", "navigate"}
+
+
 def test_navigate_tree_restores_target_branch_model_and_thinking(tmp_path) -> None:
     from loushang.agent import Agent
     from loushang.coding.session import AgentSession, ModelSelection
@@ -147,8 +196,16 @@ def test_navigate_tree_restores_target_branch_model_and_thinking(tmp_path) -> No
     class ModelRegistry:
         def list_models(self):
             return [
-                ModelSelection(provider="faux", model_id=first_model.id),
-                ModelSelection(provider="faux", model_id=second_model.id),
+                ModelSelection(
+                    endpoint_id="anthropic-messages",
+                    provider="faux",
+                    model_id=first_model.id,
+                ),
+                ModelSelection(
+                    endpoint_id="anthropic-messages",
+                    provider="faux",
+                    model_id=second_model.id,
+                ),
             ]
 
         def build_model(self, selection):
@@ -169,7 +226,11 @@ def test_navigate_tree_restores_target_branch_model_and_thinking(tmp_path) -> No
         manager.append_message(UserMessage(role="user", content="root", timestamp=0.0))
     )
     asyncio.run(manager.append_thinking_level_change("low"))
-    asyncio.run(manager.append_model_change("faux", first_model.id))
+    asyncio.run(
+        manager.append_model_change(
+            "faux", first_model.id, endpoint_id="anthropic-messages"
+        )
+    )
     first_branch_leaf = asyncio.run(
         manager.append_message(
             _assistant_text_message("first", model_id=first_model.id)
@@ -177,7 +238,11 @@ def test_navigate_tree_restores_target_branch_model_and_thinking(tmp_path) -> No
     )
     manager.branch(root_id)
     asyncio.run(manager.append_thinking_level_change("high"))
-    asyncio.run(manager.append_model_change("faux", second_model.id))
+    asyncio.run(
+        manager.append_model_change(
+            "faux", second_model.id, endpoint_id="anthropic-messages"
+        )
+    )
     asyncio.run(
         manager.append_message(
             _assistant_text_message("second", model_id=second_model.id)

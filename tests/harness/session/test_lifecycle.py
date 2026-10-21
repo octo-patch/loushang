@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
-from loushang.harness.runtime import SessionOperationPhase
+from loushang.harness.runtime import SessionOperationPhase, file_status_fingerprint
 from loushang.harness.session.lifecycle import (
     DEFAULT_FORK_PROFILE,
     ForkProfile,
     ForkSelection,
     MissingSessionCwdError,
+    PreparedSessionOperationStateError,
     SessionCwdIssue,
     SessionLifecycleDecision,
     SessionLifecycleHooks,
+    SessionLifecyclePreparationCancelledError,
     SessionLifecycleRuntime,
     SessionLifecycleTransition,
+)
+from loushang.harness.session.lifecycle import (
+    __all__ as lifecycle_exports,
 )
 
 
@@ -78,6 +83,232 @@ class _Store:
 
     def get_leaf_entry_id(self, session: _Session) -> str:
         return session.leaf_id
+
+
+def test_prepared_abort_retries_failed_original_cleanup(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        calls = 0
+
+        async def dispose(session: _Session) -> None:
+            nonlocal calls
+            assert session.ref == "saved.jsonl"
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("cleanup failed")
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(dispose_session=dispose),
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await prepared.abort()
+        await prepared.close()
+        await prepared.close()
+        assert calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_prepared_abort_cancelled_waiter_rejoins_cleanup(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        finished = False
+
+        async def dispose(_session: _Session) -> None:
+            nonlocal calls, finished
+            calls += 1
+            entered.set()
+            await release.wait()
+            finished = True
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(dispose_session=dispose),
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        waiter = asyncio.create_task(prepared.abort())
+        await entered.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+        await asyncio.gather(prepared.close(), prepared.close())
+        assert finished
+        assert calls == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("close_on_failure", [False, True])
+def test_prepared_consume_cleanup_can_acquire_transition_lock(
+    tmp_path: Path, close_on_failure: bool,
+) -> None:
+    async def scenario() -> None:
+        cleaned = False
+
+        def reject(*_args) -> None:
+            raise RuntimeError("replacement failed")
+
+        async def dispose(_session: _Session) -> None:
+            nonlocal cleaned
+            async with lifecycle.transition_host.transition():
+                cleaned = True
+
+        async def failure(*_args) -> None:
+            if close_on_failure:
+                await prepared.close()
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(
+                dispose_session=dispose, prepare_session=reject, on_failure=failure,
+            ),
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        with pytest.raises(RuntimeError, match="replacement failed"):
+            await asyncio.wait_for(prepared.consume(), timeout=2)
+        assert cleaned
+
+    asyncio.run(scenario())
+
+
+def test_stale_prepared_cleanup_runs_after_transition_unlock(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        disposed: list[str] = []
+
+        async def dispose(session: _Session) -> None:
+            async with lifecycle.transition_host.transition():
+                disposed.append(session.ref)
+
+        async def failure(*_args) -> None:
+            await prepared.close()
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(dispose_session=dispose, on_failure=failure),
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        replacement = _Session("replacement", str(tmp_path))
+        await lifecycle.replace(replacement)
+        with pytest.raises(PreparedSessionOperationStateError, match="active session changed"):
+            await asyncio.wait_for(prepared.consume(), timeout=2)
+        assert lifecycle.current_session is replacement
+        assert disposed == ["saved.jsonl"]
+        await prepared.close()
+        assert disposed == ["saved.jsonl"]
+
+    asyncio.run(scenario())
+
+
+def test_prepared_consume_failure_keeps_cleanup_retry(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        calls = 0
+
+        def reject(*_args) -> None:
+            raise RuntimeError("replacement failed")
+
+        async def dispose(_session: _Session) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("cleanup failed")
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(dispose_session=dispose, prepare_session=reject),
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await prepared.consume()
+        await prepared.close()
+        await prepared.close()
+        assert calls == 2
+        assert not prepared.consumed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["activate_session", "after_commit"])
+def test_prepared_delivered_hook_failure_never_rolls_back(tmp_path: Path, phase: str) -> None:
+    async def scenario() -> None:
+        disposed: list[str] = []
+
+        def reject(*_args) -> None:
+            raise RuntimeError("delivered hook failed")
+
+        hooks = SessionLifecycleHooks(dispose_session=lambda session: disposed.append(session.ref))
+        hooks = replace(hooks, **{phase: reject})
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)), hooks=hooks,
+        )
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        with pytest.raises(RuntimeError, match="delivered hook failed"):
+            await prepared.consume()
+        assert prepared.consumed
+        await prepared.close()
+        assert disposed == []
+        assert lifecycle.current_session is not None
+        assert lifecycle.current_session.ref == "saved.jsonl"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("prepared_mode", [False, True])
+def test_delivery_marker_precedes_product_activation(tmp_path: Path, prepared_mode: bool) -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(
+                dispose_session=lambda _session: None,
+                activate_session=lambda *_args: events.append("activate"),
+            ),
+            mark_candidate_delivered=lambda session: events.append(f"delivered:{session.ref}"),
+        )
+        if prepared_mode:
+            prepared = await lifecycle.prepare_restore("saved.jsonl")
+            assert events == []
+            await prepared.consume()
+        else:
+            await lifecycle.restore("saved.jsonl")
+        assert events == ["delivered:saved.jsonl", "activate"]
+
+    asyncio.run(scenario())
+
+
+def test_prepared_legacy_import_retains_file_until_cleanup_settles(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        source = tmp_path / "source.jsonl"
+        source.write_text("original transcript", encoding="utf-8")
+        destination = tmp_path / "imported"
+        attempts = 0
+
+        async def dispose(session: _Session) -> None:
+            nonlocal attempts
+            assert Path(session.ref).read_text(encoding="utf-8") == "original transcript"
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("cleanup failed")
+
+        lifecycle = SessionLifecycleRuntime[_Session, str](
+            store=_Store(restored_cwd=str(tmp_path)),
+            hooks=SessionLifecycleHooks(dispose_session=dispose),
+        )
+        prepared = await lifecycle.prepare_import_file(source, destination_dir=destination)
+        imported = destination / source.name
+        assert imported.exists()
+        with pytest.raises(RuntimeError, match="cleanup failed"):
+            await prepared.abort()
+        assert imported.read_bytes() == source.read_bytes()
+        await prepared.close()
+        assert not imported.exists()
+        assert source.read_text(encoding="utf-8") == "original transcript"
+        assert attempts == 2
+
+    asyncio.run(scenario())
 
 
 def test_lifecycle_default_profile_forks_at_selected_entry(
@@ -164,9 +395,12 @@ def test_lifecycle_cancellation_prevents_store_and_replacement(
 
 def test_lifecycle_restore_uses_configured_fallback_cwd(tmp_path: Path) -> None:
     store = _Store(restored_cwd="/missing")
+    disposed: list[str] = []
     lifecycle = SessionLifecycleRuntime[_Session, object](
         store=store,
-        hooks=SessionLifecycleHooks(dispose_session=lambda _session: None),
+        hooks=SessionLifecycleHooks(
+            dispose_session=lambda session: disposed.append(session.ref)
+        ),
     )
 
     result = asyncio.run(
@@ -182,6 +416,7 @@ def test_lifecycle_restore_uses_configured_fallback_cwd(tmp_path: Path) -> None:
         ("restore", None, "resume", "saved.jsonl", None),
         ("restore", None, "resume", "saved.jsonl", str(tmp_path)),
     ]
+    assert disposed == ["saved.jsonl"]
 
 
 def test_lifecycle_prepared_restore_stages_before_atomic_publish(
@@ -239,6 +474,135 @@ def test_lifecycle_prepared_restore_abort_releases_unpublished_candidate(
         assert disposed == ["saved.jsonl"]
 
     asyncio.run(scenario())
+
+
+def test_lifecycle_prepared_restore_uses_the_shared_cwd_fallback(
+    tmp_path: Path,
+) -> None:
+    store = _Store(restored_cwd="/missing")
+    disposed: list[str] = []
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=store,
+        hooks=SessionLifecycleHooks(
+            dispose_session=lambda session: disposed.append(session.ref)
+        ),
+    )
+
+    async def scenario() -> None:
+        prepared = await lifecycle.prepare_restore(
+            "saved.jsonl",
+            fallback_cwd=str(tmp_path),
+            missing_cwd="fallback",
+        )
+        assert lifecycle.current_session is None
+        assert disposed == ["saved.jsonl"]
+
+        result = await prepared.consume()
+        assert result.current == _Session("saved.jsonl", str(tmp_path))
+
+    asyncio.run(scenario())
+    assert store.actions == [
+        ("restore", None, "resume", "saved.jsonl", None),
+        ("restore", None, "resume", "saved.jsonl", str(tmp_path)),
+    ]
+
+
+def test_lifecycle_prepared_restore_cancellation_does_not_create_candidate(
+    tmp_path: Path,
+) -> None:
+    store = _Store(restored_cwd=str(tmp_path))
+    current = _Session("current", str(tmp_path))
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=store,
+        current_session=current,
+        hooks=SessionLifecycleHooks(
+            before_transition=lambda _session, _transition: SessionLifecycleDecision(
+                cancelled=True
+            ),
+            dispose_session=lambda _session: None,
+        ),
+    )
+
+    with pytest.raises(SessionLifecyclePreparationCancelledError):
+        asyncio.run(lifecycle.prepare_restore("saved.jsonl"))
+
+    assert lifecycle.current_session is current
+    assert store.actions == []
+
+
+def test_lifecycle_prepared_restore_rejects_stale_and_repeated_consumption(
+    tmp_path: Path,
+) -> None:
+    store = _Store(restored_cwd=str(tmp_path))
+    disposed: list[str] = []
+    current = _Session("current", str(tmp_path))
+    replacement = _Session("replacement", str(tmp_path))
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=store,
+        current_session=current,
+        hooks=SessionLifecycleHooks(
+            dispose_session=lambda session: disposed.append(session.ref)
+        ),
+    )
+
+    async def scenario() -> None:
+        prepared = await lifecycle.prepare_restore("saved.jsonl")
+        await lifecycle.replace(replacement)
+
+        with pytest.raises(
+            PreparedSessionOperationStateError,
+            match="active session changed",
+        ):
+            await prepared.consume()
+        with pytest.raises(
+            PreparedSessionOperationStateError,
+            match="closed",
+        ):
+            await prepared.consume()
+
+    asyncio.run(scenario())
+    assert lifecycle.current_session is replacement
+    assert disposed == ["current", "saved.jsonl"]
+
+
+def test_lifecycle_transition_preserves_transaction_hook_order(tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class _OrderedStore(_Store):
+        async def create(self, *args, **kwargs):
+            events.append("create")
+            return await super().create(*args, **kwargs)
+
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=_OrderedStore(),
+        current_session=_Session("current", str(tmp_path)),
+        hooks=SessionLifecycleHooks(
+            before_transition=lambda _session, _transition: events.append("before"),
+            prepare_session=lambda _session, _previous, _transition: events.append(
+                "prepare"
+            ),
+            before_release=lambda _session, _target, _transition: events.append(
+                "release"
+            ),
+            dispose_session=lambda _session: events.append("dispose"),
+            activate_session=lambda _session, _previous, _transition: events.append(
+                "activate"
+            ),
+            after_commit=lambda _result, _transition: events.append("commit"),
+        ),
+    )
+
+    asyncio.run(lifecycle.new(cwd=str(tmp_path)))
+
+    assert events == [
+        "before",
+        "create",
+        "prepare",
+        "release",
+        "dispose",
+        "activate",
+        "commit",
+    ]
 
 
 def test_lifecycle_reports_missing_cwd_without_fallback() -> None:
@@ -311,3 +675,99 @@ def test_lifecycle_reports_import_preflight_failure(tmp_path: Path) -> None:
     failure, transition = failures[0]
     assert failure.phase is SessionOperationPhase.PREPARE
     assert transition.target_session_ref == str(tmp_path / "missing.jsonl")
+
+
+def test_lifecycle_import_with_fingerprint_preserves_legacy_copy_port(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "legacy.jsonl"
+    destination_dir = tmp_path / "sessions"
+    source.write_bytes(b"legacy transcript\n")
+    calls: list[tuple[Path, Path]] = []
+
+    def legacy_copy(selected: Path, destination: Path) -> None:
+        calls.append((selected, destination))
+        destination.write_bytes(selected.read_bytes())
+
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=_Store(restored_cwd=str(tmp_path)),
+        hooks=SessionLifecycleHooks(dispose_session=lambda _session: None),
+        copy_file=legacy_copy,
+    )
+
+    result = asyncio.run(
+        lifecycle.import_file(
+            source,
+            destination_dir=destination_dir,
+            expected_source_fingerprint=file_status_fingerprint(source.lstat()),
+        )
+    )
+
+    assert calls == [(source, destination_dir / "legacy.jsonl")]
+    assert result.current is not None
+    assert result.current.ref == str(destination_dir / "legacy.jsonl")
+
+
+def test_lifecycle_module_exports_prepared_operation_contracts() -> None:
+    assert {
+        "PreparedSessionLifecycleOperation",
+        "PreparedSessionOperationStateError",
+        "SessionLifecyclePreparationCancelledError",
+    } <= set(lifecycle_exports)
+
+
+def test_lifecycle_prepared_restore_task_cancellation_releases_transition(
+    tmp_path: Path,
+) -> None:
+    """A cancelled prepare (e.g. hub activation timeout) must not wedge the host."""
+
+    restore_started = asyncio.Event()
+    restore_release = asyncio.Event()
+    disposed: list[str] = []
+
+    class _BlockingStore(_Store):
+        async def restore(
+            self,
+            current: _Session | None,
+            transition: SessionLifecycleTransition,
+            session_ref: str | Path,
+            *,
+            cwd_override: str | None = None,
+        ) -> _Session:
+            restore_started.set()
+            await restore_release.wait()
+            return await super().restore(
+                current,
+                transition,
+                session_ref,
+                cwd_override=cwd_override,
+            )
+
+    store = _BlockingStore(restored_cwd=str(tmp_path))
+    current = _Session("current", str(tmp_path))
+    lifecycle = SessionLifecycleRuntime[_Session, object](
+        store=store,
+        current_session=current,
+        hooks=SessionLifecycleHooks(
+            dispose_session=lambda session: disposed.append(session.ref)
+        ),
+    )
+
+    async def scenario() -> None:
+        prepare_task = asyncio.create_task(lifecycle.prepare_restore("saved.jsonl"))
+        await asyncio.wait_for(restore_started.wait(), timeout=1.0)
+        prepare_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prepare_task
+
+        # The transition lock must be free and the previous session untouched:
+        # a follow-up operation completes promptly instead of deadlocking.
+        result = await asyncio.wait_for(
+            lifecycle.new(cwd=str(tmp_path)),
+            timeout=1.0,
+        )
+        assert result.current.ref == "new"
+        assert result.previous is current
+
+    asyncio.run(scenario())
+    assert disposed == ["current"]

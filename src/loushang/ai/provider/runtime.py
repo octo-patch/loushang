@@ -20,6 +20,12 @@ from loushang.ai.options import (
     get_idle_timeout_seconds,
     get_timeout_seconds,
 )
+from loushang.ai.prepared_request import (
+    PreparedModelCallAttemptUsage,
+    PreparedModelCallAttemptUsageRecorder,
+    PreparedModelCallOutcome,
+    PreparedModelCallOutcomeRecorder,
+)
 from loushang.ai.provider.cancellation import is_signal_cancelled, wait_signal_cancelled
 from loushang.ai.provider.errors import (
     normalize_provider_error,
@@ -28,6 +34,7 @@ from loushang.ai.provider.errors import (
 )
 from loushang.ai.provider.protocol import ProviderRequest
 from loushang.ai.trace import emit_trace
+from loushang.ai.types import Usage
 
 RawPartSource = Callable[[], AsyncIterator[RawPart] | Any]
 Sleep = Callable[[float], Awaitable[object]]
@@ -83,16 +90,18 @@ def start_provider_runtime(
     *,
     options,
     request: ProviderRequest,
+    invocation_id: str | None = None,
     _sleep: Sleep = asyncio.sleep,
     _jitter: Jitter = random.random,
 ) -> AssistantMessageEventStream:
     model = request.model
     stream = AssistantMessageEventStream()
-    call_id = uuid4().hex
+    call_id = invocation_id or uuid4().hex
     assembler = RawAssembler(
         stream=stream,
         api=model.api or "",
         provider=model.provider_id,
+        endpoint=model.endpoint_id,
         model=model.id,
         pricing=model.pricing,
     )
@@ -101,10 +110,14 @@ def start_provider_runtime(
         signals = _cancellation_signals(options)
         cancellation_task = _create_cancellation_task(signals)
         if _signals_cancelled(signals):
-            _emit_runtime_cancel_trace(
-                options, request=request, model=model, call_id=call_id
+            await _settle_runtime_cancellation(
+                assembler,
+                deque(),
+                options=options,
+                request=request,
+                model=model,
+                call_id=call_id,
             )
-            await assembler.emit({"type": "aborted"})
             return
         try:
             max_attempts = _retry_max_attempts(options)
@@ -158,6 +171,13 @@ def start_provider_runtime(
                             )
                         ):
                             deadline.cancel()
+                            await _record_pending_attempt_usage(
+                                pending,
+                                options=options,
+                                request=request,
+                                model=model,
+                                call_id=call_id,
+                            )
                             await _close_source(source)
                             source = None
                             await _sleep_before_retry(
@@ -199,9 +219,17 @@ def start_provider_runtime(
                                     model=model,
                                     call_id=call_id,
                                 )
-                            await assembler.emit(part)
                             if part["type"] in _TERMINAL_RAW_PART_TYPES:
+                                await _emit_terminal_part_and_record_outcome(
+                                    assembler,
+                                    part,
+                                    options=options,
+                                    request=request,
+                                    model=model,
+                                    call_id=call_id,
+                                )
                                 return
+                            await assembler.emit(part)
                             continue
 
                         pending_bytes = _append_pending_part(
@@ -234,18 +262,41 @@ def start_provider_runtime(
                         model=model,
                         call_id=call_id,
                     )
-                    await assembler.emit(error_part)
+                    await _emit_terminal_part_and_record_outcome(
+                        assembler,
+                        error_part,
+                        options=options,
+                        request=request,
+                        model=model,
+                        call_id=call_id,
+                    )
                     return
                 except _RuntimeCancelled:
-                    await _flush_pending(assembler, pending)
-                    _emit_runtime_cancel_trace(
-                        options, request=request, model=model, call_id=call_id
+                    deadline.cancel()
+                    await _settle_runtime_cancellation(
+                        assembler,
+                        pending,
+                        options=options,
+                        request=request,
+                        model=model,
+                        call_id=call_id,
                     )
-                    await assembler.emit({"type": "aborted"})
                     return
                 except (Exception, asyncio.CancelledError) as caught:
                     if isinstance(caught, asyncio.CancelledError):
                         if not deadline.expired:
+                            committer = getattr(
+                                options, "prepared_request_committer", None
+                            )
+                            if isinstance(committer, PreparedModelCallOutcomeRecorder):
+                                await _settle_runtime_cancellation(
+                                    assembler,
+                                    pending,
+                                    options=options,
+                                    request=request,
+                                    model=model,
+                                    call_id=call_id,
+                                )
                             raise
                         error: Exception = AITimeoutError(
                             "Provider request timed out.",
@@ -257,14 +308,15 @@ def start_provider_runtime(
                     else:
                         error = caught
                     if _signals_cancelled(signals):
-                        await _flush_pending(assembler, pending)
-                        _emit_runtime_cancel_trace(
-                            options,
+                        deadline.cancel()
+                        await _settle_runtime_cancellation(
+                            assembler,
+                            pending,
+                            options=options,
                             request=request,
                             model=model,
                             call_id=call_id,
                         )
-                        await assembler.emit({"type": "aborted"})
                         return
                     if (
                         not visible_output_started
@@ -272,6 +324,13 @@ def start_provider_runtime(
                         and _retryable_exception(error, source=model.api or "")
                     ):
                         deadline.cancel()
+                        await _record_pending_attempt_usage(
+                            pending,
+                            options=options,
+                            request=request,
+                            model=model,
+                            call_id=call_id,
+                        )
                         await _close_source(source)
                         source = None
                         await _sleep_before_retry(
@@ -304,7 +363,14 @@ def start_provider_runtime(
                         model=model,
                         call_id=call_id,
                     )
-                    await assembler.emit(error_part)
+                    await _emit_terminal_part_and_record_outcome(
+                        assembler,
+                        error_part,
+                        options=options,
+                        request=request,
+                        model=model,
+                        call_id=call_id,
+                    )
                     return
                 finally:
                     deadline.cancel()
@@ -314,6 +380,244 @@ def start_provider_runtime(
 
     stream.attach_task(asyncio.create_task(_run()))
     return stream
+
+
+async def _settle_runtime_cancellation(
+    assembler: RawAssembler,
+    pending: deque[RawPart],
+    *,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    """Finish the terminal cancellation fact despite caller cancellation."""
+
+    settlement = asyncio.create_task(
+        _record_runtime_cancellation(
+            assembler,
+            pending,
+            options=options,
+            request=request,
+            model=model,
+            call_id=call_id,
+        )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    while not settlement.done():
+        try:
+            await asyncio.shield(settlement)
+        except asyncio.CancelledError as error:
+            cancellation = error
+    settlement.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _record_runtime_cancellation(
+    assembler: RawAssembler,
+    pending: deque[RawPart],
+    *,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    await _flush_pending(assembler, pending)
+    _emit_runtime_cancel_trace(
+        options,
+        request=request,
+        model=model,
+        call_id=call_id,
+    )
+    await _emit_terminal_part_and_record_outcome(
+        assembler,
+        cast(RawPart, {"type": "aborted"}),
+        options=options,
+        request=request,
+        model=model,
+        call_id=call_id,
+    )
+
+
+async def _emit_terminal_part_and_record_outcome(
+    assembler: RawAssembler,
+    part: RawPart,
+    *,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    await assembler.emit(part)
+    committer = getattr(options, "prepared_request_committer", None)
+    outcome = PreparedModelCallOutcome.from_assistant_message(
+        call_id,
+        assembler.result_nowait(),
+    )
+    if not (
+        (
+            assembler.usage_observed
+            and isinstance(committer, PreparedModelCallAttemptUsageRecorder)
+        )
+        or isinstance(committer, PreparedModelCallOutcomeRecorder)
+    ):
+        return
+    # Once a terminal provider fact is visible, its durable observation must
+    # finish before caller cancellation is propagated. Otherwise the Agent's
+    # bounded force-cancel can turn an observed abort into an unknown outcome.
+    recording = asyncio.create_task(
+        _record_terminal_observations(
+            outcome,
+            usage_observed=assembler.usage_observed,
+            committer=committer,
+            options=options,
+            request=request,
+            model=model,
+            call_id=call_id,
+        )
+    )
+    cancellation: asyncio.CancelledError | None = None
+    caller = asyncio.current_task()
+    while not recording.done():
+        try:
+            await asyncio.shield(recording)
+        except asyncio.CancelledError as error:
+            if caller is None or caller.cancelling() == 0:
+                recording.result()
+                return
+            cancellation = error
+    recording.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _record_terminal_observations(
+    outcome: PreparedModelCallOutcome,
+    *,
+    usage_observed: bool,
+    committer: object,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    if usage_observed and isinstance(committer, PreparedModelCallAttemptUsageRecorder):
+        await _record_attempt_usage(
+            outcome.usage,
+            committer=committer,
+            options=options,
+            request=request,
+            model=model,
+            call_id=call_id,
+        )
+    if not isinstance(committer, PreparedModelCallOutcomeRecorder):
+        return
+    try:
+        await committer.record_model_call_outcome(outcome)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        emit_trace(
+            options,
+            {
+                "type": "runtime:outcome",
+                **_runtime_trace_base(
+                    request=request,
+                    model=model,
+                    call_id=call_id,
+                ),
+                "reason": "record_failed",
+                "exceptionType": error.__class__.__name__,
+            },
+        )
+
+
+async def _record_pending_attempt_usage(
+    pending: deque[RawPart],
+    *,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    usage = _usage_from_pending_parts(pending)
+    committer = getattr(options, "prepared_request_committer", None)
+    if usage is None or not isinstance(
+        committer, PreparedModelCallAttemptUsageRecorder
+    ):
+        return
+    await _record_attempt_usage(
+        usage,
+        committer=committer,
+        options=options,
+        request=request,
+        model=model,
+        call_id=call_id,
+    )
+
+
+async def _record_attempt_usage(
+    usage: Usage,
+    *,
+    committer: PreparedModelCallAttemptUsageRecorder,
+    options: object | None,
+    request: ProviderRequest,
+    model: object,
+    call_id: str,
+) -> None:
+    try:
+        await committer.record_prepared_model_call_attempt_usage(
+            PreparedModelCallAttemptUsage(
+                invocation_id=call_id,
+                usage=usage,
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        emit_trace(
+            options,
+            {
+                "type": "runtime:attempt_usage",
+                **_runtime_trace_base(
+                    request=request,
+                    model=model,
+                    call_id=call_id,
+                ),
+                "reason": "record_failed",
+                "exceptionType": error.__class__.__name__,
+            },
+        )
+
+
+def _usage_from_pending_parts(parts: deque[RawPart]) -> Usage | None:
+    components = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    provider_total: int | None = None
+    observed = False
+    for part in parts:
+        if part["type"] != "usage_delta":
+            continue
+        observed = True
+        component_changed = False
+        for name in components:
+            value = part.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                components[name] = value
+                component_changed = True
+        total = part.get("total_tokens")
+        if isinstance(total, int) and not isinstance(total, bool) and total > 0:
+            provider_total = total
+        elif component_changed:
+            provider_total = None
+    if not observed:
+        return None
+    component_total = sum(components.values())
+    return Usage(
+        **components,
+        total_tokens=max(provider_total or 0, component_total),
+        cost=None,
+    )
 
 
 async def _flush_pending(assembler: RawAssembler, pending: deque[RawPart]) -> None:
@@ -452,6 +756,7 @@ def _emit_runtime_error_trace(
             cast(Mapping[str, object], part),
             source=request.model.api or "",
             provider=request.model.provider_id,
+            endpoint=request.model.endpoint_id,
             model=getattr(model, "id", None),
         )
     except Exception:
@@ -476,6 +781,13 @@ def _emit_runtime_error_trace(
         event["statusCode"] = error_info.status_code
     if error_info.request_id is not None:
         event["requestId"] = error_info.request_id
+    details = error_info.details
+    exception_type = details.get("exceptionType")
+    if isinstance(exception_type, str) and exception_type:
+        event["exceptionType"] = exception_type
+    response_summary = cast(Mapping[str, object], part).get("provider_response_summary")
+    if isinstance(response_summary, str) and response_summary:
+        event["providerResponseSummary"] = response_summary
     emit_trace(options, event)
 
 
@@ -628,6 +940,7 @@ def _retryable_response_error_part(
             cast(Mapping[str, object], part),
             source=request.model.api or "",
             provider=request.model.provider_id,
+            endpoint=request.model.endpoint_id,
             model=getattr(model, "id", None),
         )
     except Exception:
@@ -761,6 +1074,7 @@ def _retry_reason_from_part(
             cast(Mapping[str, object], part),
             source=request.model.api or "",
             provider=request.model.provider_id,
+            endpoint=request.model.endpoint_id,
             model=getattr(model, "id", None),
         )
     except Exception:

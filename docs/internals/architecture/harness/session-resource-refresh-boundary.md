@@ -8,9 +8,19 @@ existing Harness resource refresh coordinator with a small session port set:
 
 1. optionally prepare the bound Product runtime;
 2. reload the bundle for the current Product cwd;
-3. allow an optional extension runtime to contribute discovered resources;
-4. apply the shared disabled-skill activation policy; and
-5. commit the new bundle and rebuild the Product's prompt and tool view.
+3. when the staged-generation seam exists, prepare an unpublished Extension
+   generation and run an optional Product declaration preflight;
+4. allow the candidate extension runtime to contribute discovered resources;
+5. apply the shared disabled-skill activation policy; and
+6. commit the new bundle and rebuild the Product's prompt and tool view.
+
+When the bound Extension runtime exposes the staged-generation seam, reload
+uses the stronger
+[Extension And Resource Generation Lifecycle](extension-generation-lifecycle-boundary.md):
+resource discovery and live binding occur on an unpublished candidate, runtime
+and resources publish together, and the old generation retires only afterward.
+The ordinary `refresh`/`refresh_async` methods remain the compatibility path for
+resource-only refresh and runtimes without generation support.
 
 An extension-requested refresh is failure-contained. Harness reports the
 exception through a Product callback and synchronizes extension diagnostics
@@ -22,7 +32,9 @@ code or user-visible wording.
 Products supply the resource loader, resource bundle holder, cwd, settings,
 optional extension discovery runtime, bundle commit callback, and view rebuild
 callback. They also choose when a refresh is requested and how a failure is
-recorded or rendered.
+recorded or rendered. A Product that admits runtime-capability declarations may
+also supply a synchronous, pure preflight over the candidate's redacted value
+snapshot. Harness does not import the Product resolver or infer its grants.
 
 ## Coding Binding
 
@@ -32,9 +44,9 @@ and the `extension_resource_refresh_failed` diagnostic projection. Its existing
 watcher remains a Harness resource watcher whose Product callback chooses the
 watch reload and subsequent Coding extension-runtime refresh behavior.
 
-Coding keeps extension API event classes and its `ExtensionRuntimeController`:
-those types express the Coding extension protocol rather than generic resource
-refresh coordination. The former
+Coding keeps extension API event classes and binds the shared Extension session
+coordinator. Resource-watch changes enter the same staged reload path rather
+than refreshing the bundle twice. The former
 `coding.session.resource_refresh_controller` has no parallel implementation.
 
 ## Dependency Rule
@@ -51,6 +63,8 @@ protocols.
   asynchronous extension discovery, disabled-skill activation, rebuild, and
   failure-contained requests.
 - Coding `AgentSession` regressions retain its refresh, watcher, and extension
-  API behavior.
+  API behavior, while staged reload failures preserve the previous generation.
+- Coding production tests prove graph-owned declaration changes are rejected
+  before discovery and content-only reload does not rebind the Session Graph.
 - Architecture tests forbid Coding imports in the runtime, require the Coding
   binding, and prevent reintroducing the old Coding controller.

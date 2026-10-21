@@ -15,12 +15,13 @@ from loushang.tui import (
 
 
 class _Content:
-    def __init__(self) -> None:
+    def __init__(self, *, intent_kind: str = "select") -> None:
         self.last_event: InputEvent | None = None
+        self.intent_kind = intent_kind
 
     def handle_input(self, event: InputEvent) -> object:
         self.last_event = event
-        return SimpleNamespace(kind="select", text="picked", note="child")
+        return SimpleNamespace(kind=self.intent_kind, text="picked", note="child")
 
     def render(self, constraints: RenderConstraints) -> RenderResult:
         return RenderResult.from_lines(
@@ -47,6 +48,22 @@ def test_screen_surface_view_preserves_content_cursor_and_translates_mouse_row()
     assert content.last_event is not None
     assert content.last_event.mouse_row == 1
     assert intent == InputIntent(kind="select", text="picked", note="child")
+
+
+def test_screen_surface_view_preserves_open_structural_intent_kinds() -> None:
+    for kind in ("example_plugin.openArtifact", ""):
+        view = ScreenSurfaceView(
+            title="Plugin",
+            purpose="dialog",
+            content=_Content(intent_kind=kind),
+            footer="",
+        )
+
+        assert view.handle_input(InputEvent(kind="key", key="enter")) == InputIntent(
+            kind=kind,
+            text="picked",
+            note="child",
+        )
 
 
 def test_screen_surface_view_scrolls_info_without_changing_copy_or_footer() -> None:
@@ -87,4 +104,26 @@ def test_screen_surface_view_info_close_keys_keep_existing_contract() -> None:
 
     assert view.handle_input(InputEvent(kind="key", key="enter")) == InputIntent(
         kind="surface_close"
+    )
+
+
+def test_screen_surface_view_renders_feedback_inside_exclusive_surface() -> None:
+    view = ScreenSurfaceView(
+        title="Models",
+        purpose="model",
+        content=_Content(),
+        feedback="Error: selected model does not support image input",
+        feedback_hint="Choose another model or press Esc to keep the current model.",
+        presentation="bottom-exclusive",
+    )
+
+    rendered = view.render(RenderConstraints(width=80, max_height=8))
+
+    assert tuple(line.text for line in rendered.lines)[:6] == (
+        "Models",
+        "",
+        "choice",
+        "",
+        "Error: selected model does not support image input",
+        "Choose another model or press Esc to keep the current model.",
     )

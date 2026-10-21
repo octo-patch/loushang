@@ -6,10 +6,10 @@ from enum import Enum
 from typing import Self
 
 from loushang.ai.utils.redaction import is_header_container_key, is_sensitive_key
-from loushang.observability.problem import (
-    JSONValue,
-    ensure_json_safe_mapping,
-    ensure_json_safe_value,
+from loushang.foundation.json import JSONValue
+from loushang.foundation.observability.projection import (
+    project_diagnostic_mapping,
+    project_diagnostic_value,
 )
 
 _REDACTED = "[redacted]"
@@ -22,6 +22,7 @@ class AIErrorCode(str, Enum):
     UNSUPPORTED_CAPABILITY = "unsupported_capability"
     AUTHENTICATION = "authentication"
     REQUEST_VALIDATION = "request_validation"
+    REQUEST_TOO_LARGE = "request_too_large"
     TOOL_VALIDATION = "tool_validation"
     PROVIDER = "provider"
     RATE_LIMIT = "rate_limit"
@@ -49,7 +50,7 @@ class AIErrorInfo:
     def __post_init__(self) -> None:
         if not isinstance(self.code, AIErrorCode):
             raise TypeError("AIErrorInfo.code must be AIErrorCode")
-        details = ensure_json_safe_mapping(self.details)
+        details = project_diagnostic_mapping(self.details)
         object.__setattr__(self, "details", details)
 
     def to_dict(self) -> dict[str, JSONValue]:
@@ -144,6 +145,10 @@ class AIRequestValidationError(AIError):
     default_code = AIErrorCode.REQUEST_VALIDATION
 
 
+class AIRequestTooLargeError(AIRequestValidationError):
+    default_code = AIErrorCode.REQUEST_TOO_LARGE
+
+
 class ToolValidationError(AIRequestValidationError):
     default_code = AIErrorCode.TOOL_VALIDATION
 
@@ -191,6 +196,7 @@ _ERROR_CLASS_BY_CODE: dict[AIErrorCode, type[AIError]] = {
     AIErrorCode.UNSUPPORTED_CAPABILITY: UnsupportedCapabilityError,
     AIErrorCode.AUTHENTICATION: AIAuthenticationError,
     AIErrorCode.REQUEST_VALIDATION: AIRequestValidationError,
+    AIErrorCode.REQUEST_TOO_LARGE: AIRequestTooLargeError,
     AIErrorCode.TOOL_VALIDATION: ToolValidationError,
     AIErrorCode.PROVIDER: AIProviderError,
     AIErrorCode.RATE_LIMIT: AIRateLimitError,
@@ -235,7 +241,7 @@ def _redact_json_value(value: JSONValue, *, key: str | None = None) -> JSONValue
         }
     if isinstance(value, list):
         return [_redact_json_value(item) for item in value]
-    return ensure_json_safe_value(value)
+    return project_diagnostic_value(value)
 
 
 def _redact_json_mapping(value: Mapping[str, JSONValue]) -> dict[str, JSONValue]:
@@ -277,6 +283,7 @@ __all__ = [
     "UnsupportedCapabilityError",
     "AIAuthenticationError",
     "AIRequestValidationError",
+    "AIRequestTooLargeError",
     "ToolValidationError",
     "AIProviderError",
     "AIRateLimitError",

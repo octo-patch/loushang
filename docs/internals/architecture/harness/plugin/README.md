@@ -1,0 +1,806 @@
+# Loushang Plugin Architecture
+
+## Status
+
+- Authority: normative catalog for active Harness Plugin documents; it does
+  not make a proposed child design accepted.
+- Design status: mixed and explicitly labeled per document. Architecture V2 is
+  independently reviewed and owner accepted under issue `#502`; incremental
+  contracts record implemented slices; plans remain delivery records; baselines
+  are implementation evidence.
+- Implementation status: PLC0--PLC8 are complete and terminally reviewed;
+  PLC9's final integrated acceptance is tracked in #509. Current `main` has Product-backed
+  management projections and bounded repair routes across CLI, optional RPC,
+  TUI, and local management SDK; public reproducible data Skill, Prompt, and
+  Theme Wheels; explicit Linux Worker candidate admission, opt-in, native
+  release custody, Session use, and recovery; and POSIX root/shared-dependency
+  GC plus Arch private-data backup, delete, restore, and expiry owners. Each
+  route retains its own Product gate. Explicit Windows candidate first-B,
+  Worker, and GC native journeys passed at the final PLC9 code head. Ordinary
+  unflagged Windows B Session selection was admitted in PR #662. Linux and
+  Windows AMD64 now admit independently authored, self-contained read-only
+  Worker query Wheels through explicit Product routes; Windows private-data
+  production use retains a separate gate. The final
+  Coding offline package regression passed. The
+  [closure ledger](plugin-experience-and-plc9-closure-design.md) records the
+  exact-head evidence and limits.
+- Linux Worker history V2 has a bounded Product cutover path. Under Product
+  runtime quiescence and the GC write gate, it prepares five typed stream
+  bases, publishes one exact owner index after physical and reference proof,
+  and retires only the sealed source segments named by durable deletion debt.
+  All five journals read and append through the typed bases after cutover;
+  receipt full-history reads still refuse because retired records cannot be
+  reconstructed. A real installed Product Worker case passed owner commit,
+  physical retirement, a fresh Session query, and Package GC preparation after
+  retirement. This is candidate evidence for that Linux path. Windows V2
+  authority cutover is tracked separately in #732; backup/restore, wider
+  crash-boundary evidence, and default activation retain their separate gates.
+- Workspace compatibility: [ARD-008](../../decisions/accepted/ARD-008-workspace-upgrade-compatibility.md)
+  supersedes the 2026-10-01 fresh-only ordinary-startup boundary. Existing
+  unfenced workspaces retain their fence-aware compatible Session owner;
+  settings, Plugin choices and history remain usable without conversion.
+  Fresh and verifiable B-fenced workspaces keep the Product route. Explicit
+  fresh-only cutover is separate from ordinary startup. The Product owner
+  accepted automatic first-B cutover for a genuinely fresh Linux workspace on
+  2026-10-01. The ordinary
+  Session implementation, interruption/old-snapshot regressions, and full
+  Coding offline package regression have passed. Explicit Windows candidate
+  first-B and GC routes have native evidence. Direct, Session Runtime, and
+  Hosted ordinary Windows Sessions select the B Product in PR #662. Default
+  Worker routing retains a separate gate.
+- Delivery anchor: PR #678 merged bounded third-party Worker admission on
+  `main`; #509 tracks the final PLC9 integrated acceptance.
+- Worker boundary: explicit Linux x86-64 and Windows AMD64 Coding Product
+  opt-in admits self-contained read-only query Wheels. Current remains the
+  default; dependency execution, effectful Tools, macOS, and default Worker
+  routing remain closed.
+- Owner: `loushang.harness` Plugin architecture scope; contribution runtime
+  authority remains with each exact domain owner.
+
+This directory is the single entrypoint for active Harness Plugin architecture,
+delivery, frozen contracts, and baselines.
+
+For current kind, Product, platform, and entry-route status, use the
+[Plugin support matrix](plugin-support-matrix.md). Earlier status lines in
+delivery records are chronological evidence and may predate later gates.
+
+## Authority Order
+
+When documents disagree, use this order:
+
+1. current source and executable tests for implemented behavior;
+2. accepted exact-owner runtime boundaries linked below;
+3. [Plugin Architecture V2](architecture.md) for the canonical target and
+   cross-document decisions;
+4. frozen incremental contracts for their exact implemented slices;
+5. the lifecycle plan for sequencing and delivery status;
+6. baselines as implementation evidence, not current design authority; and
+7. superseded ARDs only for design archaeology.
+
+The architecture document answers what the Plugin system is and which owner
+controls each state. The lifecycle plan answers when a target is delivered.
+Neither may silently override a narrower implemented owner contract.
+
+## Start Here
+
+- [Plugin Support Matrix](plugin-support-matrix.md) separates artifact build,
+  Product admission, selected consumption, and default-route status for native
+  Resources, Extension files, and Wheels.
+- [Plugin Architecture V2](architecture.md) is the only active Plugin
+  architecture master document. It defines first principles, orthogonal
+  artifact/identity/contribution/execution/trust/lifetime axes, exact ownership,
+  Skill semantics, Worker and remote-service topology, security, and the public
+  authoring ladder.
+- [Plugin Experience And PLC9 Closure Candidate](plugin-experience-and-plc9-closure-design.md)
+  was accepted by the Plugin scope owner on 2026-09-26 as a staged delivery
+  direction for read-only composition explanation, simpler data-Resource
+  authoring, kind-specific Product gates, and unfinished PLC9 work. It does not
+  replace Architecture V2 or the PLC9 plan, and individual Product gates remain
+  subject to their exact owner decisions and implementation evidence.
+- [Plugin Experience Improvements P0–P4](plugin-improvements-p0-p4-design.md)
+  is a candidate implementation design for the next data-Plugin user journey,
+  evidence presentation, author/local discovery path, Coding composition
+  choice, and separately gated third-party Worker path. It adds no authority
+  until exact Product owners accept and implement each slice.
+- [Plugin Lifecycle And Coding Pluginization Plan](plugin-lifecycle-coding-pluginization-plan.md)
+  is the only coordinating PLC0-PLC9 delivery plan. Its status section tracks
+  the current implementation, including the production `coding.lsp` route.
+- [Plugin Authoring Primitives Delivery Plan](plugin-authoring-primitives-delivery-plan.md)
+  refines Definition/Provider/Consumer, Component Host, declaration builder,
+  admission, and the public SDK path delivered by PLC8.
+- [Resource Catalog And Source Pluginization Plan](resource-catalog-pluginization-plan.md)
+  owns the Resource/Skill catalog convergence and the rule that mechanisms may
+  be Plugin components while individual Skills remain Resources.
+- [PLC9D1 Package GC Operator Projection Contract](plugin-lifecycle-plc9d1-contract.md)
+  bounds the current internal GC/cleanup read-model candidate; it does not
+  authorize physical deletion or claim PLC9D completion.
+- [PLC9D2 Dark Package GC Reservation Contract](plugin-lifecycle-plc9d2-contract.md)
+  bounds opt-in reference fencing and durable reservation replay; no Product or
+  Store deletion route is active.
+- [PLC9D3a Writer Fence And Store Deletion Primitive](plugin-lifecycle-plc9d3a-contract.md)
+  records the dark Product downgrade fence, exact Store primitive, and the
+  remaining gates before executable GC or PLC9D completion.
+- [PLC9D3b Store GC Re-publication Fence](plugin-lifecycle-plc9d3b-contract.md)
+  prevents a deleted Store ref from being staged again; Product GC remains dark.
+- [PLC9D3c Exact Root GC Target Resolution](plugin-lifecycle-plc9d3c-contract.md)
+  checks the desired handoff, committed set, and physical Store settlement
+  without granting deletion authority.
+- [PLC9D3d Committed-Set Root Ref Fence](plugin-lifecycle-plc9d3d-contract.md)
+  refuses a newly committed alias after one root ref enters GC.
+- [PLC9D3e Durable GC Result And Retry Debt](plugin-lifecycle-plc9d3e-contract.md)
+  journals Store result or retryable debt without enabling a Product GC route.
+- [PLC9D3f Internal Root GC Execution](plugin-lifecycle-plc9d3f-contract.md)
+  connects reservation, exact root deletion, and durable result in a
+  POSIX-tested internal coordinator; Product ingress remains closed.
+- [PLC9D3g Explicit Product Root GC Command](plugin-lifecycle-plc9d3g-contract.md)
+  reserves an exact candidate and executes its root settlement under one
+  Product gate; default management and transport routes remain closed.
+- [PLC9D3h Root GC Result Projection](plugin-lifecycle-plc9d3h-contract.md)
+  shows reserved, started, debt, success, or evidence conflict from durable
+  owners without granting deletion or asserting private-data/backup effects.
+- [PLC9D3i Fenced Product Root GC Composition](plugin-lifecycle-plc9d3i-contract.md)
+  joins the real B Product owners behind offline runtime quiescence, transaction
+  recovery, and an exact Store root.
+- [PLC9D3j Offline Root GC Command](plugin-lifecycle-plc9d3j-contract.md)
+  exposes separate preparation, candidate/status, exact deletion, and
+  durable-start retry through an offline POSIX operator CLI.
+- [PLC9D3k Private-Data Confirmation And Backup Projection Seams](plugin-lifecycle-plc9d3k-contract.md)
+  requires independent confirmation and domain-owned deletion evidence, and
+  projects backup status only when a backup owner is bound.
+- [PLC9D3l Durable Private-Data Confirmation Evidence](plugin-lifecycle-plc9d3l-contract.md)
+  persists exact separately issued confirmation evidence; no operator or
+  destructive command is exposed.
+- [PLC9D3m Cutover Backup Status Projection](plugin-lifecycle-plc9d3m-contract.md)
+  verifies the real pre-B workspace snapshot owner through the current fence;
+  per-Plugin retention and expiry remain unknown.
+
+## Frozen Contracts
+
+- [PLC1B Declaration Foundation](plugin-declaration-foundation-plc1b-contract.md)
+  freezes declaration sources, strict wire records, contribution kinds,
+  fingerprints, aggregate claims, and version diagnostics.
+- [PLC2 Lifecycle Contract](plugin-lifecycle-plc2-contract.md) freezes durable
+  install/enable/disable/update, retirement handoff, Instance leases, cleanup,
+  repair, and GC evidence.
+- [PLC3 Execution Trust Contract](plugin-execution-trust-plc3-contract.md)
+  freezes one-shot execution decisions, use consumption, verified Definition
+  evaluation, and recovery.
+- [PLC7 Second-Provider Contract](plugin-lifecycle-plc7-contract.md) freezes the
+  `coding.arch.default` identities, typed facets, shared single-Graph Product
+  composition, private indexed-state policy, direct-path deletion, and review
+  gates.
+- [PLC8 Public SDK And Managed Skill Action Contract](plugin-lifecycle-plc8-contract.md)
+  freezes the public author namespace, engine negotiation, inert validation,
+  single-Catalog action selection, and Approval/containment execution boundary.
+- [PLC9A1 Management Application Contract](plugin-lifecycle-plc9a1-contract.md)
+  freezes the internal transport-neutral command/query boundary, read-only
+  owner-revisioned projection, one-way enablement migration, and Coding CLI
+  adaptation without widening the public author SDK.
+- [PLC9A2 Product Routing Contract](plugin-lifecycle-plc9a2-contract.md)
+  freezes Product-owned recovery/epoch activation, one typed Package intent
+  across operations/Session/CLI/RPC/startup, and explicit-non-Plugin-only
+  fallback without granting transports Store or deletion authority.
+- [PLC9 A2 Later-Phase Repair Policy](plugin-lifecycle-a2-later-repair-policy.md)
+  maps existing bounded Coding repair actions to their Package phases and
+  defines the evidence and refusal gates for a general repair decision.
+- [PLC9B Safe Package Boundary Contract](plugin-lifecycle-plc9b-contract.md)
+  freezes the Package acquisition owner, exact entrypoint inventory, versioned
+  wheel/closure/publication evidence, fail-closed recovery, and mandatory
+  adversarial acceptance matrix. PLC9B1 implements the dark inert Owner Kernel;
+  PLC9B2a adds an unbound bounded Source/quarantine component. Archive/wheel
+  verification, phase integration, cleanup repair, and evidence-driven crash
+  adoption are implemented by PLC9B2b/B2c/B2d/B2e. PLC9B2f supplies the
+  accepted native Windows rooted-handle backend and its mandatory CI oracle.
+  PLC9B2g is the accepted acquisition-level manifest slice; PLC9B2h is the
+  accepted Linux archive/path/type/limit/wheel matrix; PLC9B2i is the accepted
+  Windows archive path/type matrix. PLC9B2j is the accepted Linux-native slice
+  for artifact identity, early crash, and cleanup-debt recovery. PLC9B2k is the
+  accepted POSIX-native slice proving Wheel 1.x hardlinked sources are
+  normalized to independent regular files. PLC9B3a is the accepted dark pure
+  closure-v2 verifier with component-level adversarial fixtures. PLC9B3b is the
+  accepted dark slice for durable authenticated-Source inputs and deterministic
+  recovery of Wheel dependency headers. PLC9B3c is the accepted dark recursive
+  builder that gives a selection-only resolver no acquisition authority and
+  routes every dependency through accepted Source/acquisition/Wheel evidence
+  before the pure closure proof. PLC9B3d-1 accepted dark code adds durable
+  basis/selection/plan evidence, local dependency replay, cleanup-debt handoff,
+  and dark closure phase-CAS. B3d-1 accepts its two crash rows after the retained
+  54-row Linux-native report passed. B3d-2a accepts the three composed
+  closure-limit rows after the retained 57-row Linux-native report passed;
+  B3d-2b accepts all seven closure-integrity rows with bounded cleanup-debt
+  custody after the retained 64-row Linux-native report passed. PLC9B3e-1
+  accepted code adds dark credential-free typed stable refs, an immutable
+  closure lock, and the exact committed-set record without pinning, staging,
+  publishing, admission, or production binding; its retained native report
+  remained exactly 64 rows and contained no `B-PUB-*` node. PLC9B3e-2a
+  accepted code adds credential-free transaction-pin records, a narrow Port,
+  and a durable adjacent-evidence journal without phase composition or a
+  concrete retention-ledger import; its retained report remained exactly 64
+  rows and contained neither `B-CRASH-PINNED` nor a `B-PUB-*` node.
+  PLC9B3e-2b accepted code composes exact pin acquisition, durable receipt
+  ordering, phase CAS, retry adoption, and candidate-free restart recovery. Its
+  composed `B-CRASH-PINNED` row passed in the retained 65-row Linux-native
+  report with zero skips, failures, or errors; publication and production
+  routing remain unimplemented. PLC9B3e-3a accepted code adds dark,
+  role-separated staging contracts with an authority-issued Plugin-root
+  target, exact adjacent staging evidence, and a Package-owner atomic
+  closure-lock/committed-set journal. It composes no store or lifecycle phase,
+  keeps all publication/crash rows planned, and remains private to the Package
+  owner boundary. Its retained 65-row Linux-native report passed with zero
+  skips, failures, or errors and contained no staging/set crash or publication
+  node. PLC9B3e-3b accepted code composes those dark contracts through
+  deterministic dependency-first staging, classification recheck, atomic set
+  evidence, and candidate-free recovery. It makes `B-CRASH-STAGING` and
+  `B-CRASH-SET` executable without claiming a concrete store, native
+  publication-root safety, admission, or production routing. Its retained
+  67-row Linux-native report passed with zero skips, failures, or errors,
+  included all three committed-phase crash rows, and contained no publication
+  node. PLC9B3e-3c0 accepted contracts bind a files-only logical transfer
+  manifest to exact Wheel evidence and separate quarantine transfer,
+  dependency-root sinks, and designated Plugin-root sinks. They expose no
+  physical path or handle, perform no Store effect, and keep every publication
+  row planned pending native backends and later commit admission. Its retained
+  67-row Linux-native report passed without skips, failures, errors, or a
+  publication node.
+  PLC9B3e-3c1 accepted code adds the first concrete POSIX-native consumers of
+  those contracts: an identity-checked quarantine reader, bounded transfer
+  owner, and role-separated immutable Store adapters. Five publication/root/
+  handle manifest rows now traverse real acquisition-to-set composition;
+  Windows native backends, collision/reuse, commit admission, and production
+  routing remain closed. Its retained 72-row Linux-native report passed with
+  zero skips, failures, or errors and included exactly those five publication
+  nodes.
+  PLC9B3e-3c2 accepted code adds corresponding role-separated Windows-native
+  Store adapters using the accepted rooted-handle backend plus handle-relative
+  atomic rename. Its retained native report passed 15 component tests and 12
+  manifest nodes with zero skips, failures, or errors, including all five
+  Windows publication/ABA/handle nodes. Collision/reuse, commit admission, and
+  production routing remain closed.
+  PLC9B3e-3c3 accepted code adds a durable Store-private settlement authority
+  to both native adapters. It records the complete rooted physical identity,
+  exact verified manifest, and receipt before rename, serializes Store
+  instances with a durable owner lock, recovers the rename-to-receipt crash
+  window, and distinguishes exact restart reuse from same-byte identity
+  collision. Collision and reuse become executable without exposing a public
+  route; `B-PUB-UNCOMMITTED` remains the PLC9B4 admission gate. All 23 PR
+  checks passed; retained reports executed 74 Linux-native manifest nodes, 19
+  Windows native-component tests, and 12 Windows manifest nodes without skips,
+  failures, or errors.
+  PLC9B4a accepted code adds the dark terminal commit owner, deterministic
+  publication receipt, and candidate-free read-only admission owner. The
+  admission boundary proves exact operation/request, Product/scope,
+  Installation/Plugin, root/set/closure, and live transaction-pin evidence but
+  cannot reopen a revision or mutate binding/desired state. The missing-receipt
+  publication row and seven cross-context admission rows are executable; the
+  later retention-handoff, epoch, and Product-routing gates remain closed. All
+  23 candidate checks passed, and retained Linux artifact `9823339334`
+  executed exactly 82 manifest nodes with no skips, failures, or errors.
+  PLC9B4b accepted code adds strict Desired-CAS, dependency-pin, handoff, and
+  settlement receipts plus a durable handoff CAS coordinator. Dependency pins
+  precede Desired commit; rejection preserves the transaction pin; successful
+  settlement proves exact dependency retention before transaction-pin release.
+  All six handoff rows are executable, including post-settlement recovery and
+  concurrent replay. The code remains dark and independent of concrete
+  `plugin_management` ledgers; B4c epoch fencing and Product adapters remain
+  closed. All 23 PR checks passed, and retained Linux artifact `9825049355`
+  executed exactly 88 manifest nodes with no skips, failures, or errors.
+  Accepted PLC9B4c0 code adds the dark adjacent epoch-fence journal and a
+  read-only runtime admission owner over exact fence/root/protocol and complete
+  active-lease evidence. Newer/older runtime epochs and mixed active epochs
+  fail closed without journal or Product mutation, making `B-COMPAT-EPOCH` and
+  `B-COMPAT-MIXED` executable. Native root cutover, offline restore, adoption,
+  recovery convergence, and every Product route remain closed. Local
+  `make check-harness` passed Ruff, mypy over 642 source files, and 3,824 tests
+  with 23 expected skips. Candidate `18f0bab8` passed all 23 PR checks, and
+  retained Linux artifact `9826705491` executed exactly 90 manifest nodes with
+  no skips, failures, or errors.
+  PLC9B4c1 accepted code adds a dark POSIX-native offline cutover owner over
+  exclusive quiescence and snapshot Ports. It creates a fresh identity-pinned
+  sibling namespace and treats the adjacent epoch-journal append as the sole
+  atomic Product-root pointer; live pre-fence writers reject before native
+  mutation. The two POSIX compatibility rows are executable, raising the
+  Linux manifest to 92 nodes. Windows cutover, concrete restore/recovery,
+  adoption, and all Product routes remain closed. Local `make check-harness`
+  passed Ruff, mypy over 643 source files, and 3,837 tests with 23 expected
+  skips; the focused regression passed all 142 tests. Candidate `e99945d2`
+  passed all 23 PR checks, and retained Linux artifact `9828433273` executed
+  exactly 92 manifest nodes with no skips, failures, or errors.
+  PLC9B4c2 accepted code adds the symmetric dark Windows-native cutover owner.
+  It reuses the exact B4c1 pathless schema and epoch visibility edge while
+  preparing, identity-pinning, flushing, reopening, and cleaning the sibling
+  namespace through rooted Windows handles. The two Windows compatibility
+  rows are executable only in the mandatory Windows XML gate. Concrete
+  restore/recovery, adoption, and all Product routes remain closed. Local
+  `make check-harness` passed Ruff, mypy over 644 source files, and 3,837 tests
+  with 33 expected skips; the focused regression passed 132 tests with the ten
+  Windows-native component tests collected but skipped on Linux. Windows Shell
+  Compatibility run `33584494760`, native job `100105659525`, and retained
+  artifact `9829593062` then executed all 29 PLC9B native-component tests and
+  all 14 Windows manifest nodes with zero skips, failures, or errors; all 23
+  candidate PR checks passed.
+  PLC9B4c3a accepted code adds the dark, pathless offline-restore protocol.
+  It binds the exact current and genesis fences to complete pre-B snapshot
+  evidence covering store bytes plus Source, lock/binding, Desired, Instance,
+  enablement, root-pointer, and fence state. Exclusive quiescence encloses
+  evidence lookup, isolated materialization, and old-runtime activation; fence
+  drift deactivates and discards exact residue. Native restore and adoption
+  remain unimplemented, so all seven remaining compatibility rows stay planned.
+  Candidate `2fe7953a` passed all 23 PR checks; retained Linux artifact
+  `9831701194` executed the unchanged 92 manifest nodes with zero skips,
+  failures, or errors.
+  PLC9B4c3b accepted code adds rooted POSIX snapshot verification, a
+  request-bound current-B identity check, exact no-follow copying, durable
+  same-request replay, atomic isolated namespace publication, and
+  identity-bound discard behind the accepted offline-restore Port. The request
+  and receipt remain pathless and no Product journal or public route is added.
+  Its in-memory activation-Port composition is not a
+  native process-start proof, so `B-COMPAT-OFFLINE-RESTORE-POSIX` remains
+  planned and the Linux manifest remains at 92 nodes; Windows restore, concrete
+  legacy process launchers, adoption, and Product binding remain closed.
+  PLC9B4c3c accepted code adds one dark Linux/Bubblewrap activation adapter
+  owned by `loushang.harness.sandbox`; the resource kernel remains backend-free.
+  It verifies the durable restored tree and current-B identity, requires an
+  application readiness handshake, proves the real sandbox child's namespaces
+  and view of the restored/B roots through procfs, persists a private
+  identity-bound process marker, and uses a guardian plus pidfds for exact
+  replay/deactivation without worker-thread or PID-reuse races. The
+  complete POSIX offline-restore row now executes as node 93 in the named Linux
+  native gate; Windows restore, adoption, and Product routing remain closed.
+  PLC9B4c4a accepted code freezes a dark, pathless legacy-adoption coordinator
+  in the Package resource-owner kernel. Its versioned evidence binds an exact
+  current fence and complete immutable legacy state around a separately owned
+  B transaction, and it accepts only an exact committed Plugin-bound receipt
+  while the fence and legacy state remain unchanged. It owns no source,
+  filesystem, process, publication, Product-state, or public-route capability;
+  the concrete adapter and all five adoption manifest rows remain closed.
+  PLC9B4c4b accepted code adds a one-operation adoption transaction adapter
+  that sequences the existing closure, pin, staging/set, and commit owners. Its
+  private execution binding may retain an opaque credential reference, while
+  adoption requests/results stay pathless and credential-free. Shared-journal
+  confirmation rejects invented phase results, and durable staging/commit
+  replay skips prior effects. A bare transaction pin cannot reconstruct live
+  verified candidates and therefore fails closed until a reacquisition seam is
+  supplied. The adapter remains dark; native end-to-end acquisition and all
+  five adoption manifest rows remain closed.
+  PLC9B4c4c accepted code supplies that seam without adding ambient
+  authority. The artifact and closure owners reopen and reverify the exact
+  pinned attempt solely from durable authenticated-source, acquisition, Wheel,
+  selection, and closure-plan evidence. Recovery never falls back to Source or
+  resolver calls, does not append evidence or move lifecycle phase, and the
+  adoption adapter replays the existing pin before ordinary staging/commit.
+  Native end-to-end adoption and all five adoption manifest rows remain closed.
+  PLC9B4c4d accepted evidence composes the positive adoption path through the
+  production authenticated-acquisition, verification, closure, pin,
+  POSIX-native Store, committed-set, commit, transaction, and adoption owners.
+  It proves exact receipt replay, one physical Source request/pin/publication,
+  a still-visible acquired pin, filesystem-recaptured legacy snapshot equality,
+  unchanged Product-domain bytes, and no credential persistence. The positive
+  `B-COMPAT-ADOPT` row now executes as Linux native node 94; the four
+  failure/crash adoption rows, Windows restore, and Product routing remain
+  closed pending their own retained evidence.
+  PLC9B4c4e accepted evidence promotes the unauthorized and temporarily
+  unavailable adoption Source paths as Linux native nodes 95 and 96. Both
+  fail or retry at `acquiring`, replay without extra network work, leave no
+  publication or bounded residue, and preserve independent revisioned Product
+  projections plus the complete legacy snapshot. The two crash rows remain
+  closed.
+  PLC9B4c4f accepted evidence promotes crash-after-committed as Linux native
+  node 97. A one-shot post-CAS crash yields no first receipt; restart and replay
+  reauthorize the durable root and reconstruct the same receipt without
+  repeating Source, pin, staging, settlement, or committed-set effects. The
+  every-precommit crash row remains closed.
+  PLC9B4c4g accepted evidence injects a one-shot crash after each of the nine
+  durable pre-commit phases. A completely rebuilt Package owner graph resumes
+  the same active attempt to one exact receipt without repeating Source, pin,
+  staging, settlement, or committed-set effects. No interruption event is
+  fabricated for a process that could not write one; explicit supervisor
+  interruption and greater-epoch retry remain a separate lifecycle action.
+  This promotes `B-COMPAT-ADOPT-CRASH` as Linux native node 98, so all five
+  adoption rows are executable and nonskippable in the retained Linux gate.
+  Candidate head `d961e9d9` passed all 23 PR checks. Harness Quality run
+  `33701887340`, Linux job `100482733307`, and retained artifact `9873812228`
+  executed all 98 Linux manifest nodes plus three authority/recovery guard
+  tests with zero skips, failures, or errors; artifact upload digest
+  `1822656d9150bd1b2ff602906ae229922bcc04527bec6a6f41f3edfb34934d98`.
+  PLC9B4c5 accepted code adds the dark Windows rooted-handle peer of the
+  accepted POSIX offline-restore materializer plus a separately owned
+  zero-capability AppContainer/Job old-runtime activation adapter. It publishes
+  one exact isolated namespace, proves restored-root reachability and current-B
+  denial with the real process token, binds replay to native process identity,
+  and reverses the process tree and granted authority. Five component cases and
+  `B-COMPAT-OFFLINE-RESTORE-WINDOWS` run without skips in the mandatory Windows
+  native XML gates.
+  PLC9B4d accepted code closes fourteen remaining recovery, concurrency,
+  cancellation, status, compatibility, no-execution, drift, and secret-
+  persistence rows. Exact terminal replay stays read-only and fenced retry is
+  the only roll-forward route for an interrupted pinned attempt.
+  PLC9B5 accepted code adds one internal, capability-poor Product router for
+  CLI, RPC, Session, startup, and operations provenance. Plugin-bound routes
+  share one transaction Port; direct materialization and publication bypasses
+  are durably refused. Its seven cross-platform nodes complete the 127-row
+  PLC9B adversarial manifest without adding an author-SDK surface.
+  Final candidate `fb0832d6` passed all 23 PR checks. Retained Linux run
+  `33709473590`/artifact `9876413745` executed 119 manifest nodes plus three
+  guards; Windows run `33709473605`/artifact `9876434660` executed 34 native
+  component tests and all 15 Windows manifest nodes. All retained PLC9B XML
+  reports recorded zero skips, failures, and errors.
+  The current PLC9B integration branch adds an explicit POSIX local-Wheel
+  Product composition over a live epoch lease, the existing Product desired
+  and GC owners, digest-pinned Source, journaled transaction pins, and native
+  Package Stores. Native end-to-end tests cover root-only and dependency-Wheel
+  commits through this composition; a separate real-Store/Product fixture
+  covers changed-Source refusal. The composition refuses a moved Store root.
+  An explicit minimal Coding Session now exercises this real binding through
+  the Product factory Port and commits a local Wheel without a legacy
+  materializer. The same native fixture now also commits through shared CLI
+  and RPC install transports with Product-bound Session evidence. Coding now
+  assembles the installed `coding.base` data files into a deterministic Wheel,
+  publishes it once in a private POSIX Source root, and pins its digest and
+  trust class in a Product local-Wheel policy. The native fixture consumes that
+  artifact through the PLC9B Wheel verifier and real Store. A real Coding Session
+  also installs that checked-in package through
+  the Product transaction and reads its manifest, declaration, Prompt, and
+  Skill members from the selected Store root after enablement. A concrete
+  fenced Coding Product owner constructor first served explicit Hosted Sessions;
+  default selection is described below. The first-party LSP and Arch
+  Capability packages can now be frozen as distinct, digest-pinned Product
+  Wheels alongside `coding.base` under one explicit Source policy. Their
+  `in_process` Provider declarations remain unchanged. The real B Store fixture
+  uses a three-package Coding Product owner and its leased Session factory to
+  commit and enable both, capture their exact definition bytes, and reopen both
+  selected manifests while the pre-B roots are absent. A Product-selected
+  revision bridge now rechecks the live Store selection on every verified file
+  read and supplies those bytes to the existing Plugin Python loader; the
+  native fixture proves both Definitions load after the pre-B roots are hidden
+  and the bridge rejects a disposed Product runtime. An explicit POSIX Product
+  preparation builds its Definition plan from the B instance, Source, artifact,
+  and trust evidence, then uses those selections to
+  approve and compile both Definitions, bind a workspace Provider into two
+  Capability requests and two Tool owners, and abort an unpublished assembly.
+  It rechecks the live Product selection before binding, so disposing the B
+  runtime after preparation fails closed. A second explicit preparation now
+  selects `coding.base` and both Capability packages in one Product plan,
+  rejects a base compilation from an older Store selection, and compiles the
+  base Resource admissions and Capability owners together. The base Resource
+  candidates retain the exact B transaction lock digest while the executable
+  Definition gate retains its Plugin lock; the only permitted owner-candidate
+  projection changes that lock field after matching current Store identity.
+  The native fixture binds the resulting base and Capability assemblies to
+  the same Session composition inputs. With an explicit Product factory,
+  `coding-standard` now starts a real Session from the selected base and LSP,
+  while `coding-architecture` starts from all three selected packages. Both
+  prepare the Session graph with pre-B roots hidden and legacy constructors
+  disabled. A base-only Product owner cannot satisfy the LSP request and does
+  not fall back to the legacy materializer. The later B-fence default selection
+  and its remaining migration gates are described below. The
+  POSIX root Store now exposes a bounded, exact-member read from a live,
+  untombstoned settlement after verifying the full tree and native identities.
+  The POSIX Product factory binds that read to its current enabled desired
+  selection, exact Product crosswalk and committed set under the GC reference
+  gate; the reader returns only verified bytes within the bound Product scope.
+  The `coding.base` default cutover and migration of the remaining Plugin
+  inputs remain open. The
+  concrete POSIX factory pins Product, Session, and
+  workspace identity, and now requires a native cutover result matching the
+  current fence, namespace, and Store root before composing those owners. Its
+  integration fixture runs the native cutover owner with the durable runtime
+  lease/quiescence owner and reopens that registry for Session admission. A
+  Product-facing lease helper binds the registered runtime to that exact fence
+  and releases the lease if admission construction fails. The explicit POSIX
+  factory now transfers that lease through its runtime binding to the Session:
+  failed factory activation or post-activation Session construction releases
+  it, and successful Session disposal releases it after cleanup completes. A
+  failed disposal retains the lease for safe retry or operator repair. The
+  POSIX factory issues only one binding per lease, and Coding bootstrap
+  releases an unbound lease if startup refuses before activation. A Product-facing
+  Session owner accepts the already fenced authorities, registers a distinct
+  runtime lease, and returns a one-shot factory through a thin Coding selector;
+  it refuses a foreign workspace before registration and releases the lease if
+  factory construction fails. The native fixture also starts a Hosted Session
+  on the committed `coding.base` Store root through this selector; Product
+  Prompt and Skill are visible, the legacy materializer is not reached, and
+  closing releases the lease. A Coding application owner can now reopen one
+  fenced B epoch, supply factories to successive standard and architecture
+  Sessions, and close only after its own runtime leases have been released;
+  the real-Store fixture rejects an early close and permits closing while a
+  separate Store owner remains live. The shared Hosted/managed Session factory
+  and standalone Coding runtime now select this owner when a workspace has a
+  durable B fence. Their application close releases the owner after Session
+  cleanup; a failed B reopen cannot fall back to the legacy materializer.
+  Direct `create_agent_session` callers also select a fenced owner by default;
+  its Session binding releases that owner at disposal.
+  A POSIX snapshot owner now publishes a durable, restore-compatible bundle from
+  nine explicitly configured pre-B domain roots; an independent reader still
+  verifies the evidence after the old source roots disappear. The integration
+  fixture supplies those roots and now uses a concrete Linux pre-fence owner:
+  process-held liveness locks and a root-directory launch barrier reject live
+  old processes before snapshot and refuse new old registrations after fence.
+  The cutover fixture now uses Coding's existing legacy Package directory as
+  the POSIX legacy root, with a sibling epoch namespace, and snapshots its
+  actual lifecycle state root. Its Package-root mapping now partitions deployed
+  `installed` and `plugin-revisions` Store data from `package-lock.json` binding
+  and lock history, and refuses any unaccounted top-level member. The combined
+  JSON file is explicitly copied into both history domains. The real Coding
+  lifecycle root is now partitioned into Desired, enablement, and Instance
+  domains, including known journal locks and old lease directories. Both
+  mappings reject unknown top-level members. A Coding-owned preparation context
+  now composes these mappings and holds the Source settings locks through
+  cutover; a Product-facing owner contains native snapshot publication, and the
+  native fixture exercises both entries. The same Product owner now composes
+  the native pre-fence, runtime-lease, and cutover authorities for the first B
+  fence. A live old runtime refuses before publication; exact replay reads the
+  persisted old-root identity, and a changed namespace refuses. Coding has one
+  explicit call that holds the Source locks through this Product cutover; the
+  default bootstrap has not selected it. The cutover snapshots the
+  real pre-fence control root as `fence_record`; the new B fence appears only
+  after that snapshot. The current POSIX Product fence can now be reopened from
+  the durable journal and exact selected-root identity without reading the old
+  Package or lifecycle Source roots; missing fences and replaced B roots refuse.
+  A Product-facing runtime owner now retains the private control-root descriptor
+  and rooted lease registry across Sessions, and refuses shutdown while a live
+  runtime lease remains. The Session selector issues leases through that owner,
+  which rechecks the visible control root and B fence at selection and factory
+  activation; a replaced control path cannot reuse the pinned registry. The
+  real Store fixture uses this owner instead of assembling the registry itself.
+  Coding now opens B Product desired, management, GC gate, and binding journals
+  in a private control-root child only after the fence. The native fixture
+  refuses a foreign workspace or non-private child and verifies that Product
+  work leaves the complete pre-B Package and lifecycle trees unchanged.
+  The same pinned owner can create a separate private Product Source child
+  after the fence; the native fixture rejects an unsafe existing child and
+  publishes the installed `coding.base` Wheel there under a restrictive umask.
+  A Coding Product owner constructor now joins that Source, the B-only state
+  owners, the selected Store namespace, the canonical workspace scope, and the
+  host's resolution environment. The real Hosted Session fixture uses this
+  constructor to reopen the selected `coding.base` files from the Store;
+  foreign workspaces and mismatched B journals refuse before composition. The
+  constructor also reopens with both pre-B roots temporarily absent.
+  This is restart admission evidence, not default runtime selection. For
+  `legacy_root_pointer`, the snapshot owner requires an empty source domain and
+  records the verified old Store identity with the
+  Product-declared root name. The native fixture now holds real Coding global
+  and project settings transaction locks through cutover, verifies their file
+  bytes against the loaded settings layers, and snapshots a private Source-only
+  projection; transient session Source overrides and unmapped Source keys
+  refuse. The independent reader verifies it after the projection source is
+  deleted. The native Session fixture also restores that exact nine-domain
+  bundle through the POSIX offline-restore owner, starts an isolated legacy
+  runtime, replays the request, and verifies the B root and fence survive
+  restoration and cleanup. This is recovery evidence, not default activation.
+  The snapshot owner rejects overlapping whole-tree roots and accepts
+  colocated roots only with exact top-level member coverage, including declared
+  shared members. This completes the nine-domain native fixture geometry, not
+  a default Coding cutover or Plugin entry switch.
+  On Linux, the
+  Coding lifecycle and management-application builders now hold process-level
+  pre-fence registrations before preparing their legacy state; default base
+  materializer construction follows that admission. Coding reaches the internal
+  Linux registration owner only through a Product-facing Package adapter.
+  Configured Continuity registers before compatibility reconciliation and
+  materializer construction;
+  a bound compatibility writer retains that registration after an empty bind.
+  Continuity without a settings owner or Plugin Source remains a non-Plugin
+  path. The explicit minimal Product-bound Session now proves its public
+  `install_package` call commits through the transaction, while its public
+  `materialize_package`, `update_package`, `remove_package`, and
+  `uninstall_package_async` calls refuse Plugin-bound targets without a legacy
+  materializer. The real CLI/RPC transport fixture also proves durable Product
+  refusals for these four commands: materialize/update reach the unavailable
+  transaction route, while remove/uninstall stop at indeterminate target
+  classification. Synchronous Session `uninstall_package` now routes an enforced
+  Product binding before consulting the legacy synchronous-refresh gate; its
+  real-Store refusal is durable even when catalog refresh is async-only.
+  Further transport coverage and supervisor launch still need a one-time switch.
+  Trusted Hosted, local, and managed command constructors can now pass a fresh
+  Product runtime factory for each Session into the same bootstrap gate. The
+  shared Hosted/managed factory, standalone Coding runtime, and direct Session
+  API select a fenced Product owner by default. The real-Store fixture confirms
+  base/LSP selection with pre-B roots hidden and legacy constructors disabled,
+  then releases their runtime leases on close. CLI and RPC updates through that
+  default Session each leave a durable Product refusal while their legacy
+  Session method is disabled. A configured startup Package Source now enters
+  the Product transaction, and a failed Product record aborts Session startup;
+  later configured Sources are not attempted, and the exact Product failure
+  code is recorded in diagnostics. The old materializer is not called. Product
+  mode does not mount the configured Source path as a Resource root. A native
+  POSIX fixture now also proves that a default, fenced `coding-minimal` Session
+  commits a configured first-party capability Wheel through the real Product
+  Store, records the committed lifecycle and committed set, and releases its
+  runtime lease. The subsequent capability selection reads that committed root.
+  The same default Session commits the first-party LSP Wheel through the CLI
+  install route with its legacy Session install method disabled; the Product
+  lifecycle and committed set retain that separate transaction.
+  A second RPC install of that already installed Plugin now leaves a durable
+  classified refusal before another Package commit, with Desired state and
+  committed sets unchanged. The real Product route holds the GC reference gate
+  across its installed-target preflight, transaction, and handoff so concurrent
+  management mutations cannot cross those phases.
+  That default Session also sends unauthorized CLI and RPC installs through
+  Product: both leave distinct durable refusals with Desired state unchanged
+  while its legacy install method is disabled.
+  Direct legacy `PluginRevisionStore.publish` and
+  `PackageMaterializer.publish_plugin_packages` now refuse the old revision root
+  after an epoch namespace exists. They hold the same authority-root lock as
+  cutover through publication; the native B fixture proves both refusals and
+  preserves the pre-B tree. The same Linux fence now covers direct
+  `PackageMaterializer` lockfile/binding writes, synchronous and asynchronous
+  backend effects, and removal through their full write intervals. Native B
+  evidence covers lockfile and synchronous backend refusals; focused epoch-root
+  regressions cover binding, asynchronous update, and removal. Direct Git and
+  Python backend calls into the legacy `installed` tree, including aliases that
+  resolve there, now refuse before running either installer. Windows and
+  noncanonical external write roots remain outside this guard.
+  This is not a completed Product
+  cutover, Windows composition, or PLC9D execution claim.
+  An enforced Product route now refuses an unhandled non-Plugin outcome even
+  when a legacy materializer was supplied, including startup Source resolution
+  and direct configured-Source preparation. Dark mode retains its compatibility
+  behavior. Enforced startup now routes configured local Wheels as Product
+  `install` intents; a real POSIX Store/Product fixture commits both root-only
+  and dependency-Wheel cases through that resolver. A separately accepted
+  non-Plugin owner remains an activation gate.
+  Shared CLI now requires its typed source or collection executor whenever a
+  Session declares a Package Product binding; a missing executor cannot fall
+  back to legacy Package methods.
+  The composition now returns one enforced lifecycle/inventory runtime binding.
+  Its Product-owned local-Wheel inventory reads the same desired and
+  committed-set journals, binds bulk-update targets durably, and reports
+  unknown or legacy-unverified installed Sources as check failures. Coding
+  supplies this binding only through the explicit minimal Product factory
+  composition, not its default bootstrap.
+  Coding bootstrap now refuses an explicitly supplied Package Product runtime
+  factory when its composition requests legacy Plugins, its Catalog policy
+  includes Package resources, configured Package roots/sources are present,
+  or an initial Product composition or peer materializer is supplied.
+  Only an explicit minimal composition with the canonical read-only Catalog
+  policy can exercise the factory before those legacy inputs are migrated; it
+  constructs and exposes no legacy Package materializer. Default Coding
+  remains on its existing path. An enforced Product route with no materializer
+  also refuses explicit non-Plugin fallback before settings mutation.
+- [PLC9C Local Worker Boundary](plugin-lifecycle-plc9c0-baseline.md) freezes the
+  threat model and implements C1--C4's additive `local_worker` declaration,
+  owner-only Process/Sandbox launch capability, bounded protocol/supervisor,
+  durable attempt journal, and default-dark read-only Capability adapter. C5.1
+  through C5.5c now add exact lifecycle/receipt ownership and explicit Linux
+  and Windows AMD64 Coding Product canaries; general author-SDK runtime owners
+  and `remote_service` remain absent. The separate
+  [HOST-H5 default-dark adapter](../../hosting/harness-worker-adapter-h5.md)
+  supplies an atomic Hosting session seam and rollback selector but explicitly
+  retains the sealed-descriptor preparation gap, so it does not advance C5.
+  The proposed [HOST-H6 managed preparation contract](../../hosting/managed-launch-preparation-h6.md)
+  and [Hosted Product Runtime V1 plan](../../drafts/hosted-product-runtime-v1-plan.md)
+  define the next mechanical and cross-scope gates; neither changes the C5
+  activation fence. The accepted
+  [PLC9C5 C5.0 Product/Native Worker Activation Baseline](plugin-lifecycle-plc9c5-c50-baseline.md)
+  and its source-backed
+  [Current inventory](plugin-lifecycle-plc9c5-c50-inventory.md) records the C5
+  progression from design/guards through receipt/lifecycle, Linux native,
+  Windows mechanics, and the two Product canaries. Product activation remains
+  explicit and default-dark; Current is still the default.
+- [Registered Worker Recovery Contract](plugin-worker-registered-recovery.md)
+  records the Product evidence and history-retention gates for a Linux C5
+  attempt stranded before its effect-start edge.
+- [PLC9C5 C5.1 Product Worker Receipt And Lifecycle Contract](plugin-lifecycle-plc9c5-c51-contract.md)
+  implements the authority-free policy/receipt join, synchronous serialized
+  freshness gate, deterministic publication/retirement lifecycle, durable
+  settlement/debt, and restart latch. It retains default Current and adds no
+  native bridge or production Product composition.
+- [PLC9C5 C5.2 Linux Native Profile Binding](plugin-lifecycle-plc9c5-c52-linux-native.md)
+  adds the single request-bound POSIX contained-profile friend, exact
+  policy/execution closure evidence, non-WSL Linux x86_64 rejection gate, and
+  retained native report. C5.2 had no Product consumer; C5.4 later added the
+  explicit Linux Coding canary while keeping Current as the default.
+- [PLC9C5 C5.3 Windows Mechanics And Product Rejection](plugin-lifecycle-plc9c5-c53-windows-mechanics.md)
+  adds one Hosting-private OS-sourced trusted-payload builder, retains the
+  restricted-token/Job/handle-list mechanics report, and proves explicit
+  Product required-containment rejection at C5.3. C5.5b/c later accepted only
+  the LPAC-contained Windows AMD64 Coding canary.
+- [PLC9C5 C5.4 Linux Coding Product Canary](plugin-lifecycle-plc9c5-c54-linux-product.md)
+  composes the one explicit Linux Coding canary over the retained Worker and
+  Hosting capabilities, joins stable Session and shared-entrypoint evidence,
+  and closes ordered rollback/recovery and publication evidence. G7 remained
+  open at C5.4; C5.5c subsequently closed its Windows gate for the exact canary.
+- [PLC9C5 C5.5 Windows Required-Containment Baseline](plugin-lifecycle-plc9c5-c55-windows-containment.md)
+  freezes the LPAC threat model, immutable-material-versus-attempt lifetime,
+  sole-writer boundaries, native/Product evidence matrices, and the C5.5a--c
+  rollout. C5.5b implements the retained LPAC native containment path and C5.5c
+  implements the exact Windows AMD64 Coding canary; every unlisted Windows or
+  Product route remains closed and Current remains the default.
+- [PLC9C Third-Party Local Worker Admission Candidate](plugin-lifecycle-plc9c-third-party-admission.md)
+  records the remaining selected-Wheel, Product decision, native containment,
+  recovery, and authoring gates. It grants no new Worker route.
+- [Plugin Authoring Guide](plugin-authoring-guide.md) documents the minimum
+  stable Provider, Skill package, validation, and developer-conformance flows.
+- [PAP4 Capability Admission Contract](plugin-capability-admission-pap4-contract.md)
+  freezes exact Capability-owner admission and Product Provider selection.
+- [Phase 5B Continuity Provider Foundation](continuity-provider-phase5b-contract.md)
+  freezes portable read-only Provider contracts, Product lifecycle bridging,
+  and the handoff requirements for later Plugin admission.
+- [Phase 5C Continuity Provider Plugin Lifecycle](continuity-provider-phase5c-contract.md)
+  implements the installed-Plugin declaration, exact owner-component
+  lifecycle, sealed process composition, revocation linearization, durable
+  recovery barrier, and Package cleanup handoff.
+- [Phase 5D Continuity Mutation Foundation](continuity-mutation-phase5d-contract.md)
+  implements exact deletion proposals, opaque Product authorization evidence,
+  cancellation-safe settlement, and the lifecycle handoff required before an
+  installed Plugin may expose mutation.
+- [Phase 5E Installed Continuity Mutation Lifecycle](continuity-mutation-phase5e-contract.md)
+  implements the durable Product deletion journal, generation-gated installed
+  Provider adapter, startup recovery barrier, and explicit Coding binding.
+- [Phase 5F Continuity Production Composition and Operations](continuity-production-phase5f-contract.md)
+  binds that lifecycle to real Coding configuration, `--resume`, TUI stable
+  references, canonical machine state, recovery diagnostics, retry, and
+  process-owned shutdown.
+- [RCP5 Resource Catalog Skill Convergence](resource-catalog-rcp5-contract.md)
+  freezes the conservative, exact-generation typed Skill Consumer and the
+  ordered deletion of legacy Skill/Resource peer authority. Its first slice is
+  internal and does not authorize Product cutover.
+
+These contracts refine the architecture only inside their stated versions and
+implemented slices. The implemented public SDK, managed Skill actions, and
+explicit Worker canaries grant no unstated author/runtime authority; an
+unimplemented general Worker authoring path or `remote_service` shape cannot be
+inferred from them.
+The [default-route rollout decision](plugin-default-route-rollout-decision.md)
+currently holds the ordinary route while Product and platform evidence remains
+incomplete.
+
+## Baselines
+
+- [PLC0 Baseline](plugin-lifecycle-plc0-baseline.md)
+- [PLC1A Baseline](plugin-lifecycle-plc1a-baseline.md)
+- [PLC9.0 Baseline](plugin-lifecycle-plc9-baseline.md)
+- [PLC9.0 Owner And Peer Inventory](plugin-lifecycle-plc9-inventory.md)
+- [PLC9C5 C5.0 Current Product/Native Worker Inventory](plugin-lifecycle-plc9c5-c50-inventory.md)
+- [Resource Catalog RCP0 Baseline](resource-catalog-rcp0-baseline.md)
+
+Baselines freeze source and authority facts required by later contracts. Review
+discussion and acceptance evidence belong to issue `#502`, its delivery PR,
+and Git history; they are not maintained as parallel architecture documents.
+
+## Runtime Boundaries That Remain Outside This Directory
+
+Plugin contributions must integrate with these existing authorities rather
+than reimplement them:
+
+- [Capability Dependency And Mount Lifecycle](../capability-dependency-and-mount-lifecycle.md)
+- [Product Capability Composition Core](../product-capability-composition-core.md)
+- [Capability Variation And Replacement](../capability-variation-and-replacement-boundary.md)
+- [Extension And Resource Generation Lifecycle](../extension-generation-lifecycle-boundary.md)
+- [Extension Runtime Core](../extension-runtime-core-boundary.md)
+- [Contribution Inventory](../contribution-inventory-boundary.md)
+- [Effective Runtime Diagnostics](../effective-runtime-diagnostics-boundary.md)
+- [Runtime Provenance](../runtime-provenance-boundary.md)
+- [Capability Catalog](../capability-catalog.md)
+- [Current Owner Map](../current-owner-map.md)
+- [OEM Extension Architecture](../oem-extension-architecture.md)
+- [Process Hosting Boundary](../process-hosting-boundary.md)
+- [Sandbox Runtime Boundary](../sandbox-runtime-boundary.md)
+
+They remain outside `plugin/` because their primary reason to change is their
+own runtime domain. Moving them here would make Plugin appear to own the Graph,
+Resource generations, process mechanics, or containment.
+
+## Superseded Decisions
+
+Superseded ARDs may remain in their owning domain as explicitly historical
+decision records. Retired drafts, dated replacement designs, and review
+transcripts are recovered from Git/issue history rather than kept as searchable
+competitors. New Plugin work starts here and follows the exact owner documents
+above.
+
+## Placement Rule
+
+Place a document in this directory when its primary subject is Plugin identity,
+manifest/declaration, desired state, Plugin execution trust, authoring, Plugin
+Instance lifecycle, or Plugin-to-owner admission. Keep a document with its
+domain owner when Plugin is only one consumer of that boundary.
+
+New documents must declare:
+
+- whether they are architecture, an incremental contract, a delivery plan, or
+  a baseline;
+- current versus target implementation status;
+- the sole writer for every new state;
+- the architecture or owner boundary they refine; and
+- which earlier document, if any, they supersede.

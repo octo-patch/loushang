@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from loushang.harnesstui.status.identity import session_display_label
 from loushang.tui import StatusField
 
 StatusLineAutoValue = Literal["auto", "true", "false"]
@@ -22,6 +23,7 @@ class StatusLineSettings:
     runtime: bool = True
     queue: StatusLineAutoValue = "auto"
     message: StatusLineAutoValue = "auto"
+    context: StatusLineAutoValue = "auto"
     separator: StatusLineSeparator = "pipe"
     style: StatusLineStyle = "codex-like"
 
@@ -37,6 +39,8 @@ class StatusLinePreviewSnapshot:
     pending_followups: int = 0
     pending_steers: int = 0
     status_message: str | None = None
+    context_usage: object | None = None
+    session_id: str | None = None
 
 
 def status_line_fields(
@@ -45,17 +49,29 @@ def status_line_fields(
 ) -> tuple[StatusField, ...]:
     fields: list[StatusField] = []
     if settings.model:
-        fields.append(StatusField(snapshot.model_label or "model", priority=100, token="model"))
+        fields.append(
+            StatusField(
+                _status_line_model_label(snapshot.model_label),
+                priority=100,
+                token="model",
+            )
+        )
     if settings.workspace:
         fields.append(StatusField(cwd_label(snapshot.cwd), priority=90, token="workspace"))
     if settings.branch:
         fields.append(StatusField(snapshot.branch or "no-branch", priority=80, token="branch"))
     if settings.session:
-        fields.append(StatusField(snapshot.session_label or "no-session", priority=70, token="session"))
+        fields.append(
+            StatusField(
+                session_display_label(snapshot.session_label, snapshot.session_id),
+                priority=70,
+                token="session",
+            )
+        )
     if settings.permissions:
         fields.append(
             StatusField(
-                f"perm={snapshot.permission_profile or 'standard'}",
+                snapshot.permission_profile or "standard",
                 priority=35,
                 token="permissions",
             )
@@ -74,6 +90,9 @@ def status_line_fields(
         )
     if _show_auto_field(settings.message, bool(snapshot.status_message)):
         fields.append(StatusField(snapshot.status_message or "no status", priority=40, token="message"))
+    if _show_auto_field(settings.context, snapshot.context_usage is not None):
+        context_text, context_token = _context_status(snapshot.context_usage)
+        fields.append(StatusField(context_text, priority=30, token=context_token))
     return tuple(fields)
 
 
@@ -105,6 +124,7 @@ def status_line_settings_from_control(settings: object | None) -> StatusLineSett
         runtime=bool(_setting_value(settings, "runtime", defaults.runtime)),
         queue=cast(StatusLineAutoValue, _setting_value(settings, "queue", defaults.queue)),
         message=cast(StatusLineAutoValue, _setting_value(settings, "message", defaults.message)),
+        context=cast(StatusLineAutoValue, _setting_value(settings, "context", defaults.context)),
         separator=cast(StatusLineSeparator, _setting_value(settings, "separator", defaults.separator)),
         style=cast(StatusLineStyle, _setting_value(settings, "style", defaults.style)),
     )
@@ -121,6 +141,7 @@ def status_line_settings_to_patch(settings: StatusLineSettings) -> dict[str, obj
         "runtime": settings.runtime,
         "queue": settings.queue,
         "message": settings.message,
+        "context": settings.context,
         "separator": settings.separator,
         "style": settings.style,
     }
@@ -130,6 +151,15 @@ def cwd_label(cwd: str) -> str:
     if not cwd:
         return "cwd"
     return cwd.rstrip("/").rsplit("/", 1)[-1] or cwd
+
+
+def _status_line_model_label(model_label: str | None) -> str:
+    if not model_label:
+        return "model"
+    identity = model_label.split(":", 2)
+    if len(identity) == 3 and all(identity):
+        return identity[2]
+    return model_label
 
 
 def _setting_value(settings: object, key: str, default: object) -> object:
@@ -144,6 +174,47 @@ def _show_auto_field(value: StatusLineAutoValue, has_data: bool) -> bool:
     if value == "false":
         return False
     return has_data
+
+
+def _context_status(value: object | None) -> tuple[str, str]:
+    percent = _usage_value(value, "percent")
+    source = _usage_value(value, "source")
+    accuracy = _usage_value(value, "accuracy")
+    envelope_status = _usage_value(
+        value, "structural_envelope_status", "structuralEnvelopeStatus"
+    )
+    stale = _usage_value(value, "stale_after_compaction", "staleAfterCompaction") is True
+    if isinstance(percent, bool) or not isinstance(percent, int | float):
+        return "ctx ?", "context.unknown"
+    remaining = max(0, min(100, round(100 - float(percent))))
+    if stale:
+        return f"{remaining}% left stale", "context.stale"
+    if isinstance(envelope_status, str) and envelope_status in {
+        "mismatched",
+        "logical_mismatch",
+    }:
+        return f"{remaining}% left changed", "context.estimated"
+    if accuracy is None and source == "assistant_usage":
+        return f"{remaining}% left", "context.measured"
+    if (
+        (not isinstance(accuracy, str) or accuracy not in {"projected", "estimated", "unknown"})
+        and source == "assistant_usage"
+    ):
+        return f"{remaining}% left", "context.measured"
+    return f"{remaining}% left", "context.estimated"
+
+
+def _usage_value(value: object | None, *names: str) -> object:
+    if isinstance(value, Mapping):
+        for name in names:
+            if name in value:
+                return value[name]
+        return None
+    for name in names:
+        candidate = getattr(value, name, None)
+        if candidate is not None:
+            return candidate
+    return None
 
 
 __all__ = [

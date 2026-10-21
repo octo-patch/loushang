@@ -4,27 +4,27 @@ from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 from loushang.agent.types import AgentToolResult, TextPart
-from loushang.harness.approval import ApprovalResolver
+from loushang.harness.tools.authoring import (
+    FilesystemActionAdapter,
+    ToolContext,
+    authorized_tool,
+    tool,
+)
 from loushang.harness.workspace.mutation_queue import with_file_mutation_queue
 from loushang.harness.workspace.operations import EditOperations, resolve_operation
 
-from .authoring import tool
-from .authorization import execute_workspace_tool_action
 from .builtin_renderers import render_edit_call, render_edit_result
-from .context import ToolContext, context_approval_resolver
 from .edit_diff import (
     EditEntry,
     apply_text_edits,
     build_unified_diff,
     first_changed_line,
 )
-from .normalize import tool_to_definition
 from .operations import (
     normalize_edit_operations,
     raise_if_operation_aborted,
 )
 from .path_utils import resolve_tool_path
-from .policy import ToolPolicyEvaluator
 from .runtime import prepare_tool_arguments
 from .types import ToolDefinition
 
@@ -47,31 +47,25 @@ class EditToolDetails(TypedDict, total=False):
 @dataclass(frozen=True)
 class EditToolOptions:
     operations: EditOperations | None = None
-    policy_engine: ToolPolicyEvaluator | None = None
-    approval_resolver: ApprovalResolver | None = None
 
 
 def create_edit_tool_definition(
     *,
     operations: EditOperations | None = None,
-    policy_engine: ToolPolicyEvaluator | None = None,
-    approval_resolver: ApprovalResolver | None = None,
     options: EditToolOptions | None = None,
 ) -> ToolDefinition:
-    ops = normalize_edit_operations(
-        operations or (options.operations if options is not None else None)
+    selected_operations = operations or (
+        options.operations if options is not None else None
     )
-    resolved_policy_engine = policy_engine or (
-        options.policy_engine if options is not None else None
-    )
-    resolved_approval_resolver = approval_resolver or (
-        options.approval_resolver if options is not None else None
-    )
+    ops = normalize_edit_operations(selected_operations)
 
     @tool(
         name="edit",
         label="Edit",
-        description="Apply exact text replacements to a file in the workspace.",
+        description=(
+            "Apply exact text replacements to a workspace file. JSON arguments: "
+            '{"path":"file","edits":[{"oldText":"before","newText":"after"}]}.'
+        ),
         prompt_snippet="- edit: Apply exact text replacements to a file in the workspace.",
     )
     async def edit(
@@ -82,39 +76,38 @@ def create_edit_tool_definition(
     ) -> AgentToolResult[dict[str, Any]]:
         resolved = resolve_tool_path(path, cwd=ctx.cwd)
         validated_edits = _validate_edits(edits)
+        active_operations = (
+            normalize_edit_operations(
+                ctx.operation_binding
+                if ctx.operation_binding is not None
+                else ops
+            )
+            if selected_operations is None
+            else ops
+        )
 
         async def execute_edit(_action: object) -> tuple[str, str]:
             raise_if_operation_aborted(ctx.signal)
             async with with_file_mutation_queue(str(resolved)):
-                original = await _read_existing_text(resolved, operations=ops)
+                original = await _read_existing_text(
+                    resolved,
+                    operations=active_operations,
+                )
                 raise_if_operation_aborted(ctx.signal)
                 updated = apply_text_edits(
                     original,
                     validated_edits,
                     path=str(resolved),
                 )
-                await _write_exact_text(resolved, updated, operations=ops)
+                await _write_exact_text(
+                    resolved,
+                    updated,
+                    operations=active_operations,
+                )
                 raise_if_operation_aborted(ctx.signal)
             return original, updated
 
-        original, updated = await execute_workspace_tool_action(
-            resolved_policy_engine,
-            tool_name="edit",
-            arguments={"path": str(resolved), "edits": validated_edits},
-            executor=execute_edit,
-            cwd=ctx.cwd,
-            approval_resolver=context_approval_resolver(
-                ctx,
-                resolved_approval_resolver,
-            ),
-            tool_call_id=ctx.tool_call_id,
-            audit_sink=ctx.event_sink,
-            execution_profile_ceiling=getattr(
-                ctx.exec_service,
-                "execution_profile",
-                None,
-            ),
-        )
+        original, updated = await execute_edit(None)
         diff = build_unified_diff(str(resolved), original, updated)
         return AgentToolResult(
             content=[
@@ -131,10 +124,17 @@ def create_edit_tool_definition(
         )
 
     return replace(
-        tool_to_definition(edit),
+        authorized_tool(
+            edit,
+            action=FilesystemActionAdapter(
+                "write",
+                authorization_fields=("edits",),
+            ),
+        ),
         prepare_arguments=_prepare_edit_arguments,
         render_call=render_edit_call,
         render_result=render_edit_result,
+        operation_binding_key="edit_operations",
     )
 
 

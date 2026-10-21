@@ -22,12 +22,14 @@ def test_retry_coordinator_owns_backoff_and_success_waiter() -> None:
     outcomes: list[RetryOutcome] = []
     continued: list[str] = []
     delays: list[int] = []
-    coordinator = _coordinator(attempts, outcomes, continued, delays)
+    coordinator = _coordinator(attempts, outcomes, delays)
 
     async def scenario() -> None:
         assert await coordinator.retry("busy", policy=RetryPolicy(True, 3, 25)) is True
+        coordinator.continue_retry(lambda: _append(continued, "continue"))
         await asyncio.sleep(0)
         assert await coordinator.retry("busy", policy=RetryPolicy(True, 3, 25)) is True
+        coordinator.continue_retry(lambda: _append(continued, "continue"))
         await asyncio.sleep(0)
         await coordinator.finish(RetryOutcome(success=True, attempt=2))
         await coordinator.wait()
@@ -57,7 +59,6 @@ def test_retry_coordinator_cancels_pending_delay_and_resolves_waiter() -> None:
         create_cancel_handle=CancelHandle,
         cancel=lambda handle: setattr(handle, "cancelled", True),
         delay=blocking_delay,
-        continue_run=_noop,
         on_started=lambda attempt: _append(attempts, attempt),
         on_finished=lambda outcome: _append(outcomes, outcome),
     )
@@ -89,7 +90,6 @@ def test_retry_coordinator_rejects_reentry_and_reports_exhaustion() -> None:
         create_cancel_handle=CancelHandle,
         cancel=lambda handle: setattr(handle, "cancelled", True),
         delay=delay,
-        continue_run=_noop,
         on_started=lambda attempt: _noop(),
         on_finished=lambda outcome: _append(outcomes, outcome),
     )
@@ -121,7 +121,6 @@ def test_retry_coordinator_cleans_up_when_a_driver_fails() -> None:
         create_cancel_handle=CancelHandle,
         cancel=lambda handle: setattr(handle, "cancelled", True),
         delay=lambda delay_ms, handle: _noop(),
-        continue_run=_noop,
         on_started=fail_started,
         on_finished=lambda outcome: _noop(),
     )
@@ -147,13 +146,13 @@ def test_retry_coordinator_observes_deferred_continuation_failure() -> None:
         create_cancel_handle=CancelHandle,
         cancel=lambda handle: setattr(handle, "cancelled", True),
         delay=lambda delay_ms, handle: _noop(),
-        continue_run=fail_continue,
         on_started=lambda attempt: _noop(),
         on_finished=lambda outcome: _append(outcomes, outcome),
     )
 
     async def scenario() -> None:
         assert await coordinator.retry("busy", policy=RetryPolicy(True, 1, 1))
+        coordinator.continue_retry(fail_continue)
         await coordinator.wait()
 
     asyncio.run(scenario())
@@ -171,7 +170,6 @@ def test_retry_coordinator_observes_deferred_continuation_failure() -> None:
 def _coordinator(
     attempts: list[RetryAttempt],
     outcomes: list[RetryOutcome],
-    continued: list[str],
     delays: list[int],
 ) -> RetryCoordinator[CancelHandle]:
     async def delay(delay_ms: int, handle: CancelHandle) -> None:
@@ -182,7 +180,6 @@ def _coordinator(
         create_cancel_handle=CancelHandle,
         cancel=lambda handle: setattr(handle, "cancelled", True),
         delay=delay,
-        continue_run=lambda: _append(continued, "continue"),
         on_started=lambda attempt: _append(attempts, attempt),
         on_finished=lambda outcome: _append(outcomes, outcome),
     )
@@ -194,3 +191,44 @@ async def _append(values: list, value: object) -> None:
 
 async def _noop() -> None:
     return None
+
+
+def test_settlement_joins_cancelled_continuation_cleanup_after_waiter_reset() -> None:
+    async def scenario() -> None:
+        coordinator = _coordinator([], [], [])
+        entered, cleaning, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        completed = []
+
+        async def continuation() -> None:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+                completed.append("cleanup")
+
+        await coordinator.retry("busy", policy=RetryPolicy(True, 1, 0))
+        task = coordinator.continue_retry(continuation)
+        await entered.wait()
+        await coordinator.finish(RetryOutcome(success=False, attempt=1, cancelled=True))
+        await coordinator.wait()
+        await cleaning.wait()
+        assert not task.done()
+        settling = asyncio.Event()
+
+        async def settle() -> None:
+            settling.set()
+            await coordinator.settle(cancel_pending=True)
+
+        waiter = asyncio.create_task(settle())
+        try:
+            await settling.wait()
+            assert not waiter.done()
+            assert task.cancelling() == 1
+        finally:
+            release.set()
+            await waiter
+        assert completed == ["cleanup"]
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))

@@ -20,9 +20,7 @@ def test_permissions_surface_selects_scoped_modes_and_confirms_full_access() -> 
 
     rendered = "\n".join(
         line.text
-        for line in view.render(
-            RenderConstraints(width=90, max_height=24)
-        ).lines
+        for line in view.render(RenderConstraints(width=90, max_height=24)).lines
     )
     assert "Standard (current)" in rendered
     assert "Cautious" in rendered
@@ -45,15 +43,32 @@ def test_permissions_surface_selects_scoped_modes_and_confirms_full_access() -> 
     )
     confirmation = "\n".join(
         line.text
-        for line in view.render(
-            RenderConstraints(width=90, max_height=24)
-        ).lines
+        for line in view.render(RenderConstraints(width=90, max_height=24)).lines
     )
     assert "Enable Full Access?" in confirmation
     assert "Managed denies" in confirmation
+    assert "this session now and save as the project default" in confirmation
     assert view.handle_input(InputEvent(kind="key", key="enter")) == InputIntent(
         kind="permission_profile_action",
         text="set-profile:project:full_access",
+    )
+
+
+def test_saving_full_as_user_default_confirms_even_when_session_is_already_full():
+    view = build_permissions_surface_view(
+        ApprovalPermissionsSnapshot(),
+        profile_snapshot=permission_profile_snapshot("full_access"),
+    )
+    view.handle_input(InputEvent(kind="text", text="u"))
+    assert view.handle_input(InputEvent(kind="key", key="enter")) == InputIntent(
+        kind="consumed", note="permission_confirmation",
+    )
+    rendered = "\n".join(
+        line.text for line in view.render(RenderConstraints(width=90, max_height=24)).lines
+    )
+    assert "this session now and save as the user default" in rendered
+    assert view.handle_input(InputEvent(kind="key", key="enter")) == InputIntent(
+        kind="permission_profile_action", text="set-profile:user:full_access",
     )
 
 
@@ -76,9 +91,7 @@ def test_permissions_surface_disables_modes_above_managed_ceiling() -> None:
     )
     rendered = "\n".join(
         line.text
-        for line in view.render(
-            RenderConstraints(width=90, max_height=24)
-        ).lines
+        for line in view.render(RenderConstraints(width=90, max_height=24)).lines
     )
     assert "Managed by your organization." in rendered
 
@@ -173,6 +186,4 @@ def test_permissions_surface_identifies_child_incarnations() -> None:
         )
     )
 
-    assert view.content.items[0].description == (
-        "/root/reviewer#2 · Publish a release"
-    )
+    assert view.content.items[0].description == ("/root/reviewer#2 · Publish a release")

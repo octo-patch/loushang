@@ -2,12 +2,24 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from typing import Any, Protocol, cast
 
 from loushang.harness.permissions import (
     PermissionProfileScope,
     PermissionProfileSnapshot,
     permission_profile_snapshot,
 )
+
+
+class SessionSettingsSnapshotPort(Protocol):
+    @property
+    def compaction(self) -> object: ...
+
+
+class SessionSettingsManagerPort(Protocol):
+    def get_settings(self) -> SessionSettingsSnapshotPort: ...
+
+    def get_retry_settings(self) -> object: ...
 
 
 @dataclass
@@ -19,8 +31,8 @@ class SessionSettingsBinding:
     facade import Product config types.
     """
 
-    settings_manager: object | None = None
-    create_settings_manager: Callable[[], object] | None = None
+    settings_manager: SessionSettingsManagerPort | None = None
+    create_settings_manager: Callable[[], SessionSettingsManagerPort] | None = None
     default_compaction: Callable[[], object] = lambda: _empty_settings(
         "compaction"
     )
@@ -30,12 +42,24 @@ class SessionSettingsBinding:
     get_follow_up_mode_callback: Callable[[], str] | None = None
     set_follow_up_mode_callback: Callable[[str], None] | None = None
 
-    def get_settings_manager(self) -> object | None:
+    def get_settings_manager(self) -> SessionSettingsManagerPort | None:
         return self.settings_manager
 
     def get_compaction_settings(self) -> object:
         if self.settings_manager is None:
             return self.default_compaction()
+        return getattr(self.settings_manager.get_settings(), "compaction")
+
+    def get_compaction_policy_override(self) -> object | None:
+        """Return the bound Product's field-level policy overrides.
+
+        Compaction setting fields use ``None`` to inherit from the runtime
+        capability, so a default settings manager does not shadow Product or
+        OEM policy values.
+        """
+
+        if self.settings_manager is None:
+            return None
         return getattr(self.settings_manager.get_settings(), "compaction")
 
     def get_retry_settings(self) -> object:
@@ -76,7 +100,7 @@ class SessionSettingsBinding:
             )
         setter(profile_id, scope=scope)
 
-    def ensure_settings_manager(self) -> object:
+    def ensure_settings_manager(self) -> SessionSettingsManagerPort:
         if self.settings_manager is None:
             if self.create_settings_manager is None:
                 raise RuntimeError("A settings manager factory is not configured.")
@@ -90,15 +114,15 @@ class SessionSettingsBinding:
     def set_auto_retry_enabled(self, enabled: bool) -> None:
         getattr(self.ensure_settings_manager(), "set_retry_enabled")(enabled)
 
-    @property
-    def auto_compaction_enabled(self) -> bool:
-        return bool(getattr(self.get_compaction_settings(), "enabled", False))
-
     def set_auto_compaction_enabled(self, enabled: bool) -> None:
         manager = self.ensure_settings_manager()
+        current = self.get_compaction_settings()
         getattr(manager, "update_settings")(
             scope="session",
-            compaction=replace(self.get_compaction_settings(), enabled=enabled),
+            compaction=replace(
+                cast(Any, current),
+                enabled=enabled,
+            ),
         )
 
     def persist_queue_mode(self, kind: str, mode: str) -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, NotRequired, TypedDict
 
-from loushang.protocol import JSONValue
+from loushang.foundation.json import JSONValue
 
 
 class UsageCost(TypedDict):
@@ -22,6 +22,24 @@ class Usage:
     cache_write: int
     total_tokens: int
     cost: UsageCost | None
+
+    @property
+    def uncached_input_tokens(self) -> int:
+        """Return the input tokens that were not served from or written to cache."""
+
+        return self.input
+
+    @property
+    def total_input_tokens(self) -> int:
+        """Return all input tokens across uncached, cache-read, and cache-write buckets."""
+
+        return self.input + self.cache_read + self.cache_write
+
+    @property
+    def computed_total_tokens(self) -> int:
+        """Return the sum of the normalized, disjoint usage components."""
+
+        return self.total_input_tokens + self.output
 
 
 @dataclass(frozen=True)
@@ -61,6 +79,7 @@ class AssistantMessage:
     content: list[TextPart | ThinkingPart | ToolCall | ImagePart]
     api: str
     provider: str
+    endpoint: str
     model: str
     response_id: str | None
     usage: Usage
@@ -68,6 +87,14 @@ class AssistantMessage:
     error_message: str | None
     timestamp: float
     response_model: str | None = None
+    error_info: dict[str, JSONValue] | None = None
+
+    def __post_init__(self) -> None:
+        for field_name in ("api", "provider", "endpoint", "model"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"AssistantMessage.{field_name} must be non-empty")
+            object.__setattr__(self, field_name, value.strip())
 
 
 @dataclass(frozen=True)

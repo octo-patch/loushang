@@ -1,0 +1,281 @@
+"""Foreground connection lifetime, independent of application construction."""
+
+from __future__ import annotations
+
+import asyncio
+
+from .client import AppClientV1, SessionDiscoveryClientV1
+from .dispatch import dispatch_request
+from .execution.client import ExecutionClientV1
+from .execution.codec import EXECUTION_PROTOCOL_VERSION, decode_call
+from .execution.codec import encode_response as encode_execution_response
+from .execution.dispatch import dispatch_execution
+from .execution.model import (
+    ExecutionCallV1,
+    ExecutionFailureV1,
+    ExecutionOperationV1,
+    ExecutionResponseV1,
+    ExecutionResultV1,
+    ExecutionServiceErrorV1,
+)
+from .framing import (
+    AppConnectionClosedError,
+    AppConnectionEOFError,
+    AppMessageStreamV1,
+    require_timeout,
+)
+from .managed_mux import ManagedMuxCreationClientV1
+from .managed_mux_close import ManagedMuxCloseClientV1
+from .managed_mux_wire import (
+    MANAGED_MUX_CLOSE_PROTOCOL_VERSION,
+    MANAGED_MUX_PROTOCOL_VERSION,
+    ManagedMuxCallV1,
+    ManagedMuxCloseCallV1,
+    ManagedMuxCloseResponseV1,
+    ManagedMuxResponseV1,
+    decode_close_call,
+    encode_close_response,
+)
+from .managed_mux_wire import decode_call as decode_managed_call
+from .managed_mux_wire import encode_response as encode_managed_response
+from .protocol import (
+    AppErrorCodeV1,
+    AppFailureV1,
+    AppRequestV1,
+    AppResponseV1,
+    AppResultPayloadV1,
+    AppServiceError,
+    InvalidAppMessageError,
+    decode_request,
+    encode_response,
+)
+from .protocol.codec import _loads
+from .protocol.connection_profile import (
+    AppConnectionProfileV1,
+    connection_hello,
+    require_profile_operation,
+    supports_execution,
+    supports_managed_mux,
+    supports_managed_mux_close,
+    supports_resume_input_lookup,
+)
+from .protocol.stdio_profile import (
+    CONTROL_OPERATIONS,
+    MAX_CONTROL_REQUESTS,
+    MAX_ORDINARY_REQUESTS,
+    connection_request_number,
+)
+
+
+class AppServerConnectionV1:
+    """Own request tasks and IO, never the injected service/application."""
+
+    def __init__(
+        self,
+        client: AppClientV1,
+        stream: AppMessageStreamV1,
+        *,
+        phase_timeout: float = 10.0,
+        profile: AppConnectionProfileV1 = AppConnectionProfileV1.STDIO,
+        discovery: SessionDiscoveryClientV1 | None = None,
+        execution: ExecutionClientV1 | None = None,
+        managed_mux: ManagedMuxCreationClientV1 | None = None,
+        managed_mux_close: ManagedMuxCloseClientV1 | None = None,
+    ) -> None:
+        require_timeout(phase_timeout)
+        if supports_execution(profile):
+            if execution is None:
+                raise ValueError("execution profile requires an explicit capability")
+            self._hello = connection_hello(profile, service_instance_id=execution.service_instance_id)
+        elif execution is not None:
+            raise ValueError("execution capability requires its profile")
+        else:
+            self._hello = connection_hello(profile)
+        self._execution = execution
+        if supports_managed_mux(profile) != (managed_mux is not None):
+            raise ValueError("managed profile requires its explicit capability")
+        self._managed_mux = managed_mux
+        if supports_managed_mux_close(profile) != (managed_mux_close is not None):
+            raise ValueError("close profile requires its explicit capability")
+        self._managed_mux_close = managed_mux_close
+        self._profile = profile
+        self._discovery = discovery
+        self._client = client
+        self._stream = stream
+        self._timeout = phase_timeout
+        self._tasks: set[asyncio.Task[None]] = set()
+        self._receiver: asyncio.Task[None] | None = None
+        self._fault: asyncio.Future[None] | None = None
+        self._counts = {False: 0, True: 0}
+        self._last_id = 0
+        self._started = False
+        self._closed = False
+        self._close_lock = asyncio.Lock()
+
+    async def serve(self) -> None:
+        if self._started or self._closed:
+            raise AppConnectionClosedError()
+        self._started = True
+        self._fault = asyncio.get_running_loop().create_future()
+        try:
+            async with asyncio.timeout(self._timeout):
+                await self._stream.send(self._hello)
+                if await self._stream.receive() != self._hello:
+                    raise InvalidAppMessageError()
+            self._receiver = asyncio.create_task(self._receive_requests())
+            completed, _ = await asyncio.wait(
+                {self._receiver, self._fault}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if self._fault in completed:
+                raise AppConnectionClosedError()
+            await self._receiver
+        except TimeoutError:
+            raise AppConnectionClosedError() from None
+        finally:
+            await self.close()
+
+    async def _receive_requests(self) -> None:
+        while not self._closed:
+            try:
+                payload = await self._stream.receive()
+            except AppConnectionEOFError:
+                return
+            version = _loads(payload).get("protocolVersion") if (
+                self._execution is not None or self._managed_mux is not None
+            ) else None
+            request = (
+                decode_close_call(payload)
+                if self._managed_mux_close is not None and version == MANAGED_MUX_CLOSE_PROTOCOL_VERSION
+                else
+                decode_managed_call(payload)
+                if self._managed_mux is not None and version == MANAGED_MUX_PROTOCOL_VERSION
+                else decode_call(payload)
+                if self._execution is not None and version == EXECUTION_PROTOCOL_VERSION
+                else decode_request(payload)
+            )
+            number = connection_request_number(request.request_id)
+            if number <= self._last_id:
+                raise InvalidAppMessageError()
+            self._last_id = number
+            control = request.operation in CONTROL_OPERATIONS or request.operation in {
+                ExecutionOperationV1.INTERRUPT, ExecutionOperationV1.GET, ExecutionOperationV1.FIND,
+                ExecutionOperationV1.RESUME_INPUT_LOOKUP,
+            } or isinstance(request, ManagedMuxCloseCallV1) and request.read_result
+            maximum = MAX_CONTROL_REQUESTS if control else MAX_ORDINARY_REQUESTS
+            if self._counts[control] >= maximum:
+                await self._stream.send(
+                    encode_close_response(ManagedMuxCloseResponseV1(
+                        request.request_id, AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+                    )) if isinstance(request, ManagedMuxCloseCallV1) else
+                    encode_managed_response(ManagedMuxResponseV1(
+                        request.request_id, AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+                    )) if isinstance(request, ManagedMuxCallV1) else encode_execution_response(ExecutionResponseV1(
+                        request.request_id, AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+                    )) if isinstance(request, ExecutionCallV1) else encode_response(
+                        AppResponseV1(
+                            request.request_id,
+                            AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE),
+                        )
+                    )
+                )
+                continue
+            self._counts[control] += 1
+            task = asyncio.create_task(self._execute(request, control=control))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _execute(self, request: AppRequestV1 | ExecutionCallV1 | ManagedMuxCallV1 | ManagedMuxCloseCallV1, *, control: bool) -> None:
+        try:
+            if isinstance(request, ManagedMuxCloseCallV1):
+                await self._execute_managed_close(request)
+                return
+            if isinstance(request, ManagedMuxCallV1):
+                await self._execute_managed(request)
+                return
+            if isinstance(request, ExecutionCallV1):
+                await self._execute_execution(request)
+                return
+            try:
+                require_profile_operation(self._profile, request.operation)
+                result: AppResultPayloadV1 = await dispatch_request(
+                    self._client, request, discovery=self._discovery
+                )
+            except AppServiceError as error:
+                result = AppFailureV1(error.code)
+            except Exception:
+                result = AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+            await self._stream.send(
+                encode_response(AppResponseV1(request.request_id, result))
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self._fault is not None and not self._fault.done():
+                self._fault.set_result(None)
+        finally:
+            self._counts[control] -= 1
+
+    async def _execute_managed_close(self, request: ManagedMuxCloseCallV1) -> None:
+        assert self._managed_mux_close is not None
+        try:
+            result = (await self._managed_mux_close.read_managed_mux_close(request.request) if request.read_result
+                      else await self._managed_mux_close.close_managed_mux(request.request))
+            if result is None and not request.read_result:
+                raise AppServiceError(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+            response = ManagedMuxCloseResponseV1(request.request_id, result)
+        except AppServiceError as error:
+            response = ManagedMuxCloseResponseV1(request.request_id, AppFailureV1(error.code))
+        except Exception:
+            response = ManagedMuxCloseResponseV1(request.request_id, AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE))
+        await self._stream.send(encode_close_response(response))
+
+    async def _execute_managed(self, request: ManagedMuxCallV1) -> None:
+        assert self._managed_mux is not None
+        try:
+            result = await self._managed_mux.create_managed_mux(request.request)
+            response = ManagedMuxResponseV1(request.request_id, result)
+        except AppServiceError as error:
+            response = ManagedMuxResponseV1(request.request_id, AppFailureV1(error.code))
+        except Exception:
+            response = ManagedMuxResponseV1(request.request_id, AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE))
+        await self._stream.send(encode_managed_response(response))
+
+    async def _execute_execution(self, request: ExecutionCallV1) -> None:
+        assert self._execution is not None
+        result: ExecutionResultV1
+        try:
+            if (
+                request.operation is ExecutionOperationV1.RESUME_INPUT_LOOKUP
+                and not supports_resume_input_lookup(self._profile)
+            ):
+                raise AppServiceError(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+            result = await dispatch_execution(self._execution, request)
+        except ExecutionServiceErrorV1 as error:
+            result = ExecutionFailureV1(error.code)
+        except AppServiceError as error:
+            result = AppFailureV1(error.code)
+        except Exception:
+            result = AppFailureV1(AppErrorCodeV1.OPERATION_UNAVAILABLE)
+        await self._stream.send(encode_execution_response(ExecutionResponseV1(request.request_id, result)))
+
+    async def close(self) -> None:
+        async with self._close_lock:
+            self._closed = True
+            tasks = set(self._tasks)
+            if self._receiver is not None:
+                tasks.add(self._receiver)
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            pending: set[asyncio.Task[None]] = set()
+            if tasks:
+                done, pending = await asyncio.wait(tasks, timeout=self._timeout)
+                for task in done:
+                    if not task.cancelled():
+                        task.exception()
+            await self._stream.close()
+            if pending:
+                raise AppServiceError(AppErrorCodeV1.CLEANUP_INCOMPLETE)
+
+
+__all__ = ["AppServerConnectionV1"]

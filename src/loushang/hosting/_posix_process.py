@@ -1,0 +1,682 @@
+"""Private POSIX process-group backend for Hosting."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import signal
+import subprocess
+from collections.abc import Callable
+from contextlib import suppress
+from typing import TYPE_CHECKING, Protocol, cast
+
+from ._launch_preparation import _ManagedSpawnEffect
+from ._process_backend import _ProcessInheritance, _ProcessTransport
+from .contracts import (
+    ProcessLaunchRequest,
+    ProcessStderrMode,
+    ProcessStdinMode,
+    ProcessStdoutMode,
+)
+from .errors import HostingError, HostingFailureCategory
+from .service import LinuxServiceIdentityV1, LinuxServiceObserverV1
+from .service_group import LinuxServiceGroupObservationV1
+
+if TYPE_CHECKING:
+    from ._posix_launch_preparation import _PosixStaticLaunchMaterial
+
+_TREE_POLL_SECONDS = 0.01
+_FAILED_ATTACHMENT_SETTLEMENT_SECONDS = 1.0
+_SIGTERM = cast(signal.Signals, getattr(signal, "SIGTERM", 15))
+_SIGKILL = cast(signal.Signals, getattr(signal, "SIGKILL", 9))
+
+
+class _PosixChildProcess(Protocol):
+    """Owned child identity; returncode is set only after this child is reaped.
+
+    Both the asyncio transport and optional synchronous service launcher supply
+    this seam. A pidfd exit observation alone cannot implement returncode: an
+    exited but unreaped leader is not evidence that its numeric PID was reused.
+    """
+
+    @property
+    def pid(self) -> int: ...
+
+    @property
+    def returncode(self) -> int | None: ...
+
+    @property
+    def stdin(self) -> asyncio.StreamWriter | None: ...
+
+    @property
+    def stdout(self) -> asyncio.StreamReader | None: ...
+
+    @property
+    def stderr(self) -> asyncio.StreamReader | None: ...
+
+
+class _GatedPosixChild:
+    """Synchronous Popen child retained until its native identity is captured."""
+
+    stdin = stdout = None
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        self._process = process
+        self.stderr: asyncio.StreamReader | None = None
+        self._stderr_transport: asyncio.ReadTransport | None = None
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.poll()
+
+    async def attach_stderr(self) -> None:
+        pipe = self._process.stderr
+        if pipe is None:
+            return
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        transport, _ = await asyncio.get_running_loop().connect_read_pipe(
+            lambda: protocol, pipe
+        )
+        self.stderr = reader
+        self._stderr_transport = transport
+
+    def close_handles(self) -> None:
+        if self._stderr_transport is not None:
+            self._stderr_transport.close()
+        if self._process.stderr is not None:
+            self._process.stderr.close()
+
+
+class _PosixProcess:
+    def __init__(
+        self,
+        process: _PosixChildProcess,
+        *,
+        native_identity: LinuxServiceIdentityV1 | None = None,
+        start_gate_identity: tuple[int, int] | None = None,
+    ) -> None:
+        process_group_id = process.pid
+        if type(process_group_id) is not int or process_group_id <= 0:
+            raise RuntimeError("POSIX process has no valid process-group identity")
+        self._process = process
+        self._process_group_id = process_group_id
+        self._native_identity = native_identity
+        self._start_gate_identity = start_gate_identity
+        self._stdin_closed = False
+        self._handles_closed = False
+        self._group_settled = False
+        self._close_lock = asyncio.Lock()
+
+    @property
+    def return_code(self) -> int | None:
+        return self._process.returncode
+
+    @property
+    def native_identity(self) -> LinuxServiceIdentityV1 | None:
+        return self._native_identity
+
+    @property
+    def start_gate_identity(self) -> tuple[int, int] | None:
+        return self._start_gate_identity
+
+    def _attach_native_identity(self, identity: LinuxServiceIdentityV1) -> None:
+        if self._native_identity is not None or type(identity) is not LinuxServiceIdentityV1:
+            raise RuntimeError("POSIX native process identity is already attached")
+        self._native_identity = identity
+
+    async def read_stdout(self, max_bytes: int) -> bytes:
+        reader = self._process.stdout
+        if reader is None:
+            return b""
+        return await reader.read(max_bytes)
+
+    async def read_stderr(self, max_bytes: int) -> bytes:
+        reader = self._process.stderr
+        if reader is None:
+            return b""
+        return await reader.read(max_bytes)
+
+    async def write_stdin(self, data: bytes) -> None:
+        writer = self._process.stdin
+        if writer is None or self._stdin_closed:
+            raise BrokenPipeError("POSIX process stdin is closed")
+        writer.write(data)
+        await writer.drain()
+
+    async def close_stdin(self) -> None:
+        if self._stdin_closed:
+            return
+        self._stdin_closed = True
+        writer = self._process.stdin
+        if writer is None:
+            return
+        writer.close()
+
+    async def wait(self) -> int:
+        # ``asyncio.subprocess.Process.wait()`` may remain pending after the
+        # root has exited while a descendant still owns one of the pipe write
+        # ends.  Hosting must observe the root exit independently so it can
+        # start reclaiming that descendant tree instead of waiting for pipe
+        # EOF.  The child watcher updates ``returncode`` when the root is
+        # reaped, independently of pipe transport settlement.
+        while self._process.returncode is None:
+            await asyncio.sleep(_TREE_POLL_SECONDS)
+        return self._process.returncode
+
+    def group_exists(self) -> bool:
+        if self._group_settled:
+            return False
+        if self._root_identity_was_reused():
+            self._group_settled = True
+            return False
+        try:
+            _kill_process_group(self._process_group_id, 0)
+        except ProcessLookupError:
+            self._group_settled = True
+            return False
+        except PermissionError:
+            # Signal zero reports existence separately from permission.  A
+            # denied probe therefore proves that the group is still live; the
+            # subsequent real signal remains responsible for surfacing any
+            # inability to terminate it.
+            return True
+        return True
+
+    def signal_group(self, group_signal: signal.Signals) -> None:
+        if not self.group_exists():
+            return
+        try:
+            _kill_process_group(self._process_group_id, group_signal)
+        except ProcessLookupError:
+            self._group_settled = True
+            return
+
+    def _root_identity_was_reused(self) -> bool:
+        if self._process.returncode is None:
+            return False
+        getpgid = getattr(os, "getpgid", None)
+        if not callable(getpgid):
+            raise HostingError(
+                HostingFailureCategory.PLATFORM_UNSUPPORTED,
+                "POSIX process identity inspection is unavailable",
+            )
+        try:
+            getpgid(self._process_group_id)
+        except ProcessLookupError:
+            return False
+        # POSIX does not reuse this numeric PID while the original process
+        # group still exists. A live process at the reaped leader's PID proves
+        # that the original group has already settled; never signal the reuse.
+        return True
+
+    async def wait_group(self) -> None:
+        while self.group_exists():
+            await asyncio.sleep(_TREE_POLL_SECONDS)
+
+    async def close_handles(self) -> None:
+        async with self._close_lock:
+            if self._handles_closed:
+                return
+            self._handles_closed = True
+            await self.close_stdin()
+            for reader in (self._process.stdout, self._process.stderr):
+                _close_reader_transport(reader)
+            transport = getattr(self._process, "_transport", None)
+            close = getattr(transport, "close", None)
+            if callable(close):
+                close()
+            native_close = getattr(self._process, "close_handles", None)
+            if callable(native_close):
+                native_close()
+
+
+class _PosixProcessBackend:
+    backend_id = "posix-process-group-v1"
+
+    def __init__(self) -> None:
+        if (
+            os.name != "posix"
+            or not callable(getattr(os, "setsid", None))
+            or not callable(getattr(os, "killpg", None))
+            or not callable(getattr(asyncio, "create_subprocess_exec", None))
+        ):
+            raise HostingError(
+                HostingFailureCategory.PLATFORM_UNSUPPORTED,
+                "POSIX process groups are unavailable",
+            )
+
+    async def spawn(
+        self,
+        request: ProcessLaunchRequest,
+        *,
+        on_spawn: Callable[[_ProcessTransport], None],
+        inheritance: _ProcessInheritance | None = None,
+    ) -> _PosixProcess:
+        if inheritance is not None and (
+            request.streams.stdin is not ProcessStdinMode.CLOSED
+            or request.streams.stdout is not ProcessStdoutMode.DISCARD
+        ):
+            raise HostingError(
+                HostingFailureCategory.ENDPOINT_TRANSFER_FAILED,
+                "inherited endpoints reserve child stdin and stdout",
+            )
+        endpoint_descriptors = _claim_endpoint(inheritance, self.backend_id)
+        operation = (
+            self._spawn_once(request)
+            if endpoint_descriptors is None
+            else self._spawn_once(request, endpoint_descriptors)
+        )
+        spawn_task = asyncio.create_task(
+            operation,
+            name="hosting-posix-process-spawn",
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while True:
+            try:
+                process = await asyncio.shield(spawn_task)
+                break
+            except asyncio.CancelledError as exc:
+                if spawn_task.cancelled():
+                    raise
+                if cancellation is None:
+                    cancellation = exc
+            except BaseException as exc:
+                if cancellation is not None:
+                    raise cancellation from exc
+                raise
+
+        try:
+            if inheritance is not None:
+                inheritance.mark_transferred()
+            on_spawn(process)
+        except BaseException as primary:
+            try:
+                await self._reclaim_failed_attachment(process)
+            except BaseException as cleanup:
+                primary.add_note(f"POSIX spawn attachment cleanup also failed: {cleanup}")
+                raise primary from cleanup
+            raise
+        if cancellation is not None:
+            raise cancellation
+        return process
+
+    async def _spawn_once(
+        self,
+        request: ProcessLaunchRequest,
+        endpoint_descriptors: tuple[int, int] | None = None,
+        *,
+        argv: tuple[str, ...] | None = None,
+        executable: str | None = None,
+        cwd: str | None = None,
+        pass_fds: tuple[int, ...] = (),
+    ) -> _PosixProcess:
+        if endpoint_descriptors is None:
+            stdin: int = (
+                asyncio.subprocess.PIPE
+                if request.streams.stdin is ProcessStdinMode.PIPE
+                else subprocess.DEVNULL
+            )
+            stdout: int = (
+                asyncio.subprocess.PIPE
+                if request.streams.stdout is ProcessStdoutMode.PIPE
+                else subprocess.DEVNULL
+            )
+        else:
+            stdin, stdout = endpoint_descriptors
+        # The high-level asyncio operation spans native creation and transport /
+        # child-watcher setup.  An exception from it cannot certify which stage
+        # failed, so this backend deliberately does not mint a
+        # settled-without-process receipt.  Once the effect gate is crossed,
+        # every such failure remains fenced.
+        process = await asyncio.create_subprocess_exec(
+            *(request.argv if argv is None else argv),
+            executable=executable,
+            cwd=request.cwd if cwd is None else cwd,
+            env=dict(request.effective_environment),
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=pass_fds,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=(
+                asyncio.subprocess.PIPE
+                if request.streams.stderr
+                in {ProcessStderrMode.PIPE, ProcessStderrMode.CAPTURE_TAIL}
+                else subprocess.DEVNULL
+            ),
+        )
+        try:
+            return _PosixProcess(process)
+        except BaseException:
+            process.kill()
+            await process.wait()
+            raise
+
+    async def _spawn_static_prepared(
+        self,
+        material: "_PosixStaticLaunchMaterial",
+        request: ProcessLaunchRequest,
+        *,
+        effect: _ManagedSpawnEffect,
+        on_spawn: Callable[[_ProcessTransport], None],
+        inheritance: _ProcessInheritance | None,
+    ) -> _PosixProcess:
+        from ._posix_launch_preparation import _PosixStaticLaunchMaterial
+
+        if type(material) is not _PosixStaticLaunchMaterial:
+            raise effect.not_created(
+                HostingError(
+                    HostingFailureCategory.PREPARATION_FAILED,
+                    "POSIX process backend requires static launch material",
+                )
+            )
+        if request != material.request:
+            raise effect.not_created(
+                HostingError(
+                    HostingFailureCategory.PREPARATION_FAILED,
+                    "POSIX static launch request changed before spawn",
+                )
+            )
+        if inheritance is None:
+            raise effect.not_created(
+                HostingError(
+                    HostingFailureCategory.ENDPOINT_TRANSFER_FAILED,
+                    "POSIX static child launch requires endpoint inheritance",
+                )
+            )
+        if (
+            request.streams.stdin is not ProcessStdinMode.CLOSED
+            or request.streams.stdout is not ProcessStdoutMode.DISCARD
+        ):
+            raise effect.not_created(
+                HostingError(
+                    HostingFailureCategory.ENDPOINT_TRANSFER_FAILED,
+                    "POSIX static inherited endpoint reserves stdin and stdout",
+                )
+            )
+        endpoint_descriptors = _claim_endpoint(inheritance, self.backend_id)
+        assert endpoint_descriptors is not None
+        (
+            executable_descriptor,
+            cwd_descriptor,
+            launcher_descriptor,
+            start_gate_descriptor,
+        ) = material._claim_descriptors()
+        preparation_descriptors = tuple(
+            descriptor
+            for descriptor in (
+                executable_descriptor,
+                cwd_descriptor,
+                launcher_descriptor,
+                start_gate_descriptor,
+            )
+            if descriptor is not None
+        )
+        if (
+            len(set(preparation_descriptors)) != len(preparation_descriptors)
+            or set(endpoint_descriptors) & set(preparation_descriptors)
+            or any(
+                descriptor < 3
+                for descriptor in (*endpoint_descriptors, *preparation_descriptors)
+            )
+        ):
+            raise effect.not_created(
+                HostingError(
+                    HostingFailureCategory.ENDPOINT_TRANSFER_FAILED,
+                    "POSIX endpoint and preparation descriptors collide",
+                )
+            )
+        inherited_descriptors = tuple(
+            dict.fromkeys((*endpoint_descriptors, *preparation_descriptors))
+        )
+        argv = (
+            request.argv
+            if launcher_descriptor is None
+            else material._contained_invocation(
+                executable_descriptor=executable_descriptor,
+                cwd_descriptor=cwd_descriptor,
+                launcher_descriptor=launcher_descriptor,
+                start_gate_descriptor=start_gate_descriptor,
+            )
+        )
+        spawn_descriptor = (
+            executable_descriptor
+            if launcher_descriptor is None
+            else launcher_descriptor
+        )
+        executable = f"/proc/self/fd/{spawn_descriptor}"
+        effect.begin_effect()
+        if start_gate_descriptor is None:
+            process = await self._spawn_once(
+                request,
+                endpoint_descriptors,
+                argv=argv,
+                executable=executable,
+                cwd=f"/proc/self/fd/{cwd_descriptor}",
+                pass_fds=inherited_descriptors,
+            )
+            on_spawn(process)
+        else:
+            process, child = self._spawn_gated_once(
+                request,
+                endpoint_descriptors,
+                argv=argv,
+                executable=executable,
+                cwd=f"/proc/self/fd/{cwd_descriptor}",
+                pass_fds=inherited_descriptors,
+                start_gate_identity=material.start_gate_identity,
+            )
+            observer: LinuxServiceObserverV1 | None = None
+            try:
+                observer = LinuxServiceObserverV1.capture(child.pid)
+                LinuxServiceGroupObservationV1(observer).admit()
+            except BaseException as primary:
+                if observer is not None:
+                    try:
+                        observer.close()
+                    except BaseException as cleanup:
+                        on_spawn(process)
+                        primary.add_note(
+                            f"POSIX gated observer cleanup also failed: {cleanup}"
+                        )
+                        raise primary from cleanup
+                try:
+                    self._settle_gated_unattached(child._process)
+                except BaseException as cleanup:
+                    on_spawn(process)
+                    primary.add_note(
+                        f"POSIX gated capture cleanup also failed: {cleanup}"
+                    )
+                    raise primary from cleanup
+                raise effect.settled_without_process(primary)
+            try:
+                identity = observer.identity
+                observer.close()
+            except BaseException:
+                on_spawn(process)
+                raise
+            process._attach_native_identity(identity)
+            try:
+                on_spawn(process)
+            except BaseException as primary:
+                try:
+                    await self._reclaim_failed_attachment(process)
+                except BaseException as cleanup:
+                    primary.add_note(
+                        f"POSIX gated attachment cleanup also failed: {cleanup}"
+                    )
+                    raise primary from cleanup
+                raise
+            await child.attach_stderr()
+        inheritance.mark_transferred()
+        material._mark_transferred()
+        return process
+
+    def _spawn_gated_once(
+        self,
+        request: ProcessLaunchRequest,
+        endpoint_descriptors: tuple[int, int],
+        *,
+        argv: tuple[str, ...],
+        executable: str,
+        cwd: str,
+        pass_fds: tuple[int, ...],
+        start_gate_identity: tuple[int, int] | None,
+    ) -> tuple[_PosixProcess, _GatedPosixChild]:
+        # Popen has no asynchronous child watcher. Capture the direct child
+        # before this owner calls poll(), so a reaped PID cannot be reused.
+        raw = subprocess.Popen(
+            argv,
+            executable=executable,
+            cwd=cwd,
+            env=dict(request.effective_environment),
+            start_new_session=True,
+            close_fds=True,
+            pass_fds=pass_fds,
+            stdin=endpoint_descriptors[0],
+            stdout=endpoint_descriptors[1],
+            stderr=(
+                subprocess.PIPE
+                if request.streams.stderr
+                in {ProcessStderrMode.PIPE, ProcessStderrMode.CAPTURE_TAIL}
+                else subprocess.DEVNULL
+            ),
+            bufsize=0,
+        )
+        try:
+            child = _GatedPosixChild(raw)
+            if start_gate_identity is None:
+                raise RuntimeError("POSIX gated launch has no captured pipe identity")
+            return _PosixProcess(
+                child, start_gate_identity=start_gate_identity
+            ), child
+        except BaseException:
+            raw.kill()
+            raw.wait()
+            if raw.stderr is not None:
+                raw.stderr.close()
+            raise
+
+    def _settle_gated_unattached(self, raw: subprocess.Popen[bytes]) -> None:
+        # No asyncio child watcher owns this Popen. The v2 launch remains
+        # blocked by the caller-held gate while this bounded cleanup runs.
+        with suppress(ProcessLookupError):
+            _kill_process_group(raw.pid, _SIGKILL)
+        raw.wait(timeout=_FAILED_ATTACHMENT_SETTLEMENT_SECONDS)
+        try:
+            _kill_process_group(raw.pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            raise HostingError(
+                HostingFailureCategory.CLEANUP_FAILED,
+                "POSIX gated process group did not settle",
+            )
+        if raw.stderr is not None:
+            raw.stderr.close()
+
+    def tree_exited(self, process: _ProcessTransport) -> bool:
+        return not _require_posix_process(process).group_exists()
+
+    async def wait_tree(self, process: _ProcessTransport) -> None:
+        await _require_posix_process(process).wait_group()
+
+    async def terminate_tree(self, process: _ProcessTransport) -> None:
+        _require_posix_process(process).signal_group(_SIGTERM)
+
+    async def kill_tree(self, process: _ProcessTransport) -> None:
+        _require_posix_process(process).signal_group(_SIGKILL)
+
+    async def close_process_handles(self, process: _ProcessTransport) -> None:
+        owned = _require_posix_process(process)
+        failures: list[BaseException] = []
+        try:
+            if owned.group_exists():
+                owned.signal_group(_SIGKILL)
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            await owned.close_handles()
+        except BaseException as exc:
+            failures.append(exc)
+        if failures:
+            raise BaseExceptionGroup("POSIX process final cleanup failed", failures)
+
+    async def close_backend(self) -> None:
+        return
+
+    async def _reclaim_failed_attachment(self, process: _PosixProcess) -> None:
+        failures: list[BaseException] = []
+        try:
+            process.signal_group(_SIGKILL)
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            await process.wait()
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            await asyncio.wait_for(
+                process.wait_group(), _FAILED_ATTACHMENT_SETTLEMENT_SECONDS
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            await process.close_handles()
+        except BaseException as exc:
+            failures.append(exc)
+        if failures:
+            raise BaseExceptionGroup(
+                "POSIX spawn attachment cleanup failed", failures
+            )
+
+
+def _require_posix_process(process: _ProcessTransport) -> _PosixProcess:
+    if not isinstance(process, _PosixProcess):
+        raise TypeError("POSIX backend requires its own process transport")
+    return process
+
+
+def _kill_process_group(
+    process_group_id: int,
+    group_signal: int | signal.Signals,
+) -> None:
+    killpg = getattr(os, "killpg", None)
+    if not callable(killpg):
+        raise HostingError(
+            HostingFailureCategory.PLATFORM_UNSUPPORTED,
+            "POSIX process-group signaling is unavailable",
+        )
+    killpg(process_group_id, group_signal)
+
+
+def _claim_endpoint(
+    inheritance: _ProcessInheritance | None,
+    backend_id: str,
+) -> tuple[int, int] | None:
+    if inheritance is None:
+        return None
+    values = inheritance.claim(backend_id=backend_id)
+    if len(values) != 2 or any(type(value) is not int or value < 0 for value in values):
+        raise HostingError(
+            HostingFailureCategory.ENDPOINT_TRANSFER_FAILED,
+            "POSIX endpoint inheritance must contain stdin and stdout descriptors",
+        )
+    return values[0], values[1]
+
+
+def _close_reader_transport(reader: object | None) -> None:
+    if reader is None:
+        return
+    transport = getattr(reader, "_transport", None)
+    close = getattr(transport, "close", None)
+    if callable(close):
+        close()
+
+
+__all__: list[str] = []

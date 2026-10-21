@@ -3,7 +3,10 @@ from __future__ import annotations
 from io import StringIO
 from typing import Literal
 
+import pytest
+
 from loushang.tui.input import InputEvent
+from loushang.tui.terminal_backends import NativeTerminalPlatform
 from loushang.tui.terminal_capabilities import TerminalRuntimeCapabilities
 from loushang.tui.terminal_image import CellDimensions
 from loushang.tui.terminal_session import TerminalSession
@@ -22,7 +25,11 @@ def test_terminal_session_uses_context_manager_mode_factory() -> None:
     mode = _RecordingMode()
     stdout = StringIO()
 
-    with TerminalSession(stdin=StringIO(), stdout=stdout, mode_factory=lambda _stdin, _stdout, _capabilities: mode):
+    with TerminalSession(
+        stdin=StringIO(),
+        stdout=stdout,
+        mode_factory=lambda _stdin, _stdout, _capabilities: mode,
+    ):
         assert mode.entered == 1
 
     assert mode.exited == 1
@@ -30,7 +37,11 @@ def test_terminal_session_uses_context_manager_mode_factory() -> None:
 
 def test_terminal_session_cleanup_is_idempotent() -> None:
     mode = _RecordingMode()
-    session = TerminalSession(stdin=StringIO(), stdout=StringIO(), mode_factory=lambda _stdin, _stdout, _capabilities: mode)
+    session = TerminalSession(
+        stdin=StringIO(),
+        stdout=StringIO(),
+        mode_factory=lambda _stdin, _stdout, _capabilities: mode,
+    )
 
     session.__enter__()
     session.__exit__(None, None, None)
@@ -40,12 +51,92 @@ def test_terminal_session_cleanup_is_idempotent() -> None:
     assert mode.exited == 1
 
 
+@pytest.mark.parametrize("phase", ["startup", "shutdown", "drain", "mode_exit"])
+def test_terminal_session_fault_does_not_skip_remaining_native_restoration(phase):
+    class Output(StringIO):
+        broken = False
+
+        def write(self, text):
+            if self.broken or (phase == "startup" and "\x1b[16t" in text):
+                raise OSError("terminal output unavailable")
+            return super().write(text)
+
+    class Mode(_RecordingMode):
+        def __exit__(self, *args):
+            super().__exit__(*args)
+            if phase == "mode_exit":
+                raise OSError("mode exit failed")
+            return False
+
+    def drain(*args, **kwargs):
+        if phase == "drain":
+            raise OSError("drain failed")
+        return ""
+
+    output, mode, console = Output(), Mode(), _RecordingConsoleMode()
+    session = TerminalSession(
+        stdin=StringIO(),
+        stdout=output,
+        capabilities=TerminalRuntimeCapabilities(
+            windows_vt_input=True,
+            alternate_screen=True,
+            query_cell_size=True,
+            keyboard_protocol_strategy="kitty_then_modify_other_keys",
+            mouse_selection_owner="application",
+        ),
+        mode_factory=lambda *args: mode,
+        drain_input_func=drain,
+        native_platform=NativeTerminalPlatform(
+            console_mode=console,
+            modifier_keys=_RecordingModifierKeys(shift_pressed=False),
+        ),
+    )
+    with pytest.raises(OSError):
+        with session:
+            output.broken = phase == "shutdown"
+    assert mode.exited == 1
+    assert console.calls[-2:] == ["disable_input", "disable_output"]
+    session.__exit__(None, None, None)
+    assert mode.exited == 1
+
+
+def test_terminal_session_partial_alternate_screen_write_restores_output_mode():
+    class Output(StringIO):
+        def write(self, text):
+            if "\x1b[?1049h" in text:
+                raise OSError("partial alternate screen write")
+            return super().write(text)
+
+    output, mode, console = Output(), _RecordingMode(), _RecordingConsoleMode()
+    session = TerminalSession(
+        stdin=StringIO(),
+        stdout=output,
+        capabilities=TerminalRuntimeCapabilities(
+            windows_vt_input=True, alternate_screen=True
+        ),
+        mode_factory=lambda *args: mode,
+        native_platform=NativeTerminalPlatform(
+            console_mode=console,
+            modifier_keys=_RecordingModifierKeys(shift_pressed=False),
+        ),
+    )
+    with pytest.raises(OSError):
+        session.__enter__()
+    assert mode.entered == mode.exited == 0
+    assert console.calls == ["enable_output", "disable_output"]
+    assert "\x1b[?1049l" in output.getvalue()
+
+
 def test_terminal_session_owns_exit_drain_after_runtime_protocol_cleanup() -> None:
     stdout = StringIO()
     calls: list[str] = []
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
-    def drain(_stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float) -> str:
+    def drain(
+        _stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float
+    ) -> str:
         calls.append(f"drain:{max_bytes}:{idle_timeout}:{max_duration}")
         return "late-release"
 
@@ -53,11 +144,15 @@ def test_terminal_session_owns_exit_drain_after_runtime_protocol_cleanup() -> No
         stdin=StringIO("late-release"),
         stdout=stdout,
         capabilities=capabilities,
-        mode_factory=lambda _stdin, _stdout, _capabilities: _WritingMode(_stdout, calls),
+        mode_factory=lambda _stdin, _stdout, _capabilities: _WritingMode(
+            _stdout, calls
+        ),
         now_ms=lambda: 1_000,
         drain_input_func=drain,
     ) as session:
-        session.consume_control_events((InputEvent(kind="signal", signal="kitty_protocol", text="7"),))
+        session.consume_control_events(
+            (InputEvent(kind="signal", signal="kitty_protocol", text="7"),)
+        )
 
     output = stdout.getvalue()
     assert calls == ["mode:enter", "drain:4096:0.05:1.0", "mode:exit"]
@@ -68,9 +163,13 @@ def test_terminal_session_disables_modify_other_keys_before_exit_drain() -> None
     stdout = StringIO()
     drain_observations: list[bool] = []
     now = _FakeClock(1_000)
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
-    def drain(_stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float) -> str:
+    def drain(
+        _stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float
+    ) -> str:
         del max_bytes, idle_timeout, max_duration
         drain_observations.append("\x1b[>4;0m" in stdout.getvalue())
         return ""
@@ -139,14 +238,18 @@ def test_terminal_session_skips_cell_size_query_when_capability_disabled() -> No
 def test_terminal_session_consumes_cell_size_control_event() -> None:
     session = TerminalSession(stdin=StringIO(), stdout=StringIO())
 
-    session.consume_control_events((InputEvent(kind="signal", signal="cell_size", text="18;9"),))
+    session.consume_control_events(
+        (InputEvent(kind="signal", signal="cell_size", text="18;9"),)
+    )
 
     assert session.cell_size == CellDimensions(width_px=9, height_px=18)
 
 
 def test_terminal_session_starts_keyboard_protocol_without_immediate_fallback() -> None:
     stdout = StringIO()
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
     with TerminalSession(
         stdin=StringIO(),
@@ -162,9 +265,13 @@ def test_terminal_session_starts_keyboard_protocol_without_immediate_fallback() 
     assert "\x1b[>4;2m" not in output
 
 
-def test_terminal_session_consumes_kitty_protocol_response_and_disables_kitty_on_exit() -> None:
+def test_terminal_session_consumes_kitty_protocol_response_and_disables_kitty_on_exit() -> (
+    None
+):
     stdout = StringIO()
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
     with TerminalSession(
         stdin=StringIO(),
@@ -173,7 +280,9 @@ def test_terminal_session_consumes_kitty_protocol_response_and_disables_kitty_on
         mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
         now_ms=lambda: 1_000,
     ) as session:
-        session.consume_control_events((InputEvent(kind="signal", signal="kitty_protocol", text="7"),))
+        session.consume_control_events(
+            (InputEvent(kind="signal", signal="kitty_protocol", text="7"),)
+        )
 
     output = stdout.getvalue()
     assert "\x1b[?u" in output
@@ -182,10 +291,14 @@ def test_terminal_session_consumes_kitty_protocol_response_and_disables_kitty_on
     assert "\x1b[>4;0m" not in output
 
 
-def test_terminal_session_falls_back_to_modify_other_keys_after_deadline_and_disables_it_on_exit() -> None:
+def test_terminal_session_falls_back_to_modify_other_keys_after_deadline_and_disables_it_on_exit() -> (
+    None
+):
     stdout = StringIO()
     now = _FakeClock(1_000)
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
     with TerminalSession(
         stdin=StringIO(),
@@ -205,9 +318,11 @@ def test_terminal_session_falls_back_to_modify_other_keys_after_deadline_and_dis
     assert "\x1b[<u" not in output
 
 
-def test_terminal_session_enables_and_disables_mouse_mode_when_capability_enabled() -> None:
+def test_terminal_session_enables_mouse_tracking_when_application_owns_selection() -> (
+    None
+):
     stdout = StringIO()
-    capabilities = TerminalRuntimeCapabilities(enable_mouse=True)
+    capabilities = TerminalRuntimeCapabilities(mouse_selection_owner="application")
 
     with TerminalSession(
         stdin=StringIO(),
@@ -224,12 +339,72 @@ def test_terminal_session_enables_and_disables_mouse_mode_when_capability_enable
     assert "\x1b[?1002l" in output
 
 
+def test_terminal_session_rejects_late_osc52_write() -> None:
+    stdout = StringIO()
+    session = TerminalSession(
+        stdin=StringIO(),
+        stdout=stdout,
+        mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
+    )
+
+    assert not session.write_control_if_active("\x1b]52;c;YWJj\x07")
+    with session:
+        assert session.write_control_if_active("\x1b]52;c;YWJj\x07")
+    assert not session.write_control_if_active("\x1b]52;c;YWJj\x07")
+    assert stdout.getvalue().count("\x1b]52;c;YWJj\x07") == 1
+
+
+def test_terminal_session_does_not_capture_mouse_when_windows_vt_input_fails() -> None:
+    class RejectedInput(_RecordingConsoleMode):
+        def enable_vt_input(self, stdin, *, preserve_native_selection=False):
+            del stdin, preserve_native_selection
+            return False
+
+    stdout = StringIO()
+    session = TerminalSession(
+        stdin=StringIO(),
+        stdout=stdout,
+        capabilities=TerminalRuntimeCapabilities(
+            windows_vt_input=True, mouse_selection_owner="application"
+        ),
+        mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
+        native_platform=NativeTerminalPlatform(
+            console_mode=RejectedInput(),
+            modifier_keys=_RecordingModifierKeys(shift_pressed=False),
+        ),
+    )
+
+    with session:
+        assert not session.diagnostics().mouse_mode_active
+    assert "\x1b[?1002h" not in stdout.getvalue()
+
+
+def test_terminal_session_preserves_legacy_enable_mouse_compatibility() -> None:
+    stdout = StringIO()
+
+    with TerminalSession(
+        stdin=StringIO(),
+        stdout=stdout,
+        capabilities=TerminalRuntimeCapabilities(enable_mouse=True),
+        mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
+    ):
+        pass
+
+    assert all(
+        sequence in stdout.getvalue()
+        for sequence in ("\x1b[?1000h", "\x1b[?1002h", "\x1b[?1006h")
+    )
+    assert "\x1b[?1000l" in stdout.getvalue()
+
+
 def test_terminal_session_disables_mouse_mode_before_exit_drain() -> None:
     stdout = StringIO()
     drain_observations: list[bool] = []
     capabilities = TerminalRuntimeCapabilities(enable_mouse=True)
 
-    def drain(_stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float) -> str:
+    def drain(
+        _stdin: object, *, max_bytes: int, idle_timeout: float, max_duration: float
+    ) -> str:
         del max_bytes, idle_timeout, max_duration
         drain_observations.append("\x1b[?1006l\x1b[?1002l" in stdout.getvalue())
         return ""
@@ -248,21 +423,22 @@ def test_terminal_session_disables_mouse_mode_before_exit_drain() -> None:
 
 def test_terminal_session_keeps_mouse_mode_off_by_default() -> None:
     stdout = StringIO()
-    capabilities = TerminalRuntimeCapabilities(enable_mouse=False)
+    capabilities = TerminalRuntimeCapabilities()
 
     with TerminalSession(
         stdin=StringIO(),
         stdout=stdout,
         capabilities=capabilities,
         mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
-    ):
-        pass
+    ) as session:
+        diagnostics = session.diagnostics()
 
     output = stdout.getvalue()
     assert "\x1b[?1002h" not in output
     assert "\x1b[?1006h" not in output
     assert "\x1b[?1006l" not in output
     assert "\x1b[?1002l" not in output
+    assert diagnostics.mouse_selection_owner == "terminal"
 
 
 def test_terminal_session_diagnostics_report_runtime_state() -> None:
@@ -299,6 +475,7 @@ def test_terminal_session_diagnostics_report_runtime_state() -> None:
 
     assert diagnostics.keyboard_protocol_state == "kitty"
     assert diagnostics.mouse_mode_active is True
+    assert diagnostics.mouse_selection_owner == "application"
     assert diagnostics.cell_size == CellDimensions(width_px=9, height_px=18)
     assert diagnostics.image_protocol == "kitty"
     assert diagnostics.alternate_screen is True
@@ -318,7 +495,9 @@ def test_terminal_session_diagnostics_report_runtime_state() -> None:
 
 def test_terminal_session_diagnostics_report_modify_other_keys_fallback() -> None:
     now = _FakeClock(1_000)
-    capabilities = TerminalRuntimeCapabilities(keyboard_protocol_strategy="kitty_then_modify_other_keys")
+    capabilities = TerminalRuntimeCapabilities(
+        keyboard_protocol_strategy="kitty_then_modify_other_keys"
+    )
 
     with TerminalSession(
         stdin=StringIO(),
@@ -335,7 +514,9 @@ def test_terminal_session_diagnostics_report_modify_other_keys_fallback() -> Non
     assert diagnostics.mouse_mode_active is False
 
 
-def test_terminal_session_enables_and_disables_windows_vt_input_when_adapter_accepts() -> None:
+def test_terminal_session_enables_and_disables_windows_vt_input_when_adapter_accepts() -> (
+    None
+):
     platform = _RecordingPlatformAdapter(windows_enabled=True)
     capabilities = TerminalRuntimeCapabilities(windows_vt_input=True)
 
@@ -357,9 +538,13 @@ def test_terminal_session_enables_and_disables_windows_vt_input_when_adapter_acc
     ]
 
 
-def test_terminal_session_reports_windows_vt_input_inactive_when_adapter_declines() -> None:
+def test_terminal_session_reports_windows_vt_input_inactive_when_adapter_declines() -> (
+    None
+):
     platform = _RecordingPlatformAdapter(windows_enabled=False)
-    capabilities = TerminalRuntimeCapabilities(windows_vt_input=True)
+    capabilities = TerminalRuntimeCapabilities(
+        windows_vt_input=True, mouse_selection_owner="application"
+    )
 
     with TerminalSession(
         stdin=StringIO(),
@@ -369,11 +554,14 @@ def test_terminal_session_reports_windows_vt_input_inactive_when_adapter_decline
         platform_adapter=platform,
     ) as session:
         assert session.diagnostics().windows_vt_input is False
+        assert session.diagnostics().mouse_selection_owner == "terminal"
 
     assert platform.calls == ["enable_windows_vt_output", "enable_windows_vt_input"]
 
 
-def test_terminal_session_restores_windows_console_mode_when_vt_input_declines() -> None:
+def test_terminal_session_restores_windows_console_mode_when_vt_input_declines() -> (
+    None
+):
     platform = _RecordingPlatformAdapter(windows_enabled=False, windows_configured=True)
     capabilities = TerminalRuntimeCapabilities(windows_vt_input=True)
 
@@ -395,7 +583,9 @@ def test_terminal_session_restores_windows_console_mode_when_vt_input_declines()
     ]
 
 
-def test_terminal_session_enables_windows_vt_output_before_terminal_mode_writes() -> None:
+def test_terminal_session_enables_windows_vt_output_before_terminal_mode_writes() -> (
+    None
+):
     stdout = StringIO()
     calls: list[str] = []
     platform = _RecordingPlatformAdapter(windows_enabled=True)
@@ -419,7 +609,72 @@ def test_terminal_session_enables_windows_vt_output_before_terminal_mode_writes(
     assert calls == ["mode:enter", "mode:exit"]
 
 
-def test_terminal_session_normalizes_apple_terminal_shift_enter_before_input_parsing() -> None:
+def test_terminal_session_uses_native_ports_instead_of_legacy_platform_names() -> None:
+    console_mode = _RecordingConsoleMode()
+    modifier_keys = _RecordingModifierKeys(shift_pressed=True)
+    native_platform = NativeTerminalPlatform(
+        console_mode=console_mode,
+        modifier_keys=modifier_keys,
+    )
+    capabilities = TerminalRuntimeCapabilities(
+        windows_vt_input=True,
+        apple_terminal_normalization=True,
+    )
+
+    with TerminalSession(
+        stdin=StringIO(),
+        stdout=StringIO(),
+        capabilities=capabilities,
+        mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
+        platform_adapter=_UnexpectedPlatformAdapter(),
+        native_platform=native_platform,
+    ) as session:
+        assert session.normalize_input_chunk("\r") == "\x1b[13;2u"
+
+    assert console_mode.calls == [
+        "enable_output",
+        "enable_input:True",
+        "mode_configured",
+        "disable_input",
+        "disable_output",
+    ]
+    assert modifier_keys.calls == ["shift_pressed"]
+
+
+def test_terminal_session_releases_native_selection_when_application_owns_mouse() -> (
+    None
+):
+    console_mode = _RecordingConsoleMode()
+    native_platform = NativeTerminalPlatform(
+        console_mode=console_mode,
+        modifier_keys=_RecordingModifierKeys(shift_pressed=False),
+    )
+    capabilities = TerminalRuntimeCapabilities(
+        windows_vt_input=True,
+        mouse_selection_owner="application",
+    )
+
+    with TerminalSession(
+        stdin=StringIO(),
+        stdout=StringIO(),
+        capabilities=capabilities,
+        mode_factory=lambda _stdin, _stdout, _capabilities: _RecordingMode(),
+        native_platform=native_platform,
+    ):
+        pass
+
+    assert console_mode.calls == [
+        "enable_output",
+        "enable_input:False",
+        "mode_configured",
+        "disable_input",
+        "disable_output",
+    ]
+
+
+def test_terminal_session_normalizes_apple_terminal_shift_enter_before_input_parsing() -> (
+    None
+):
     platform = _RecordingPlatformAdapter(shift_pressed=True)
     capabilities = TerminalRuntimeCapabilities(apple_terminal_normalization=True)
     session = TerminalSession(
@@ -434,7 +689,9 @@ def test_terminal_session_normalizes_apple_terminal_shift_enter_before_input_par
     assert platform.calls == ["apple_shift_pressed"]
 
 
-def test_terminal_session_leaves_return_unchanged_when_apple_shift_is_not_pressed() -> None:
+def test_terminal_session_leaves_return_unchanged_when_apple_shift_is_not_pressed() -> (
+    None
+):
     platform = _RecordingPlatformAdapter(shift_pressed=False)
     capabilities = TerminalRuntimeCapabilities(apple_terminal_normalization=True)
     session = TerminalSession(
@@ -460,7 +717,9 @@ class _RecordingMode:
             self.calls.append("mode:enter")
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
+    def __exit__(
+        self, exc_type: object, exc: object, traceback: object
+    ) -> Literal[False]:
         del exc_type, exc, traceback
         self.exited += 1
         if self.calls is not None:
@@ -478,7 +737,9 @@ class _WritingMode(_RecordingMode):
         self.stdout.write("\x1b[?1004h")
         return self
 
-    def __exit__(self, exc_type: object, exc: object, traceback: object) -> Literal[False]:
+    def __exit__(
+        self, exc_type: object, exc: object, traceback: object
+    ) -> Literal[False]:
         self.stdout.write("\x1b[?1004l")
         return super().__exit__(exc_type, exc, traceback)
 
@@ -500,7 +761,9 @@ class _RecordingPlatformAdapter:
         shift_pressed: bool = False,
     ) -> None:
         self.windows_enabled = windows_enabled
-        self.windows_configured = windows_enabled if windows_configured is None else windows_configured
+        self.windows_configured = (
+            windows_enabled if windows_configured is None else windows_configured
+        )
         self.shift_pressed = shift_pressed
         self.calls: list[str] = []
 
@@ -532,3 +795,56 @@ class _RecordingPlatformAdapter:
     def apple_shift_pressed(self) -> bool:
         self.calls.append("apple_shift_pressed")
         return self.shift_pressed
+
+
+class _RecordingConsoleMode:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def enable_vt_input(
+        self,
+        stdin: object,
+        *,
+        preserve_native_selection: bool = False,
+    ) -> bool:
+        del stdin
+        self.calls.append(f"enable_input:{preserve_native_selection}")
+        return True
+
+    def disable_vt_input(self) -> None:
+        self.calls.append("disable_input")
+
+    def enable_vt_output(self, stdout: object) -> bool:
+        del stdout
+        self.calls.append("enable_output")
+        return True
+
+    def disable_vt_output(self) -> None:
+        self.calls.append("disable_output")
+
+    def mode_configured(self) -> bool:
+        self.calls.append("mode_configured")
+        return True
+
+    def vt_input_active(self) -> bool:
+        return True
+
+    def vt_output_active(self) -> bool:
+        return True
+
+
+class _RecordingModifierKeys:
+    def __init__(self, *, shift_pressed: bool) -> None:
+        self._shift_pressed = shift_pressed
+        self.calls: list[str] = []
+
+    def shift_pressed(self) -> bool:
+        self.calls.append("shift_pressed")
+        return self._shift_pressed
+
+
+class _UnexpectedPlatformAdapter:
+    def __getattribute__(self, name: str) -> object:
+        if name.startswith("__"):
+            return super().__getattribute__(name)
+        raise AssertionError(f"legacy platform adapter was used: {name}")

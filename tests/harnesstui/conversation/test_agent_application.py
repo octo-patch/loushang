@@ -7,6 +7,11 @@ from typing import Any, cast
 
 from loushang.ai.model import ModelSelection
 from loushang.harness.commands import CommandDescriptor
+from loushang.harness.session import (
+    SessionInputCapabilities,
+    SessionInputCapability,
+    session_operation_resolver,
+)
 from loushang.harnesstui.conversation.agent_application import (
     AgentPlainConversationApplicationBinding,
     AgentScreenConversationApplicationBinding,
@@ -85,6 +90,9 @@ def test_agent_screen_application_binding_prepares_shared_state() -> None:
     app = App()
     statuses: list[object] = []
     traces: list[tuple[str, dict[str, object]]] = []
+    def capabilities():
+        raise AssertionError("prepare must not sample live presentation eligibility")
+
     binding = AgentScreenConversationApplicationBinding(
         session=session,
         app=cast(Any, app),
@@ -101,11 +109,14 @@ def test_agent_screen_application_binding_prepares_shared_state() -> None:
         stdout=cast(Any, SimpleNamespace(write=lambda _value: None)),
         now=lambda: 1.0,
         resume_command_prefix=("research", "--resume"),
+        capability_provider=capabilities,
     )
 
     prepared = binding.prepare()
 
     assert prepared.app is app
+    assert app.state.session_id == "research-session"
+    assert prepared.capability_provider is capabilities
     assert prepared.event_source is session
     assert prepared.history_records == ()
     assert prepared.should_exit("/quit") is True
@@ -126,18 +137,68 @@ def test_agent_screen_application_binding_prepares_shared_state() -> None:
     ]
 
 
+def test_agent_screen_application_binding_projects_harness_input_capabilities() -> None:
+    session = _Session()
+
+    class App:
+        state = SimpleNamespace(running=False)
+
+        def set_statusline_settings(self, settings: object) -> None:
+            self.settings = settings
+
+    def fail_if_resolved() -> Any:
+        raise AssertionError("capability projection must not resolve a Session")
+
+    get_operations = session_operation_resolver(
+        fail_if_resolved,
+        input_capabilities=SessionInputCapabilities.from_capabilities(
+            (SessionInputCapability.FOLLOW_UP,)
+        ),
+    )
+    binding = AgentScreenConversationApplicationBinding(
+        session=session,
+        app=cast(Any, App()),
+        action_host=cast(Any, object()),
+        build_surface=lambda _status: _Surface(),
+        startup=_startup(),
+        interaction_context=cast(Any, nullcontext()),
+        profile=ConversationScreenRunProfile(
+            input_router_factory=None,
+            interruption_message="Interrupted",
+            cancellation_message="Cancelled",
+        ),
+        trace=lambda _name, **_data: None,
+        stdout=cast(Any, SimpleNamespace(write=lambda _value: None)),
+        now=lambda: 1.0,
+        get_operations=get_operations,
+    )
+
+    prepared = binding.prepare()
+
+    assert prepared.input_capabilities.steer is False
+    assert prepared.input_capabilities.follow_up is True
+
+
 def test_agent_screen_surface_ports_bind_structural_research_session() -> None:
     labels: list[str] = []
     approvals: list[dict[str, object]] = []
 
     class ResearchSession:
         def get_model_selection(self) -> ModelSelection:
-            return ModelSelection(provider="research", model_id="analyst")
+            return ModelSelection(
+                endpoint_id="test-endpoint", provider="research", model_id="analyst"
+            )
 
         def get_available_models(self) -> tuple[ModelSelection, ...]:
             return (
-                ModelSelection(provider="research", model_id="analyst"),
-                ModelSelection(provider="research", model_id="reviewer"),
+                ModelSelection(
+                    endpoint_id="test-endpoint", provider="research", model_id="analyst"
+                ),
+                ModelSelection(
+                    endpoint_id="test-endpoint",
+                    provider="research",
+                    model_id="reviewer",
+                ),
             )
 
         async def list_commands(self) -> tuple[CommandDescriptor[object], ...]:
@@ -172,12 +233,12 @@ def test_agent_screen_surface_ports_bind_structural_research_session() -> None:
     assert asyncio.run(ports.format_commands("report")) == (
         "Commands:\n/report - Build a research report (research)"
     )
-    assert "research/analyst" in asyncio.run(ports.format_models(""))
+    assert "research:test-endpoint:analyst" in asyncio.run(ports.format_models(""))
     assert asyncio.run(ports.build_model_selector()).purpose == "model"
     assert asyncio.run(ports.build_command_selector()).purpose == "command"
     assert asyncio.run(ports.build_settings_content()) == {"product": "research"}
     asyncio.run(ports.refresh_model_label())
-    assert labels == ["research/analyst"]
+    assert labels == ["research:test-endpoint:analyst"]
 
     assert ports.decide_approval is not None
     assert asyncio.run(
@@ -207,20 +268,36 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
     cleared: list[str] = []
     subscriptions: list[object] = []
 
-    class Session:
+    class Lease:
+        def __init__(self, close) -> None:
+            self._close = close
+
+        def close(self, reason: str = "closed") -> None:
+            del reason
+            self._close()
+
+    class Interaction:
         presenter: object | None = None
 
-        def set_approval_presenter(
+        def bind_presenter(
             self,
-            presenter: object | None,
+            presenter: object,
             *,
             dismisser: object | None = None,
-        ) -> None:
+        ) -> Lease:
             self.presenter = presenter
             self.dismisser = dismisser
+            return Lease(lambda: setattr(self, "presenter", None))
 
-        async def handle_screen_approval(self, event: dict[str, object]) -> bool:
-            return event.get("approved") is True
+        async def respond(
+            self,
+            action_id: str,
+            *,
+            outcome: str,
+            reason: str | None = None,
+        ) -> bool:
+            del action_id, reason
+            return outcome == "allow_once"
 
     class Surface:
         def open_approval(self, **payload: object) -> None:
@@ -245,11 +322,12 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
         def set_rebind_session(self, callback: object | None) -> None:
             self.rebind = callback
 
-    session = Session()
+    interaction = Interaction()
+    session = object()
     surface = Surface()
     runtime = Runtime(session)
     unbind_presenter = bind_agent_screen_approval_presenter(
-        session,
+        interaction,
         surface,
         default_action="Approve operation",
     )
@@ -263,8 +341,8 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
         on_rebind=on_rebind,
     )
 
-    assert callable(session.presenter)
-    session.presenter({"action_id": "approval-1"})  # type: ignore[operator]
+    assert callable(interaction.presenter)
+    interaction.presenter({"action_id": "approval-1"})  # type: ignore[operator]
     assert presented == [
         {
             "action": "Approve operation",
@@ -273,12 +351,12 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
             "cwd": "",
             "environment": "",
             "grant_summary": "",
-                "action_id": "approval-1",
-                "allow_session": False,
-                "options": (),
-            }
+            "action_id": "approval-1",
+            "allow_session": False,
+            "options": (),
+        }
     ]
-    session.presenter(  # type: ignore[operator]
+    interaction.presenter(  # type: ignore[operator]
         {
             "action_id": "approval-2",
             "actor_id": "/root/reviewer#1",
@@ -293,7 +371,12 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
     assert presented[-1]["cwd"] == "/repo"
     assert presented[-1]["environment"] == "local"
     assert presented[-1]["grant_summary"] == "Publish non-force refs to origin"
-    assert asyncio.run(handle_agent_screen_approval(session, {"approved": True}))
+    assert asyncio.run(
+        handle_agent_screen_approval(
+            interaction,
+            {"action_id": "approval-2", "approved": True},
+        )
+    )
     assert current_agent_runtime_session(runtime, object()) is session
     assert callable(subscriptions[0])
     assert runtime.rebind is on_rebind
@@ -304,7 +387,7 @@ def test_agent_screen_approval_binding_uses_structural_product_ports() -> None:
     unbind_presenter()
     assert subscriptions[-1] == "unsubscribed"
     assert runtime.rebind is None
-    assert session.presenter is None
+    assert interaction.presenter is None
 
 
 def test_refresh_agent_screen_session_replaces_history_and_event_source(
@@ -325,7 +408,9 @@ def test_refresh_agent_screen_session_replaces_history_and_event_source(
         session_manager = Manager()
 
         def get_model_selection(self) -> ModelSelection:
-            return ModelSelection(provider="openai", model_id="gpt-5.4")
+            return ModelSelection(
+                endpoint_id="test-endpoint", provider="openai", model_id="gpt-5.4"
+            )
 
     class Runtime:
         def get_cwd(self) -> str:
@@ -348,16 +433,188 @@ def test_refresh_agent_screen_session_replaces_history_and_event_source(
             runtime=Runtime(),
             app=app,
             session=session,
+            approval_interaction=None,
             event_source=event_source,
         )
     )
 
     assert event_source.source is session
     assert app.state.cwd == str(tmp_path)
-    assert app.state.model_label == "openai/gpt-5.4"
+    assert app.state.model_label == "openai:test-endpoint:gpt-5.4"
     assert app.state.session_label == "Resumed"
     assert app.state.records == []
     assert render_requests == ["product"]
+
+
+def test_agent_screen_application_binding_owns_live_session_rebinding(
+    tmp_path,
+) -> None:
+    class Manager:
+        def get_branch(self) -> tuple[object, ...]:
+            return ()
+
+        def get_cwd(self) -> str:
+            return str(tmp_path)
+
+    class Interaction:
+        def __init__(self, profile_id: str) -> None:
+            self.profile_id = profile_id
+            self.presenter: object | None = None
+
+        def permission_profile_snapshot(self) -> object:
+            return SimpleNamespace(
+                effective_profile=SimpleNamespace(profile_id=self.profile_id)
+            )
+
+        def bind_presenter(
+            self,
+            presenter: object,
+            *,
+            dismisser: object | None = None,
+        ) -> object:
+            del dismisser
+            self.presenter = presenter
+
+            def close() -> None:
+                self.presenter = None
+
+            return SimpleNamespace(close=close)
+
+    class Session:
+        settings_manager = None
+
+        def __init__(self, session_id: str, model: str, profile: str) -> None:
+            self.session_id = session_id
+            self.session_name = session_id.title()
+            self.session_manager = Manager()
+            self.model = model
+            self.approval_interaction = Interaction(profile)
+
+        def get_model_selection(self) -> ModelSelection:
+            return ModelSelection(
+                endpoint_id="test-endpoint", provider="research", model_id=self.model
+            )
+
+        def get_tool_definition(self, _name: str) -> None:
+            return None
+
+    class Runtime:
+        def __init__(self, current_session: object) -> None:
+            self.current_session = current_session
+            self.rebind: object | None = None
+
+        def get_cwd(self) -> str:
+            return str(tmp_path)
+
+        def set_rebind_session(self, callback: object | None) -> None:
+            self.rebind = callback
+
+        def subscribe_after_session_invalidate(self, _callback: object):
+            return lambda: None
+
+    class Composer:
+        completion_provider: object | None = None
+
+        def set_completion_provider(self, provider: object | None) -> None:
+            self.completion_provider = provider
+
+    class App:
+        def __init__(self) -> None:
+            self.state = SimpleNamespace(
+                running=False,
+                model_label="research/old",
+                cwd=str(tmp_path),
+                branch=None,
+                session_label="Old",
+                permission_profile="standard",
+                records=[],
+            )
+            self.composer = Composer()
+            self.errors: list[tuple[str, str]] = []
+
+        def set_statusline_settings(self, settings: object) -> None:
+            self.settings = settings
+
+        def install_resumed_history(
+            self,
+            records: tuple[object, ...],
+        ) -> None:
+            self.state.records = list(records)
+
+        def request_render(self, _kind: str) -> None:
+            return None
+
+        def add_error(self, summary: str, diagnostics: str = "") -> None:
+            self.errors.append((summary, diagnostics))
+
+    class Surface(_Surface):
+        def open_approval(self, **_payload: object) -> None:
+            return None
+
+        def dismiss_approval(self, _action_id: str) -> None:
+            return None
+
+    initial = Session("old", "analyst", "standard")
+    resumed = Session("resumed", "reviewer", "review")
+    runtime = Runtime(initial)
+    app = App()
+    event_source = RebindableEventSource(initial)
+    statuses: list[object] = []
+    loaded: list[tuple[object, str]] = []
+
+    async def load_completion(session: object, cwd: str) -> object:
+        loaded.append((session, cwd))
+        return "resumed-completions"
+
+    prepared = AgentScreenConversationApplicationBinding(
+        session=initial,
+        app=cast(Any, app),
+        action_host=cast(Any, object()),
+        build_surface=lambda status: statuses.append(status) or Surface(),
+        startup=_startup(),
+        interaction_context=cast(Any, nullcontext()),
+        profile=ConversationScreenRunProfile(
+            input_router_factory=None,
+            interruption_message="Interrupted",
+            cancellation_message="Cancelled",
+        ),
+        trace=lambda _name, **_data: None,
+        stdout=cast(Any, SimpleNamespace(write=lambda _value: None)),
+        now=lambda: 1.0,
+        session_provider=lambda: runtime.current_session,
+        approval_interaction_provider=lambda: getattr(
+            runtime.current_session,
+            "approval_interaction",
+            None,
+        ),
+        event_source=event_source,
+        runtime=runtime,
+        completion_provider_loader=load_completion,
+    ).prepare()
+
+    unbind_presenter = prepared.bind_presenter()
+    unbind_transition = prepared.bind_transition()
+    assert initial.approval_interaction.presenter is not None
+    assert callable(runtime.rebind)
+
+    runtime.current_session = resumed
+    asyncio.run(runtime.rebind(resumed))  # type: ignore[operator]
+
+    assert event_source.source is resumed
+    assert app.state.model_label == "research:test-endpoint:reviewer"
+    assert app.state.session_label == "Resumed"
+    assert app.state.permission_profile == "review"
+    assert app.composer.completion_provider == "resumed-completions"
+    assert loaded == [(resumed, str(tmp_path))]
+    assert initial.approval_interaction.presenter is None
+    assert resumed.approval_interaction.presenter is not None
+    assert statuses[0].snapshot().model_label == "research:test-endpoint:reviewer"
+    assert app.errors == []
+
+    unbind_transition()
+    unbind_presenter()
+    assert runtime.rebind is None
+    assert resumed.approval_interaction.presenter is None
 
 
 def test_agent_plain_application_binding_prepares_projection_and_header() -> None:

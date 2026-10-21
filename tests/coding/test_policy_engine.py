@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+import sys
+
+
+def _bash_tool(
+    *,
+    policy_engine=None,
+    approval_resolver=None,
+    **definition_options,
+):
+    from loushang.harness.tools.workspace import create_bash_tool_definition
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
+
+    return wrap_tool_definition(
+        create_bash_tool_definition(**definition_options),
+        policy_evaluator=policy_engine,
+        approval_resolver=approval_resolver,
+    )
+
 
 def _evaluate_action(engine, *, tool_name, exec_request):
     import os
@@ -434,7 +452,9 @@ def test_policy_engine_compatibility_paths_use_last_execution_path(tmp_path) -> 
     (tmp_path / "cat").symlink_to("/bin/bash")
     engine = PolicyEngine()
     dangerous_env = (("PATH", "/usr/bin"), ("PATH", str(tmp_path)))
-    safe_env = tuple(reversed(dangerous_env))
+    # /usr/bin/cat does not exist on macOS (cat lives in /bin); include /bin so
+    # the "safe" PATH resolves a real cat on every platform.
+    safe_env = (("PATH", str(tmp_path)), ("PATH", "/usr/bin:/bin"))
 
     action = _evaluate_action(
         engine,
@@ -714,14 +734,13 @@ def test_bash_policy_evaluates_effective_command_after_prefix(tmp_path) -> None:
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
             del request, kwargs
             raise AssertionError("blocked effective command must not execute")
 
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
         command_prefix="rm -rf /tmp/policy-prefix",
@@ -742,14 +761,13 @@ def test_bash_policy_evaluates_configured_shell_path(tmp_path) -> None:
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
             del request, kwargs
             raise AssertionError("blocked configured shell command must not execute")
 
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
         shell_path="/opt/product-shell",
@@ -766,19 +784,18 @@ def test_bash_policy_evaluates_configured_shell_path(tmp_path) -> None:
 
 def test_bash_policy_blocks_destructive_shell_stdin_before_execution(tmp_path) -> None:
     import asyncio
-    from shutil import copy2
+    from shutil import copyfile
 
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
             del request, kwargs
             raise AssertionError("blocked stdin script must not execute")
 
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -791,7 +808,9 @@ def test_bash_policy_blocks_destructive_shell_stdin_before_execution(tmp_path) -
     (tmp_path / "runner").symlink_to("/usr/bin/env")
     copied_shell_dir = tmp_path / "copied-shell"
     copied_shell_dir.mkdir()
-    copy2("/bin/bash", copied_shell_dir / "bash")
+    # copyfile (not copy2) avoids copying platform file flags; on macOS copy2
+    # triggers chflags PermissionError when reproducing /bin/bash attributes.
+    copyfile("/bin/bash", copied_shell_dir / "bash")
 
     for index, (command, cwd) in enumerate(
         (
@@ -803,9 +822,6 @@ def test_bash_policy_blocks_destructive_shell_stdin_before_execution(tmp_path) -
             (["bash", "/proc/thread-self/fd/0"], str(tmp_path)),
             (["bash", "/proc/self/root/dev/stdin"], str(tmp_path)),
             (["bash", "/proc/thread-self/root/dev/stdin"], str(tmp_path)),
-            (["bash", "/proc/self/root/../dev/stdin"], str(tmp_path)),
-            (["bash", "/proc/thread-self/root/../dev/stdin"], str(tmp_path)),
-            (["bash", "/proc/self/root/../../dev/stdin"], str(tmp_path)),
             (["bash", "../dev/stdin"], "/tmp"),
             (["bash", "../dev/fd/0"], "/tmp"),
             (["bash", "../proc/self/fd/0"], "/tmp"),
@@ -840,6 +856,17 @@ def test_bash_policy_blocks_destructive_shell_stdin_before_execution(tmp_path) -
                 ["/bin/busybox", "ash", "-c", "rm -rf /tmp/demo"],
                 str(tmp_path),
             ),
+        )
+        + (
+            # /proc/self/root/.. paths only exist on Linux; on macOS /proc does
+            # not exist, so these resolve to a missing path and are not stdin.
+            (
+                (["bash", "/proc/self/root/../dev/stdin"], str(tmp_path)),
+                (["bash", "/proc/thread-self/root/../dev/stdin"], str(tmp_path)),
+                (["bash", "/proc/self/root/../../dev/stdin"], str(tmp_path)),
+            )
+            if sys.platform.startswith("linux")
+            else ()
         )
     ):
         with pytest.raises(PermissionError):
@@ -883,7 +910,6 @@ def test_bash_policy_resolves_relative_path_from_execution_cwd(
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
@@ -897,7 +923,7 @@ def test_bash_policy_resolves_relative_path_from_execution_cwd(
     (process_cwd / "cat").symlink_to("/bin/cat")
     (execution_cwd / "cat").symlink_to("/bin/bash")
     monkeypatch.chdir(process_cwd)
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -925,7 +951,6 @@ def test_bash_policy_blocks_relative_stdin_symlink_without_explicit_cwd(
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
@@ -934,7 +959,7 @@ def test_bash_policy_blocks_relative_stdin_symlink_without_explicit_cwd(
 
     (tmp_path / "stdin-script").symlink_to("/dev/stdin")
     monkeypatch.chdir(tmp_path)
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -957,7 +982,6 @@ def test_bash_policy_fails_safe_when_env_wrapper_changes_cwd(tmp_path) -> None:
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
@@ -965,7 +989,7 @@ def test_bash_policy_fails_safe_when_env_wrapper_changes_cwd(tmp_path) -> None:
             raise AssertionError("incomplete wrapper command must not execute")
 
     (tmp_path / "stdin-script").symlink_to("/dev/stdin")
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -997,7 +1021,6 @@ def test_bash_policy_fails_safe_when_env_wrapper_changes_executable_path(
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
@@ -1005,7 +1028,7 @@ def test_bash_policy_fails_safe_when_env_wrapper_changes_executable_path(
             raise AssertionError("incomplete PATH wrapper command must not execute")
 
     (tmp_path / "cat").symlink_to("/bin/bash")
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -1033,14 +1056,13 @@ def test_bash_policy_blocks_shell_startup_stdin_before_execution(tmp_path) -> No
     import pytest
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
             del request, kwargs
             raise AssertionError("shell startup stdin must not execute")
 
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=UnexpectedExecService(),
     )
@@ -1083,7 +1105,6 @@ def test_bash_policy_keeps_direct_argv_out_of_shell_payload_matching(
     import asyncio
 
     from loushang.harness.policy_engine import PolicyEngine
-    from loushang.harness.tools.workspace import create_bash_tool_definition
     from loushang.harness.workspace.exec import ExecResult
 
     requests = []
@@ -1094,7 +1115,7 @@ def test_bash_policy_keeps_direct_argv_out_of_shell_payload_matching(
             requests.append(request)
             return ExecResult(exit_code=0, stdout="ok", stderr="")
 
-    bash = create_bash_tool_definition(
+    bash = _bash_tool(
         policy_engine=PolicyEngine(),
         exec_service=CapturingExecService(),
     )
@@ -1121,7 +1142,6 @@ def test_bash_policy_wraps_getter_failure_and_invalid_decision(
     import pytest
 
     from loushang.harness.policy import PolicyEvaluationError
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     class UnexpectedExecService:
         async def execute(self, request, **kwargs):
@@ -1133,7 +1153,7 @@ def test_bash_policy_wraps_getter_failure_and_invalid_decision(
         def evaluate(self):
             raise RuntimeError("evaluate getter exploded")
 
-    explosive = create_bash_tool_definition(
+    explosive = _bash_tool(
         policy_engine=ExplosivePolicy(),
         exec_service=UnexpectedExecService(),
     )
@@ -1154,7 +1174,7 @@ def test_bash_policy_wraps_getter_failure_and_invalid_decision(
                 code=object(),
             )
 
-    invalid = create_bash_tool_definition(
+    invalid = _bash_tool(
         policy_engine=InvalidPolicy(),
         exec_service=UnexpectedExecService(),
     )
@@ -1176,7 +1196,7 @@ def test_bash_policy_wraps_getter_failure_and_invalid_decision(
             del subject
             return malformed_decision
 
-    malformed = create_bash_tool_definition(
+    malformed = _bash_tool(
         policy_engine=MalformedPolicy(),
         exec_service=UnexpectedExecService(),
     )
@@ -1238,13 +1258,13 @@ def test_bash_approval_and_audit_use_effective_spawned_command(tmp_path) -> None
 
     bash = wrap_tool_definition(
         create_bash_tool_definition(
-            policy_engine=PolicyEngine(),
-            approval_resolver=CapturingApprovalResolver(),
             exec_service=CapturingExecService(),
             command_prefix="echo prefixed",
             spawn_hook=rewrite_spawn,
         ),
         context_provider=provide_context,
+        policy_evaluator=PolicyEngine(),
+        approval_resolver=CapturingApprovalResolver(),
     )
 
     asyncio.run(
@@ -1322,11 +1342,11 @@ def test_bash_approval_and_audit_preserve_direct_wrapper_argv(tmp_path) -> None:
 
     bash = wrap_tool_definition(
         create_bash_tool_definition(
-            policy_engine=PolicyEngine(),
-            approval_resolver=CapturingApprovalResolver(),
             exec_service=CapturingExecService(),
         ),
         context_provider=provide_context,
+        policy_evaluator=PolicyEngine(),
+        approval_resolver=CapturingApprovalResolver(),
     )
     command = (
         "env",
@@ -1358,7 +1378,6 @@ def test_bash_policy_and_execution_share_frozen_path_and_cwd(
     import asyncio
 
     from loushang.harness.policy import PolicyDecision
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     original_cwd = tmp_path / "original"
     changed_cwd = tmp_path / "changed"
@@ -1378,7 +1397,7 @@ def test_bash_policy_and_execution_share_frozen_path_and_cwd(
             await asyncio.sleep(0)
             return PolicyDecision.allow()
 
-    bash = create_bash_tool_definition(policy_engine=MutatingEvaluator())
+    bash = _bash_tool(policy_engine=MutatingEvaluator())
     asyncio.run(
         bash.execute(
             "call-frozen-execution",
@@ -1397,7 +1416,6 @@ def test_bash_without_policy_freezes_path_and_cwd_before_async_update(
 ) -> None:
     import asyncio
 
-    from loushang.harness.tools.workspace import create_bash_tool_definition
 
     original_cwd = tmp_path / "original"
     changed_cwd = tmp_path / "changed"
@@ -1415,7 +1433,7 @@ def test_bash_without_policy_freezes_path_and_cwd_before_async_update(
         monkeypatch.setenv("PATH", ".")
         await asyncio.sleep(0)
 
-    bash = create_bash_tool_definition()
+    bash = _bash_tool()
     asyncio.run(
         bash.execute(
             "call-frozen-no-policy",
@@ -1470,11 +1488,10 @@ def test_bash_approval_wait_cannot_change_startup_environment_or_leak_secrets(
         return ToolContext(tool_call_id=tool_call_id, event_sink=emit_event)
 
     bash = wrap_tool_definition(
-        create_bash_tool_definition(
-            policy_engine=AskingEvaluator(),
-            approval_resolver=MutatingApprovalResolver(),
-        ),
+        create_bash_tool_definition(),
         context_provider=provide_context,
+        policy_evaluator=AskingEvaluator(),
+        approval_resolver=MutatingApprovalResolver(),
     )
     asyncio.run(
         bash.execute(

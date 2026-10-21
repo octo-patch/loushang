@@ -41,6 +41,27 @@ def test_product_additions_keep_standard_values_separate() -> None:
     assert invocation.positionals == ("draft",)
 
 
+def test_append_arguments_apply_their_declared_value_parser() -> None:
+    profile = STANDARD_CLI_PROFILE.augment(
+        profile_id="typed-append",
+        root_arguments=(
+            CliArgumentSpec(
+                "example.number",
+                ("--number",),
+                "numbers",
+                owner="product",
+                action="append",
+                type=int,
+                default=[],
+            ),
+        ),
+    )
+
+    invocation = parse_args(["--number", "1", "--number", "2"], profile)
+
+    assert invocation.product_values["numbers"] == [1, 2]
+
+
 def test_product_commands_and_command_arguments_are_additive() -> None:
     design = STANDARD_CLI_PROFILE.augment(
         profile_id="design",
@@ -149,3 +170,35 @@ def test_operation_sequence_stops_after_first_handled_stage() -> None:
 
     assert result == 4
     assert calls == ["skipped", "handled"]
+
+
+def test_operation_sequence_continues_after_selected_success() -> None:
+    calls: list[str] = []
+
+    result = asyncio.run(
+        CliOperationSequence(
+            (
+                CliOperationStage("export", lambda: calls.append("export") or 0),
+                CliOperationStage("list_models", lambda: calls.append("models") or 0),
+            )
+        ).run(continue_after=frozenset({"export"}))
+    )
+
+    assert result == 0
+    assert calls == ["export", "models"]
+
+
+def test_operation_sequence_stops_after_failed_export() -> None:
+    calls: list[str] = []
+
+    result = asyncio.run(
+        CliOperationSequence(
+            (
+                CliOperationStage("export", lambda: calls.append("export") or 1),
+                CliOperationStage("list_models", lambda: calls.append("models") or 0),
+            )
+        ).run(continue_after=frozenset({"export"}))
+    )
+
+    assert result == 1
+    assert calls == ["export"]

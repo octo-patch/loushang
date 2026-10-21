@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 
 import pytest
 
+from loushang.foundation.platform_paths import resolve_platform_paths
+from loushang.foundation.runtime_scope import resolve_runtime_scope
+from loushang.harness.artifacts import ArtifactStore
 from loushang.harness.commands import (
     CommandDef,
     CommandEffect,
@@ -54,15 +57,11 @@ def test_routing_profile_owns_standard_conversation_state_machine() -> None:
         lifecycle=lifecycle,
         parse_intent=lambda text: _Intent(text) if text.strip() else None,
         is_exit=lambda intent: intent.value == "quit",
-        local_action=lambda intent: (
-            "settings" if intent.value == "settings" else None
-        ),
+        local_action=lambda intent: "settings" if intent.value == "settings" else None,
         deferred_local_action=lambda intent: (
             "debug" if intent.value == "debug" else None
         ),
-        follow_up_text=lambda intent: (
-            "later" if intent.value == "follow" else None
-        ),
+        follow_up_text=lambda intent: "later" if intent.value == "follow" else None,
         command_effect=lambda action, _intent: (
             CommandEffect(CommandEffectKind.LOCAL_UI, command)
             if action == "settings"
@@ -86,10 +85,13 @@ def test_routing_profile_owns_standard_conversation_state_machine() -> None:
         text="later",
         source="command",
     )
-    assert profile.decide(
-        _Intent("prompt"),
-        ConversationTextAction("prompt"),
-    ).route is ConversationHostRoute.STEER
+    assert (
+        profile.decide(
+            _Intent("prompt"),
+            ConversationTextAction("prompt"),
+        ).route
+        is ConversationHostRoute.STEER
+    )
     assert profile.decide(
         _Intent("settings"),
         ConversationTextAction("settings"),
@@ -98,14 +100,20 @@ def test_routing_profile_owns_standard_conversation_state_machine() -> None:
         local="settings",
     )
     lifecycle.mark_abort_requested()
-    assert profile.decide(
-        _Intent("prompt"),
-        ConversationTextAction("prompt"),
-    ).route is ConversationHostRoute.ABORT_SETTLING
-    assert profile.decide(
-        _Intent("quit"),
-        ConversationTextAction("quit"),
-    ).route is ConversationHostRoute.DISPATCH
+    assert (
+        profile.decide(
+            _Intent("prompt"),
+            ConversationTextAction("prompt"),
+        ).route
+        is ConversationHostRoute.ABORT_SETTLING
+    )
+    assert (
+        profile.decide(
+            _Intent("quit"),
+            ConversationTextAction("quit"),
+        ).route
+        is ConversationHostRoute.DISPATCH
+    )
     assert [name for name, _data in traces] == [
         "prompt.start",
         "prompt.ignored",
@@ -175,9 +183,7 @@ def _host(
         intent: _Intent,
         prompt_started: float,
     ) -> int | None:
-        calls.append(
-            ("result", (outcome, action, intent, prompt_started))
-        )
+        calls.append(("result", (outcome, action, intent, prompt_started)))
         return 14
 
     async def abort() -> None:
@@ -215,9 +221,7 @@ def _host(
 def test_routed_host_preserves_order_and_attachments_for_every_route() -> None:
     attachment = _attachment()
     decisions = {
-        "settling": ConversationHostDecision(
-            ConversationHostRoute.ABORT_SETTLING
-        ),
+        "settling": ConversationHostDecision(ConversationHostRoute.ABORT_SETTLING),
         "follow": ConversationHostDecision(
             ConversationHostRoute.FOLLOW_UP,
             text="follow text",
@@ -228,9 +232,7 @@ def test_routed_host_preserves_order_and_attachments_for_every_route() -> None:
             ConversationHostRoute.LOCAL,
             local="settings",
         ),
-        "dispatch": ConversationHostDecision(
-            ConversationHostRoute.DISPATCH
-        ),
+        "dispatch": ConversationHostDecision(ConversationHostRoute.DISPATCH),
     }
     calls: list[tuple[str, object]] = []
     host = _host(decisions=decisions, calls=calls)
@@ -293,14 +295,12 @@ def test_routed_host_preserves_order_and_attachments_for_every_route() -> None:
     assert result_args[3] == 42.5
 
 
-def test_routed_host_skips_decision_for_empty_input_and_dispatch_result_for_other_routes() -> None:
+def test_routed_host_skips_decision_for_empty_input_and_dispatch_result_for_other_routes() -> (
+    None
+):
     calls: list[tuple[str, object]] = []
     host = _host(
-        decisions={
-            "follow": ConversationHostDecision(
-                ConversationHostRoute.FOLLOW_UP
-            )
-        },
+        decisions={"follow": ConversationHostDecision(ConversationHostRoute.FOLLOW_UP)},
         calls=calls,
     )
 
@@ -323,21 +323,22 @@ def test_routed_host_exposes_abort_queue_and_exit_ports() -> None:
 
     assert (
         asyncio.run(
-            host.follow_up(
-                ConversationTextAction("next", attachments=(attachment,))
-            )
+            host.follow_up(ConversationTextAction("next", attachments=(attachment,)))
         )
         == 11
     )
-    assert asyncio.run(
-        host.steer(
-            ConversationTextAction(
-                "change",
-                attachments=(attachment,),
-                source="steer",
+    assert (
+        asyncio.run(
+            host.steer(
+                ConversationTextAction(
+                    "change",
+                    attachments=(attachment,),
+                    source="steer",
+                )
             )
         )
-    ) == 12
+        == 12
+    )
     assert asyncio.run(host.abort()) is None
     assert asyncio.run(host.restore_queue_to_composer("draft")) == "queued\n\ndraft"
     assert host.pending_messages() == ("queued",)
@@ -521,3 +522,164 @@ def test_action_host_screen_run_forwards_profile_and_product_overrides(
     assert captured["handle_surface_intent"] is surface
     assert captured["terminal_mode_factory"] is terminal_factory
     assert captured["terminal_size_provider"] is size_provider
+
+
+def test_action_host_screen_run_owns_one_shared_runtime_scope(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import loushang.harnesstui.conversation.host as host_module
+
+    paths = resolve_platform_paths(
+        environ={"LOUSHANG_RUNTIME_DIR": str(tmp_path / "runtime")},
+        home=tmp_path / "home",
+        temporary_root=tmp_path / "temporary",
+    )
+    scope = resolve_runtime_scope(paths=paths, run_id="a" * 32)
+    reports = []
+    sentinel_factory = object()
+    bound_scopes = []
+    context_events = []
+    artifact_stores = []
+
+    class Host:
+        async def submit(self, _action) -> None:
+            return None
+
+        async def steer(self, _action) -> None:
+            return None
+
+        async def follow_up(self, _action) -> None:
+            return None
+
+        async def abort(self) -> None:
+            return None
+
+    def bind_scope(bound_scope):
+        assert context_events == [("enter", scope)]
+        bound_scopes.append(bound_scope)
+        return sentinel_factory
+
+    def observe_sweep(report):
+        assert context_events == [("enter", scope)]
+        reports.append(report)
+
+    def build_artifact_store(bound_scope):
+        assert context_events == [("enter", scope)]
+        store = ArtifactStore(bound_scope)
+        artifact_stores.append(store)
+        return store
+
+    @contextmanager
+    def bind_context(bound_scope):
+        context_events.append(("enter", bound_scope))
+        try:
+            yield
+        finally:
+            assert not scope.run_dir.exists()
+            context_events.append(("exit", bound_scope))
+
+    async def fake_runner(**kwargs) -> int:
+        assert kwargs["input_router_factory"] is sentinel_factory
+        assert (scope.run_dir / ".lease").is_file()
+        assert context_events == [("enter", scope)]
+        assert len(artifact_stores) == 1
+        artifact = artifact_stores[0].put_bytes(
+            b"shared",
+            logical_name="outputs/shared.txt",
+            kind="output",
+            media_type="text/plain",
+        )
+        assert artifact_stores[0].read_bytes(artifact) == b"shared"
+        return 23
+
+    monkeypatch.setattr(host_module, "run_conversation_screen", fake_runner)
+    profile = host_module.ConversationScreenRunProfile(
+        input_router_factory=None,
+        interruption_message="interrupted",
+        cancellation_message="cancelled",
+        runtime=host_module.ConversationScreenRuntimeProfile(
+            input_router_factory=bind_scope,
+            scope_factory=lambda: scope,
+            observe_sweep=observe_sweep,
+            context_factory=bind_context,
+            artifact_store_factory=build_artifact_store,
+        ),
+    )
+
+    result = asyncio.run(
+        host_module.run_action_host_conversation_screen(
+            app=object(),  # type: ignore[arg-type]
+            stdin=StringIO(),
+            stdout=StringIO(),
+            action_host=Host(),
+            profile=profile,
+            should_exit=lambda _text: False,
+        )
+    )
+
+    assert result == 23
+    assert bound_scopes == [scope]
+    assert len(reports) == 1
+    assert reports[0].failed == 0
+    assert len(artifact_stores) == 1
+    assert context_events == [("enter", scope), ("exit", scope)]
+    assert not scope.run_dir.exists()
+
+
+@pytest.mark.parametrize("failure_type", (RuntimeError, asyncio.CancelledError))
+def test_action_host_screen_run_releases_runtime_owner_on_failure(
+    tmp_path: Path,
+    monkeypatch,
+    failure_type,
+) -> None:
+    import loushang.harnesstui.conversation.host as host_module
+
+    paths = resolve_platform_paths(
+        environ={"LOUSHANG_RUNTIME_DIR": str(tmp_path / "runtime")},
+        home=tmp_path / "home",
+        temporary_root=tmp_path / "temporary",
+    )
+    scope = resolve_runtime_scope(paths=paths, run_id="b" * 32)
+
+    class Host:
+        async def submit(self, _action) -> None:
+            return None
+
+        async def steer(self, _action) -> None:
+            return None
+
+        async def follow_up(self, _action) -> None:
+            return None
+
+        async def abort(self) -> None:
+            return None
+
+    async def fail_runner(**_kwargs) -> int:
+        assert (scope.run_dir / ".lease").is_file()
+        raise failure_type("screen failed")
+
+    monkeypatch.setattr(host_module, "run_conversation_screen", fail_runner)
+    profile = host_module.ConversationScreenRunProfile(
+        input_router_factory=None,
+        interruption_message="interrupted",
+        cancellation_message="cancelled",
+        runtime=host_module.ConversationScreenRuntimeProfile(
+            input_router_factory=lambda _scope: object(),  # type: ignore[arg-type]
+            scope_factory=lambda: scope,
+        ),
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(failure_type, match="screen failed"):
+            await host_module.run_action_host_conversation_screen(
+                app=object(),  # type: ignore[arg-type]
+                stdin=StringIO(),
+                stdout=StringIO(),
+                action_host=Host(),
+                profile=profile,
+                should_exit=lambda _text: False,
+            )
+
+    asyncio.run(scenario())
+    assert not scope.run_dir.exists()

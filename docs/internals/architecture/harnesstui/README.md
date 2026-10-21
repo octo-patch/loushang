@@ -18,11 +18,36 @@ direction is:
 
 The reverse dependencies are forbidden. In particular, `loushang.harnesstui`
 must not import `loushang.coding`, `loushang.agent`, AI message/model/provider
-packages, or product-specific policy. `loushang.harness` and `loushang.tui` are
+Python packages, or product-specific policy. `loushang.harness` and `loushang.tui` are
 independent peers: Harnesstui may depend on both, but neither peer may depend on
 Harnesstui or on the other peer.
 
+## Accepted Resume Contract
+
+HarnessTUI presents verified history, readiness, and explicitly unsent pending text. Display targets and execution targets remain distinct through resume, switching, and failure.
+
+The project owner accepted the cross-scope #696 boundaries on 2026-10-12:
+[ARD-004](../decisions/accepted/ARD-004-resume-history-and-current-authority.md),
+[ARD-005](../decisions/accepted/ARD-005-resume-continuation-commit.md), and
+[ARD-006](../decisions/accepted/ARD-006-hosted-resume-readiness-and-admission.md).
+The [Delta ledger](../current-target-gap-ledger.md) records remaining work;
+acceptance does not establish writable release or performance readiness.
+
 ## Responsibilities
+
+The [G15 design](../apphost/foreground-hosted-tui-g15.md) specifies an explicit
+Hosted Mux terminal shell over the existing controller and shared presentation.
+The [G16 delivery](../appserver/detachable-local-workspace-g16.md#final-delivery-acceptance)
+now consumes that shared shell through a separately connected local client.
+Its installed attach route reuses the conversation screen and editor, with
+per-window drafts and bounded asynchronous controls. Harnesstui binds read-only
+help/approval details to the current attachment/question; the generic TUI
+`TextPager` owns only text layout and navigation. Process launch, native local
+connections and application lifetime stay outside Harnesstui. The G15 launcher
+and global Session-discovery picker remain design-only. G16's native and
+isolated-wheel terminal evidence passed on Linux/macOS/Windows before main
+promotion. G17.0 separately tracks the subsequent Hosting baseline regression;
+it does not change terminal or process ownership.
 
 This layer owns reusable Harness-oriented terminal interaction, including:
 
@@ -84,7 +109,7 @@ caller-supplied descriptors and choices.
 The explicit module paths `loushang.harnesstui.commands.source`,
 `loushang.harnesstui.commands.interaction`, and
 `loushang.harnesstui.selection.interaction` are the stable entrypoints for
-these workflows. Package initializers do not add convenience re-exports.
+these workflows. Python package initializers do not add convenience re-exports.
 
 ## Settings and Prepared Surfaces
 
@@ -112,19 +137,37 @@ attachment coordination after the host clipboard has been read. It persists a
 neutral `ClipboardImage` into a caller-supplied directory, derives a composer
 marker relative to a caller-supplied display root, and tracks pending
 attachments so submission order follows marker order in the composed text.
-Read, unsupported-type, and persistence failures are returned as neutral
-outcomes; products supply their own status copy.
+Read, unsupported-type, quota, and persistence failures are returned as
+neutral outcomes; products supply their own status copy.
 
 The host clipboard backend and MIME detection remain in
-`loushang.tui.clipboard_image`. Products continue to choose workspace and
-storage-directory policy and adapt a neutral prompt attachment into model-facing
-values such as `ImagePart`. Harnesstui does not import AI message types or
-hard-code a Coding workspace layout.
+`loushang.tui.clipboard_image`. The standard profile receives one injected
+machine-local `RuntimeScope` and stages bounded drafts below its private run
+tree; products may provide another directory profile and adapt a neutral prompt
+attachment into model-facing values such as `ImagePart`. Harnesstui does not
+import AI message types or hard-code a Coding workspace layout.
+
+The screen host obtains that scope from one application-owned
+`RuntimeResourceOwner`, which also retains the exclusive run Lease and concrete
+ArtifactStore. The host closes the owner inside the Product-supplied runtime
+context after the screen and run-local consumers finish. Harnesstui continues
+to pass only `RuntimeScope` to the clipboard input builder; it does not expose
+the Lease or concrete ArtifactStore to attachment code. In Phase 4A the
+interactive path does not require an artifact projection; future consumers
+must receive only the focused port they use.
+
+`DraftStore` is the preferred bounded owner. The former exported
+`PendingPromptImageRegistry` name remains a compatibility alias during the
+pre-1.0 transition. It is owned and disposed by the nested input-router
+lifetime, not by `RuntimeResourceOwner`; the shared scope only locates its
+private files. Existing app-scoped profile callbacks keep their one-app
+argument; only the explicit `ClipboardImageRuntimeStorage` policy receives a
+`RuntimeScope`.
 
 The explicit module path
 `loushang.harnesstui.conversation.attachments` is the stable entrypoint for this
-capability. The conversation package initializer does not add a convenience
-re-export.
+capability. The conversation Python package initializer does not add a
+convenience re-export.
 
 ## Conversation State, Queue, and Reader
 
@@ -171,8 +214,8 @@ The stable imports introduced by this slice are the explicit module paths
 `loushang.harnesstui.conversation.window_budget`,
 `loushang.harnesstui.conversation.queue`,
 `loushang.harnesstui.conversation.reader` and
-`loushang.harnesstui.conversation.source`. The conversation package does not
-yet expose a broader convenience API.
+`loushang.harnesstui.conversation.source`. The conversation Python package does
+not yet expose a broader convenience API.
 
 ## Tool Transcript and Status Profile
 
@@ -200,6 +243,16 @@ standard Agent history dispositions and result conversion without duplicating
 their projection engines. Products import this module when they need an Agent
 conversation; the neutral modules do not import it eagerly.
 
+`loushang.harnesstui.conversation.agent_application` owns prepared Agent screen
+and plain application state. For live screen Products it also owns the atomic
+session-switch refresh of transcript history, event subscription, status
+context, completion provider, and approval presenter. Products inject their
+completion loader and problem logger. The adjacent
+`loushang.harnesstui.conversation.agent_surfaces` module composes the standard
+resume, delete, fork, rename, agent-tree, and side-question workflow ports from
+the existing surface components; it does not own Product continuity providers,
+settings, diagnostics, hotkeys, model policy, or copy.
+
 Coding no longer owns a parallel intent parser, conversation controller,
 action host, history disposition table, tool projector, or plain/screen event
 adapter. Its product binding supplies the command catalog, callbacks, Product
@@ -224,8 +277,8 @@ projection over presentation-ready status values. Coding continues to own live
 Session reads, the concrete settings store, scope choice, and provider update
 timing. Removed Coding status modules are not compatibility re-exported.
 
-These explicit module paths are the stable imports for this slice. The package
-initializers do not need to provide convenience re-exports.
+These explicit module paths are the stable imports for this slice. The Python
+package initializers do not need to provide convenience re-exports.
 
 ## Conversation Event Projection
 
@@ -269,8 +322,8 @@ test exercises the complete adapter-to-projector-to-target delta path, so the
 existing `make test-tui-render-contract` gate covers this new boundary.
 
 The explicit `projection`, `plain_target`, and `screen_target` module paths
-above are the stable imports for this capability. The package initializer does
-not provide convenience re-exports.
+above are the stable imports for this capability. The Python package initializer
+does not provide convenience re-exports.
 
 ## Conversation Screen Composition
 
@@ -291,7 +344,7 @@ composer prompts, frame copy, theme, welcome panel, transcript presentation,
 320-line budget, compaction wording, path compaction, and tool-output preview
 policy. The shared app does not import Coding, AI, Agent, or raw product events.
 The explicit `screen_frame` and `screen_app` module paths are stable; the
-conversation package initializer does not re-export them.
+conversation Python package initializer does not re-export them.
 
 ## Conversation Transcript Styling
 
@@ -308,13 +361,19 @@ does not participate in segmentation, cache invalidation, frame planning, or
 terminal writes; its module-level regular expressions, span ordering, and
 per-line call shape remain part of the frozen render-performance contract.
 The explicit module path above is stable and is not re-exported by the
-conversation package initializer.
+conversation Python package initializer.
 
 ## Conversation Interaction Control
 
-The reusable control plane for a full-screen conversation lives behind six
+The reusable control plane for a full-screen conversation lives behind eight
 explicit entrypoints:
 
+- `loushang.harnesstui.conversation.clipboard_policy` owns the standard
+  run-scoped draft path, quota policy, and user-facing copy for conversation
+  clipboard images;
+- `loushang.harnesstui.conversation.input_policy` owns neutral projected input
+  capabilities, steer-first/fallback policy, and conversation keybinding
+  definitions;
 - `loushang.harnesstui.conversation.input` coordinates decoded input,
   completion, surfaces, running-submit modes, and neutral attachments;
 - `loushang.harnesstui.conversation.control` coordinates abort, steer, and
@@ -331,15 +390,24 @@ explicit entrypoints:
 - `loushang.harnesstui.conversation.screen_runner` owns the reusable terminal
   read/route/run loop over explicit screen, router, and result ports.
 
+`ConversationInputRouter` is the sole Harness conversation-input semantic
+owner. It interprets idle/running Enter, running-submit steer or follow-up,
+pending queue restore, and conversation cancellation. It reuses TUI
+`ComposerInputTarget` and editor helper functions, but does not delegate whole
+events to generic `loushang.tui.InputRouter` as a second run-state router.
+Generic TUI emits only neutral prompt/editor signals and has no conversation
+running state.
+
 These modules build conversation interaction from neutral UI values. They do
-not own a Harness Session, persistence, runtime construction, Product intent
-classes, model-facing image types, workspace paths, command policy, or product
-copy. `ConversationRoutingProfile` receives the parser, exit predicate, local
-action mapping, follow-up projection, command effect resolver, and lifecycle
-as explicit callbacks, then compiles them into the existing
-`ConversationHostProfile`. In particular, Coding keeps `PromptIntent` and
-`BashIntent`, `ImagePart`, Session and observability setup, `.loushang` storage
-policy, and its interruption, queue, and error messages.
+not own a Harness Session, runtime construction, Product intent classes,
+model-facing image types, or command policy. `ConversationRoutingProfile`
+receives the parser, exit predicate, local action mapping, follow-up projection,
+command effect resolver, and lifecycle as explicit callbacks, then compiles
+them into the existing `ConversationHostProfile`. Harnesstui's standard
+clipboard profile owns run-scoped `drafts/clipboard` staging and generic
+outcome copy;
+Coding keeps `PromptIntent` and `BashIntent`, `ImagePart`, Session and
+observability setup, and its interruption, queue, and error messages.
 
 The action host is a dependency-inversion seam, not a second lifecycle or
 dispatch engine. Plain products may compose the existing run-control,
@@ -352,7 +420,7 @@ The screen runner coordinates existing rendering calls but does not move or
 replace transcript segmentation, invalidation, render caches, frame
 composition, or terminal writes. Those hot-path responsibilities and the
 independent render-performance contract remain unchanged. The conversation
-package initializer intentionally does not re-export these entrypoints.
+Python package initializer intentionally does not re-export these entrypoints.
 
 `AgentScreenConversationApplicationBinding` and
 `AgentPlainConversationApplicationBinding` compose these existing ports for
@@ -379,12 +447,46 @@ policy, surface presentation, and fallback copy supplied to the binding.
 product-neutral interaction ports above. Its dependency direction is
 `tests/coding/tui_support` -> `loushang.harnesstui.testing` ->
 `loushang.harnesstui` / `loushang.tui`. The reverse direction is forbidden:
-production Harnesstui must never import its testing package, and the generic
-TUI remains independent of both Harnesstui layers.
+production Harnesstui must never import its testing Python package, and the
+generic TUI remains independent of both Harnesstui layers.
 
-The shared testing package must not import Coding, AI, Agent, or Harness
-runtime packages. It owns only reusable terminal test mechanics over neutral
-ports:
+Playback is an architectural boundary test, not only UI snapshot convenience.
+It proves that a Product can bind neutral Harness conversation facts into the
+shared TUI without creating Product-specific input, routing, rendering, or
+screen-loop semantics. The production dependency remains one-way even though
+the testing layer can drive the same public ports with deterministic fixtures.
+
+Three playback forms cover different failure classes:
+
+| Playback form | Real boundaries exercised | Evidence captured |
+|---|---|---|
+| Direct render scenario | prepared app state -> render planning -> fake terminal | logical/visible frames, terminal operations, repaint diagnostics |
+| Decoded-input playback | raw chunks -> `InputReader` -> keybindings -> conversation router -> render loop | routed actions, per-step state, frames and terminal trace |
+| Screen-loop playback | timed TTY-like chunks -> reusable async screen runner -> Product callbacks | raw terminal output, normalized text, exit/result facts and final state |
+
+This layering detects sequence bugs that isolated widget tests and final-screen
+goldens cannot: an intermediate wrong focus owner, duplicate optimistic user
+echo, stale pending queue, abort/steer/follow-up misrouting, transient cursor
+movement, unnecessary repaint, accidental clear-screen, or state that looks
+correct only after a later frame repairs it.
+
+The testing contracts are intentionally Product-neutral. Coding supplies its
+app factory, scenario catalog, policy, copy, and Product-only assertions, while
+future Research, PPT, or Cowork products can reuse the same input, render, and
+screen-loop drivers. This makes playback evidence useful when extracting shared
+behavior: reuse is demonstrated through explicit ports rather than inferred by
+copying Coding fixtures into HarnessTUI.
+
+Playback artifacts also separate semantic and physical evidence. Neutral action
+results and conversation state explain what the router decided; logical frames
+explain what the renderer intended; serialized terminal output explains what
+the host would receive. Keeping all three prevents a passing high-level state
+assertion from hiding a terminal regression, and prevents a visual golden from
+hiding incorrect conversation control flow.
+
+The shared testing Python package must not import Coding, AI, Agent, or Harness
+runtime Python packages. It owns only reusable terminal test mechanics over
+neutral ports:
 
 - `loushang.harnesstui.testing.ports` defines the application, router,
   snapshot, result, and factory protocols used by playback drivers;
@@ -406,18 +508,18 @@ ports:
   under `loushang.harnesstui.testing.scenarios` provide reusable recipe
   builders. They do not construct a product catalog at import time.
 
-These explicit modules are the stable testing entrypoints. The testing package
-initializer intentionally does not re-export them. `ConversationRenderScenario`,
-the input and screen-loop drivers, and the scenario factory own the reusable
-fixture mechanics; `loushang.tui.playback_suite.run_playback_cli` owns catalog
-selection and reporting. Repository-local support in `tests/coding/tui_support`
-only binds those facilities into a concrete Coding catalog and retains
-product-only scenarios, fakes, copy, fixture volumes, and render-performance
-budgets. The repository manual runner is `scripts/run_tui_playback.py`;
-none of this product test support is part of the installed Coding package. The
-temporary
+These explicit modules are the stable testing entrypoints. The testing Python
+package initializer intentionally does not re-export them.
+`ConversationRenderScenario`, the input and screen-loop drivers, and the
+scenario factory own the reusable fixture mechanics;
+`loushang.tui.playback_suite.run_playback_cli` owns catalog selection and
+reporting. Repository-local support in `tests/coding/tui_support` only binds
+those facilities into a concrete Coding catalog and retains product-only
+scenarios, fakes, copy, fixture volumes, and render-performance budgets. The
+repository manual runner is `scripts/run_tui_playback.py`; none of this product
+test support is part of the installed Coding Python package. The temporary
 `loushang.coding.ui.playback*` and `loushang.coding.ui.perf_probe` compatibility
-paths were retired after their consumers moved to the canonical testing
+paths were retired after their consumers moved to the canonical testing Python
 packages. Persisted Coding Session materialization remains in
 `loushang.coding.presentation.tui.history`.
 
@@ -471,12 +573,31 @@ from being recreated accidentally.
 
 Coding's screen input binding now constructs the canonical
 `ConversationInputRouter` directly. Harnesstui keeps staged prompt images as
-neutral `PromptImageAttachment` values through routing and exposes clipboard
-outcomes through an optional product callback. Coding alone chooses the
-`.loushang/clipboard` workspace path, presents product status copy, and converts
-neutral attachments to `ImagePart` at the model-dispatch boundary. Its screen
-loop is a thin binding around `run_conversation_screen`; test-only aliases for
-shared runner and terminal helpers are not product APIs.
+neutral `PromptImageAttachment` values through routing, provides the standard
+workspace clipboard profile, and exposes clipboard outcomes through an optional
+caller callback. Coding consumes that shared profile and converts neutral
+attachments to `ImagePart` at the model-dispatch boundary. Its screen loop is a
+thin binding around `run_conversation_screen`; test-only aliases for shared
+runner and terminal helpers are not product APIs.
+
+Harness `SessionOperationRuntime` declares and enforces steering and follow-up
+input delivery through `SessionInputCapabilities`. The standard Agent binding
+projects those Harness-owned declarations into Harnesstui's neutral
+`ConversationInputCapabilities`; the shared input policy is steer-first and
+falls back to follow-up when steering is unavailable. Coding accepts that
+default and may bind another `ConversationInputPolicy` without changing the
+Harness capability declaration. Capability projection reads resolver binding
+metadata and must not resolve an active Session during application preparation.
+
+Generic TUI exposes an immutable, duplicate-safe `KeybindingCatalog` and owns
+only its Core action definitions. Harnesstui composes separate conversation and
+continuity catalogs over Core. The conversation catalog owns
+`conversation.input.followUp`, `conversation.input.pasteImage`, and queue edit;
+the continuity catalog owns preview, domain, and sort. User settings remain raw
+until the applicable catalog is composed, so plugin actions can be configured
+without moving their defaults into TUI. Coding formats its hotkey help from the
+resolved conversation catalog. The generic TUI router is not part of this
+conversation state machine.
 
 ## Plain Conversation Presentation
 
@@ -499,8 +620,8 @@ renderer and `loushang.tui`.
 
 The stable imports are the explicit module paths
 `loushang.harnesstui.plain.renderer` and
-`loushang.harnesstui.conversation.plain_target`; their package initializers do
-not provide convenience re-exports.
+`loushang.harnesstui.conversation.plain_target`; their Python package
+initializers do not provide convenience re-exports.
 
 ## Settings, Selection, and Surface Composition
 
@@ -558,7 +679,19 @@ persisted; Harnesstui never calls a Session or settings manager.
 
 The explicit module paths above are the stable imports. Coding binds prepared
 product data and callbacks directly, without subclassing or re-exporting these
-shared implementations; package initializers do not add convenience exports.
+shared implementations; Python package initializers do not add convenience
+exports.
+
+## Loading Input Ownership
+
+Native screen-first startup uses the same independent loading input/render
+owner on Linux, macOS and Windows, before Product preparation starts on main.
+The coordinator joins that owner before Product UI binding and preserves the
+draft, input parser and native decoding state. Queued loading input is processed
+before submission is armed. TUI supplies the transferable reader adapter;
+HarnessTUI does not import a platform backend. See
+[ARD-009](../decisions/accepted/ARD-009-unified-loading-input-and-terminal-adapters.md)
+for the contract and the outstanding native macOS/Windows validation.
 
 ## Quality Gate
 

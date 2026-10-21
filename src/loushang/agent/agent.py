@@ -7,6 +7,11 @@ from dataclasses import replace
 from typing import Any
 
 from loushang.agent.agent_loop import run_agent_loop, run_agent_loop_continue
+from loushang.agent.model_transport import (
+    is_prepared_request_conformant,
+    is_synthetic_model_transport,
+    prepared_request_conformant,
+)
 from loushang.agent.types import (
     AfterToolCallContext,
     AfterToolCallResult,
@@ -23,6 +28,7 @@ from loushang.agent.types import (
     ToolExecutionMode,
 )
 from loushang.ai.api import stream
+from loushang.ai.errors import AIError, AIErrorCode, AIErrorInfo
 from loushang.ai.messages import canonicalize_user_message
 from loushang.ai.model import Capabilities, Model
 from loushang.ai.model.registry import resolve_model_api
@@ -35,8 +41,49 @@ from loushang.ai.types import (
     Usage,
     UserMessage,
 )
+from loushang.foundation.json import JSONValue
 
-_ABORT_FORCE_CANCEL_DELAY_S = 0.05
+_ABORT_EXECUTION_CANCEL_DELAY_S = 0.05
+
+
+def _public_run_failure_message(error: Exception, *, aborted: bool) -> str:
+    if aborted:
+        return "Request aborted by user"
+    if isinstance(error, AIError):
+        return error.info.message
+    return "Agent run failed."
+
+
+def _run_failure_error_info(
+    error: Exception,
+    *,
+    aborted: bool,
+    model: Model,
+) -> dict[str, JSONValue]:
+    if aborted:
+        return AIErrorInfo(
+            code=AIErrorCode.CANCELLED,
+            message=_public_run_failure_message(error, aborted=True),
+            source="loushang.agent",
+            retryable=False,
+            provider=model.provider_id,
+            endpoint=model.endpoint_id,
+            model=model.id,
+            details={"exceptionType": error.__class__.__name__},
+        ).to_dict()
+    if isinstance(error, AIError):
+        return error.info.to_dict()
+    message = _public_run_failure_message(error, aborted=aborted)
+    return AIErrorInfo(
+        code=AIErrorCode.CANCELLED if aborted else AIErrorCode.STREAM,
+        message=message,
+        source="loushang.agent",
+        retryable=False,
+        provider=model.provider_id,
+        endpoint=model.endpoint_id,
+        model=model.id,
+        details={"exceptionType": error.__class__.__name__},
+    ).to_dict()
 
 
 class AgentStateError(RuntimeError):
@@ -45,6 +92,7 @@ class AgentStateError(RuntimeError):
     pass
 
 
+@prepared_request_conformant
 async def _default_stream(model, context, options=None):
     return await stream(model, context, options)
 
@@ -77,14 +125,46 @@ def _default_convert_to_llm(messages: list[AgentMessage]) -> list[Message]:
 class AbortSignal:
     def __init__(self) -> None:
         self.aborted = False
+        self._execution_tasks: set[asyncio.Task[Any]] = set()
+
+    def _register_execution_task(self, task: asyncio.Task[Any]) -> None:
+        self._execution_tasks.add(task)
+        task.add_done_callback(self._execution_tasks.discard)
+        if self.aborted and not task.done():
+            task.cancel()
+
+    def _unregister_execution_task(self, task: asyncio.Task[Any]) -> None:
+        self._execution_tasks.discard(task)
+
+    def _cancel_execution_tasks(self) -> None:
+        for task in tuple(self._execution_tasks):
+            if not task.done():
+                task.cancel()
 
 
 class AbortController:
     def __init__(self) -> None:
         self.signal = AbortSignal()
+        self._force_cancel_handle: asyncio.TimerHandle | None = None
 
     def abort(self) -> None:
+        if self.signal.aborted:
+            return
         self.signal.aborted = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.signal._cancel_execution_tasks()
+            return
+        self._force_cancel_handle = loop.call_later(
+            _ABORT_EXECUTION_CANCEL_DELAY_S,
+            self.signal._cancel_execution_tasks,
+        )
+
+    def finish(self) -> None:
+        if self._force_cancel_handle is not None:
+            self._force_cancel_handle.cancel()
+            self._force_cancel_handle = None
 
 
 class PendingMessageQueue:
@@ -118,7 +198,9 @@ class Agent:
         self.convert_to_llm = options.convert_to_llm or _default_convert_to_llm
         self.transform_context = options.transform_context
         self.stream_fn = options.stream_fn or _default_stream
+        self.model_transport_requires_prepared_request_conformance = False
         self.call_options = options.call_options or CallOptions()
+        self.prepare_model_call = options.prepare_model_call
         self.before_tool_call = options.before_tool_call
         self.after_tool_call = options.after_tool_call
         self.mailbox_queue = PendingMessageQueue("all")
@@ -185,6 +267,20 @@ class Agent:
     def tools(self, value: list[AgentTool[Any]]) -> None:
         """Set the tools list."""
         self._state.set_tools(value)
+
+    def get_effective_call_options(self) -> CallOptions:
+        """Return the options that the next model call will actually receive."""
+
+        return replace(
+            self.call_options,
+            cache_key=self.call_options.cache_key or self.session_id,
+            reasoning=self.call_options.reasoning
+            or _reasoning_options(
+                self._state.thinking_level,
+                self.thinking_budgets,
+            ),
+            retry=self.call_options.retry or _retry_options(self.max_retry_delay_ms),
+        )
 
     @property
     def tool_execution(self) -> ToolExecutionMode:
@@ -285,6 +381,22 @@ class Agent:
         self._max_retry_delay_ms = value
 
     # === Convenience properties ===
+
+    @property
+    def model_transport_is_prepared_request_conformant(self) -> bool:
+        """Report conformance for the currently installed transport."""
+
+        return (
+            self.stream_fn is _default_stream
+            or self.stream_fn is stream
+            or is_prepared_request_conformant(self.stream_fn)
+        )
+
+    @property
+    def model_transport_is_explicitly_synthetic(self) -> bool:
+        """Report the current transport's visible test/simulation opt-out."""
+
+        return is_synthetic_model_transport(self.stream_fn)
 
     @property
     def is_streaming(self) -> bool:
@@ -398,25 +510,11 @@ class Agent:
     def abort(self) -> None:
         if self._active_abort_controller is not None:
             self._active_abort_controller.abort()
-        active_task = self._active_run_task
-        if active_task is None or active_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            active_task.cancel()
-            return
-        loop.call_later(
-            _ABORT_FORCE_CANCEL_DELAY_S, self._force_cancel_active_task, active_task
-        )
-
-    def _force_cancel_active_task(self, task: asyncio.Task[None]) -> None:
-        if task is self._active_run_task and not task.done():
-            task.cancel()
 
     async def wait_for_idle(self) -> None:
-        if self._active_run_task is not None:
-            await self._active_run_task
+        active_task = self._active_run_task
+        if active_task is not None:
+            await asyncio.shield(active_task)
 
     def reset(self) -> None:
         self._state.set_messages([])
@@ -430,15 +528,24 @@ class Agent:
         self,
         input: str | AgentMessage | list[AgentMessage],
         images: list[ImagePart] | None = None,
+        *,
+        model_call_purpose: str = "main",
     ) -> None:
         if self._active_run_task is not None:
             raise AgentStateError(
                 "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion."
             )
         messages = self._normalize_prompt_input(input, images)
-        await self._run_prompt_messages(messages)
+        await self._run_prompt_messages(
+            messages,
+            model_call_purpose=model_call_purpose,
+        )
 
-    async def continue_run(self) -> None:
+    async def continue_run(
+        self,
+        *,
+        model_call_purpose: str = "continuation",
+    ) -> None:
         if self._active_run_task is not None:
             raise AgentStateError(
                 "Agent is already processing. Wait for completion before continuing."
@@ -451,27 +558,46 @@ class Agent:
         if getattr(last_message, "role", None) == "assistant":
             queued_mailbox = self.mailbox_queue.drain()
             if queued_mailbox:
-                await self._run_prompt_messages(queued_mailbox)
+                await self._run_prompt_messages(
+                    queued_mailbox,
+                    model_call_purpose=model_call_purpose,
+                )
                 return
 
             queued_steering = self.steering_queue.drain()
             if queued_steering:
                 await self._run_prompt_messages(
-                    queued_steering, skip_initial_steering_poll=True
+                    queued_steering,
+                    skip_initial_steering_poll=True,
+                    model_call_purpose=model_call_purpose,
                 )
                 return
 
             queued_follow_ups = self.follow_up_queue.drain()
             if queued_follow_ups:
-                await self._run_prompt_messages(queued_follow_ups)
+                await self._run_prompt_messages(
+                    queued_follow_ups,
+                    model_call_purpose=model_call_purpose,
+                )
+                return
+
+            if getattr(last_message, "stop_reason", None) == "error":
+                await self._run_continuation(
+                    model_call_purpose=model_call_purpose,
+                    drop_terminal_error=True,
+                )
                 return
 
             raise RuntimeError("Cannot continue from message role: assistant")
 
-        await self._run_continuation()
+        await self._run_continuation(model_call_purpose=model_call_purpose)
 
     async def _run_prompt_messages(
-        self, messages: list[AgentMessage], skip_initial_steering_poll: bool = False
+        self,
+        messages: list[AgentMessage],
+        skip_initial_steering_poll: bool = False,
+        *,
+        model_call_purpose: str = "main",
     ) -> None:
         async def executor(signal: AbortSignal) -> None:
             await run_agent_loop(
@@ -483,18 +609,33 @@ class Agent:
                 self._process_event,
                 signal=signal,
                 stream_fn=self.stream_fn,
+                model_call_purpose=model_call_purpose,
             )
 
         await self._run_with_lifecycle(executor)
 
-    async def _run_continuation(self) -> None:
+    async def _run_continuation(
+        self,
+        *,
+        model_call_purpose: str = "continuation",
+        drop_terminal_error: bool = False,
+    ) -> None:
         async def executor(signal: AbortSignal) -> None:
+            context = self._create_context_snapshot()
+            if drop_terminal_error:
+                last_message = context.messages[-1] if context.messages else None
+                if (
+                    isinstance(last_message, AssistantMessage)
+                    and last_message.stop_reason == "error"
+                ):
+                    context.messages.pop()
             await run_agent_loop_continue(
-                self._create_context_snapshot(),
+                context,
                 self._create_loop_config(),
                 self._process_event,
                 signal=signal,
                 stream_fn=self.stream_fn,
+                model_call_purpose=model_call_purpose,
             )
 
         await self._run_with_lifecycle(executor)
@@ -526,22 +667,17 @@ class Agent:
         async def get_follow_up_messages() -> list[AgentMessage]:
             return self.follow_up_queue.drain()
 
-        call_options = replace(
-            self.call_options,
-            cache_key=self.call_options.cache_key or self.session_id,
-            reasoning=self.call_options.reasoning
-            or _reasoning_options(
-                self._state.thinking_level,
-                self.thinking_budgets,
-            ),
-            retry=self.call_options.retry or _retry_options(self.max_retry_delay_ms),
-        )
+        call_options = self.get_effective_call_options()
         return AgentLoopConfig(
             model=self._state.model,
             call_options=call_options,
             tool_execution=self.tool_execution,
             before_tool_call=self.before_tool_call,
             after_tool_call=self.after_tool_call,
+            prepare_model_call=self.prepare_model_call,
+            require_prepared_request_conformance=(
+                self.model_transport_requires_prepared_request_conformance
+            ),
             convert_to_llm=self.convert_to_llm,
             transform_context=self.transform_context,
             get_mailbox_messages=get_mailbox_messages,
@@ -593,29 +729,38 @@ class Agent:
                 self._finish_run()
 
         self._active_run_task = asyncio.create_task(runner())
-        try:
-            await self._active_run_task
-        except asyncio.CancelledError:
-            if not abort_controller.signal.aborted:
-                raise
-            if self._active_run_task is not None:
-                await self._handle_run_failure(
-                    RuntimeError("Request aborted by user"), aborted=True
-                )
-                self._finish_run()
+        active_task = self._active_run_task
+        caller_cancelled = False
+        while not active_task.done():
+            try:
+                await asyncio.shield(active_task)
+            except asyncio.CancelledError:
+                caller_cancelled = True
+                abort_controller.abort()
+        active_task.result()
+        if caller_cancelled:
+            raise asyncio.CancelledError
 
     async def _handle_run_failure(self, error: Exception, *, aborted: bool) -> None:
+        error_message = _public_run_failure_message(error, aborted=aborted)
+        error_info = _run_failure_error_info(
+            error,
+            aborted=aborted,
+            model=self._state.model,
+        )
         failure_message = AssistantMessage(
             role="assistant",
             content=[TextPart(type="text", text="")],
             api=_resolve_failure_message_api(self._state.model),
             provider=self._state.model.provider_id,
+            endpoint=self._state.model.endpoint_id,
             model=self._state.model.id,
             response_id=None,
             usage=_empty_usage(),
             stop_reason="aborted" if aborted else "error",
-            error_message=str(error),
+            error_message=error_message,
             timestamp=time.time() * 1000,
+            error_info=error_info,
         )
         self._state.messages.append(failure_message)
         self._state.error_message = failure_message.error_message
@@ -625,6 +770,8 @@ class Agent:
         self._state.is_streaming = False
         self._state.streaming_message = None
         self._state.pending_tool_calls = set()
+        if self._active_abort_controller is not None:
+            self._active_abort_controller.finish()
         self._active_abort_controller = None
         self._active_run_task = None
 
@@ -711,7 +858,9 @@ def _reasoning_options(
 def _retry_options(max_retry_delay_ms: int | None) -> RetryOptions | None:
     if not isinstance(max_retry_delay_ms, int):
         return None
-    return RetryOptions(max_attempts=1, max_delay_seconds=max(0, max_retry_delay_ms) / 1000)
+    return RetryOptions(
+        max_attempts=1, max_delay_seconds=max(0, max_retry_delay_ms) / 1000
+    )
 
 
 def _empty_usage() -> Usage:

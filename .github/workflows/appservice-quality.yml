@@ -1,0 +1,120 @@
+name: AppService Capability Quality
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  native-service:
+    if: ${{ fromJSON(inputs.plan).checks.appservice }}
+    name: Native service (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux
+          - os: macos-15
+            platform: darwin
+          - os: windows-latest
+            platform: win32
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - uses: astral-sh/setup-uv@v5
+      - name: Install locked dependencies once
+        run: uv --cache-dir .uv-cache sync --locked --extra dev
+      - name: Linux native terminal and fault contracts
+        if: ${{ matrix.platform == 'linux' }}
+        run: >-
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py
+          tests/coding/test_mux_native_evidence.py
+          --junitxml=.artifacts/native-service-linux.xml -q -m "not live"
+      - name: Verify Linux native contracts
+        if: ${{ matrix.platform == 'linux' }}
+        run: >-
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py
+          docs/internals/architecture/appserver/detachable-local-workspace-g16-evidence-manifest.json
+          G16-NATIVE-LINUX .artifacts/native-service-linux.xml
+      - name: macOS native terminal, observation and CLI contracts
+        if: ${{ matrix.platform == 'darwin' }}
+        run: |
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py tests/coding/test_mux_native_evidence.py --junitxml=.artifacts/native-service-darwin-mux.xml -q -m "not live"
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py tests/coding/test_hosted_darwin_evidence.py --junitxml=.artifacts/native-service-darwin-hosted.xml -q -s -m "not live"
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py tests/coding/test_hosted_darwin_primitives.py --junitxml=.artifacts/native-service-darwin-primitives.xml -q -m "not live"
+      - name: Verify macOS native contracts
+        if: ${{ matrix.platform == 'darwin' }}
+        run: |
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/appserver/detachable-local-workspace-g16-evidence-manifest.json G16-NATIVE-DARWIN .artifacts/native-service-darwin-mux.xml
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-session-workflow-g17-darwin-native-manifest.json G17-DARWIN-NATIVE .artifacts/native-service-darwin-hosted.xml
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-session-workflow-g17-darwin-primitives-manifest.json G17-DARWIN-PRIMITIVES .artifacts/native-service-darwin-primitives.xml
+      - name: Windows short authenticated service and terminal smoke
+        if: ${{ matrix.platform == 'win32' && !fromJSON(inputs.plan).windows.appservice_full }}
+        run: >-
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py
+          tests/appserver/test_local.py::test_G16_LOCAL_NATIVE_real_authenticated_request_and_client_eof_only_closes_scope
+          "tests/coding/test_hosted_windows_evidence.py::test_G17_TERMINAL_WINDOWS_console_modes_and_physical_exit[G17-WINDOWS-ENTRY]"
+          --junitxml=.artifacts/native-service-win32-smoke.xml -q -m "not live"
+      - name: Verify Windows short smoke
+        if: ${{ matrix.platform == 'win32' && !fromJSON(inputs.plan).windows.appservice_full }}
+        run: >-
+          uv --cache-dir .uv-cache run python scripts/dev/verify_pytest_xml.py
+          .artifacts/native-service-win32-smoke.xml --require-tests-count 2
+      - name: Windows full native terminal and fault contracts
+        if: ${{ matrix.platform == 'win32' && fromJSON(inputs.plan).windows.appservice_full }}
+        run: |
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py tests/coding/test_mux_native_evidence.py --junitxml=.artifacts/native-service-win32-mux.xml -q -m "not live"
+          uv --cache-dir .uv-cache run python scripts/dev/run_pytest.py tests/coding/test_hosted_windows_evidence.py --junitxml=.artifacts/native-service-win32-hosted.xml -q -m "not live"
+      - name: Verify Windows full native contracts
+        if: ${{ matrix.platform == 'win32' && fromJSON(inputs.plan).windows.appservice_full }}
+        run: |
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/appserver/detachable-local-workspace-g16-evidence-manifest.json G16-NATIVE-WIN32 .artifacts/native-service-win32-mux.xml
+          uv --cache-dir .uv-cache run python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-session-workflow-g17-windows-native-manifest.json G17-WINDOWS-NATIVE .artifacts/native-service-win32-hosted.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-service-${{ matrix.platform }}
+          path: .artifacts/native-service-${{ matrix.platform }}*.xml
+          if-no-files-found: error
+
+  installed-service:
+    if: ${{ fromJSON(inputs.plan).checks.appservice }}
+    name: Installed service (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.plan).windows.appservice_full && fromJSON('[{"os":"ubuntu-24.04","platform":"linux"},{"os":"macos-15","platform":"darwin"},{"os":"windows-latest","platform":"win32"}]') || fromJSON('[{"os":"ubuntu-24.04","platform":"linux"},{"os":"macos-15","platform":"darwin"}]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - uses: astral-sh/setup-uv@v5
+      - name: Seed locked cache once
+        run: uv --cache-dir .uv-cache sync --locked --extra dev
+      - name: Build current checkout wheel once
+        run: uv --cache-dir .uv-cache build --wheel --out-dir .artifacts/service-wheel
+      - name: Verify installed mux and hosted service capabilities
+        run: |
+          uv --cache-dir .uv-cache run python scripts/dev/run_g16_installed_evidence.py --wheel-dir .artifacts/service-wheel --platform ${{ matrix.platform }}
+          uv --cache-dir .uv-cache run python scripts/dev/run_g17_installed_evidence.py --wheel-dir .artifacts/service-wheel --platform ${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: installed-service-${{ matrix.platform }}
+          path: .artifacts/g1*-wheel-${{ matrix.platform }}.xml
+          if-no-files-found: error

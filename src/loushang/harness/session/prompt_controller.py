@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
 from loushang.ai.types import ImagePart, TextPart, UserMessage
 from loushang.harness.runtime.turn import TurnInput, TurnOrchestrator
-from loushang.harness.transcript import ApplicationMessage
+from loushang.harness.session.request_evidence import RequestEvidenceRuntimePort
+from loushang.harness.session.turn_performance import (
+    TurnStartPerformanceHandle,
+    TurnStartPerformanceRuntime,
+)
+from loushang.harness.transcript import ApplicationMessage, CompactionResult
 
 CommandExtractor = Callable[[str], tuple[str, str] | None]
 CommandExecutor = Callable[[str, str], Awaitable[object | None]]
@@ -17,7 +23,7 @@ CwdProvider = Callable[[], str]
 Preflight = Callable[..., Awaitable[Any]]
 BeforeAgentStartOptions = Callable[[], dict[str, object]]
 ExtensionDiagnosticsSync = Callable[..., None]
-PrePromptCompaction = Callable[[], Awaitable[object | None]]
+PrePromptCompaction = Callable[[], Awaitable[CompactionResult | None]]
 RunPrompt = Callable[[list[object]], Awaitable[None]]
 
 
@@ -37,11 +43,19 @@ class AgentPort(Protocol):
 
 class QueuePort(Protocol):
     def queue_prepared_follow_up(
-        self, text: str, images: list[ImagePart] | None = None
+        self,
+        text: str,
+        images: list[ImagePart] | None = None,
+        *,
+        request_evidence: object | None = None,
     ) -> None: ...
 
     def queue_prepared_steering(
-        self, text: str, images: list[ImagePart] | None = None
+        self,
+        text: str,
+        images: list[ImagePart] | None = None,
+        *,
+        request_evidence: object | None = None,
     ) -> None: ...
 
     def drain_next_turn_messages(self) -> list[object]: ...
@@ -60,6 +74,8 @@ class PromptController:
     sync_extension_diagnostics: ExtensionDiagnosticsSync
     compact_before_prompt_async: PrePromptCompaction | None = None
     run_prompt: RunPrompt | None = None
+    turn_performance: TurnStartPerformanceRuntime | None = None
+    request_evidence: RequestEvidenceRuntimePort | None = None
 
     async def prompt(
         self,
@@ -70,31 +86,110 @@ class PromptController:
         source: str | None = None,
         preflight_result: Callable[[bool], None] | None = None,
     ) -> None:
+        timing = (
+            self.turn_performance.begin(source=source)
+            if self.turn_performance is not None
+            else None
+        )
+        evidence_owner = object()
         orchestrator: TurnOrchestrator[list[ImagePart], object] = TurnOrchestrator(
             interceptors=(
                 self._intercept_extension_command,
                 self._intercept_extension_input,
             ),
-            preflight=self._preflight,
+            preflight=lambda item: self._timed_preflight(item, timing),
             is_running=lambda: self.agent.is_streaming,
-            queue_turn=self._queue_turn,
-            build_message=lambda item: _user_message(
-                item.text, images=item.attachments
+            queue_turn=lambda behavior, item: self._timed_queue_turn(
+                behavior,
+                item,
+                timing,
             ),
+            build_message=lambda item: self._build_message(item, evidence_owner),
             drain_pending=self.queue_controller.drain_next_turn_messages,
-            before_run=self.compact_before_prompt_async,
-            before_start=self._before_start,
-            run_turn=self.run_prompt or self.agent.prompt,
+            before_run=(
+                (lambda: self._timed_before_run(timing))
+                if self.compact_before_prompt_async is not None
+                else None
+            ),
+            before_start=lambda item: self._timed_before_start(item, timing),
+            run_turn=lambda messages: self._timed_run_turn(messages, timing),
             busy_error=(
                 "Agent is already processing. Specify streaming_behavior "
                 "('steer' or 'followUp') to queue the message."
             ),
         )
-        await orchestrator.run(
-            TurnInput(text=user_input, attachments=images, source=source),
-            streaming_behavior=streaming_behavior,
-            report_accepted=preflight_result,
-        )
+        outcome = "completed"
+        try:
+            await orchestrator.run(
+                TurnInput(text=user_input, attachments=images, source=source),
+                streaming_behavior=streaming_behavior,
+                report_accepted=preflight_result,
+            )
+        except asyncio.CancelledError:
+            outcome = "cancelled"
+            raise
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            if self.request_evidence is not None:
+                self.request_evidence.discard_owner(evidence_owner)
+            if timing is not None:
+                timing.finish(outcome)
+
+    async def _timed_preflight(
+        self,
+        turn_input: TurnInput[list[ImagePart]],
+        timing: TurnStartPerformanceHandle | None,
+    ) -> TurnInput[list[ImagePart]] | None:
+        try:
+            return await self._preflight(turn_input)
+        finally:
+            if timing is not None:
+                timing.mark("preflight_completed")
+
+    def _timed_queue_turn(
+        self,
+        behavior: str,
+        turn_input: TurnInput[list[ImagePart]],
+        timing: TurnStartPerformanceHandle | None,
+    ) -> None:
+        self._queue_turn(behavior, turn_input)
+        if timing is not None:
+            timing.mark_queued()
+
+    async def _timed_before_run(
+        self,
+        timing: TurnStartPerformanceHandle | None,
+    ) -> object | None:
+        if self.compact_before_prompt_async is None:
+            return None
+        try:
+            return await self.compact_before_prompt_async()
+        finally:
+            if timing is not None:
+                timing.mark("before_run_completed")
+
+    async def _timed_before_start(
+        self,
+        turn_input: TurnInput[list[ImagePart]],
+        timing: TurnStartPerformanceHandle | None,
+    ) -> list[object]:
+        try:
+            return await self._before_start(turn_input)
+        finally:
+            if timing is not None:
+                timing.mark("before_start_completed")
+
+    async def _timed_run_turn(
+        self,
+        messages: list[object],
+        timing: TurnStartPerformanceHandle | None,
+    ) -> None:
+        if timing is not None:
+            timing.activate()
+        run_turn = self.run_prompt or self.agent.prompt
+        await run_turn(messages)
 
     async def _intercept_extension_command(
         self,
@@ -131,6 +226,20 @@ class PromptController:
             source=turn_input.source,
         )
 
+    async def prepare_user_message(
+        self, turn_input: TurnInput[list[ImagePart]], *, evidence_owner: object,
+    ) -> UserMessage:
+        """Prepare input and native evidence without queueing or running a turn.
+
+        The caller owns admission, command routing and the evidence lifetime.
+        Resource preflight keeps extension command execution disabled.
+        """
+
+        prepared = await self._preflight(turn_input)
+        if prepared is None:
+            raise ValueError("prepared user input was consumed by preflight")
+        return self._build_message(prepared, evidence_owner)
+
     async def _preflight(
         self,
         turn_input: TurnInput[list[ImagePart]],
@@ -141,25 +250,64 @@ class PromptController:
         )
         if result.consumed:
             return None
-        return TurnInput(
+        evidence = (
+            self.request_evidence.prepare(result)
+            if self.request_evidence is not None
+            else None
+        )
+        return _PreparedPromptInput(
             text=result.text,
             attachments=turn_input.attachments,
             source=turn_input.source,
+            request_evidence=evidence,
         )
 
     def _queue_turn(
         self, behavior: str, turn_input: TurnInput[list[ImagePart]]
     ) -> None:
+        evidence = _prepared_request_evidence(turn_input)
         if behavior == "steer":
-            self.queue_controller.queue_prepared_steering(
+            if evidence is None:
+                self.queue_controller.queue_prepared_steering(
+                    turn_input.text,
+                    images=turn_input.attachments,
+                )
+            else:
+                self.queue_controller.queue_prepared_steering(
+                    turn_input.text,
+                    images=turn_input.attachments,
+                    request_evidence=evidence,
+                )
+            return
+        if evidence is None:
+            self.queue_controller.queue_prepared_follow_up(
                 turn_input.text,
                 images=turn_input.attachments,
             )
-            return
-        self.queue_controller.queue_prepared_follow_up(
-            turn_input.text,
-            images=turn_input.attachments,
-        )
+        else:
+            self.queue_controller.queue_prepared_follow_up(
+                turn_input.text,
+                images=turn_input.attachments,
+                request_evidence=evidence,
+            )
+
+    def _build_message(
+        self,
+        turn_input: TurnInput[list[ImagePart]],
+        evidence_owner: object,
+    ) -> UserMessage:
+        message = _user_message(turn_input.text, images=turn_input.attachments)
+        evidence = _prepared_request_evidence(turn_input)
+        if evidence is not None:
+            if self.request_evidence is None:
+                raise RuntimeError("prepared request evidence has no Session runtime")
+            self.request_evidence.bind(
+                message,
+                evidence,
+                owner=evidence_owner,
+                allow_signature_fallback=True,
+            )
+        return message
 
     async def _before_start(
         self, turn_input: TurnInput[list[ImagePart]]
@@ -193,6 +341,17 @@ def _user_message(text: str, images: list[ImagePart] | None = None) -> UserMessa
         content=content,
         timestamp=0.0,
     )
+
+
+@dataclass(frozen=True)
+class _PreparedPromptInput(TurnInput[list[ImagePart]]):
+    request_evidence: object | None = field(default=None, repr=False)
+
+
+def _prepared_request_evidence(turn_input: TurnInput[list[ImagePart]]) -> object | None:
+    if isinstance(turn_input, _PreparedPromptInput):
+        return turn_input.request_evidence
+    return None
 
 
 def _custom_messages_from_extension(messages: list[object]) -> list[object]:

@@ -10,6 +10,7 @@ from typing import Literal, cast
 
 from loushang.ai.json_codec import deserialize_content_part, deserialize_message
 from loushang.ai.types import ImagePart, TextPart
+from loushang.foundation.json import JSONValue, JsonValueError, require_json_mapping
 from loushang.harness.conversation import (
     CURRENT_CONVERSATION_FORMAT_VERSION,
     CommandExecutionRecord,
@@ -50,9 +51,9 @@ from loushang.harness.transcript.types import (
     ExtensionData,
     ModelSelectionSnapshot,
     RecordAnnotationPatch,
+    SessionImagePart,
     ThinkingSelectionSnapshot,
 )
-from loushang.protocol import JSONValue, JsonValueError, require_json_mapping
 
 CURRENT_SESSION_VERSION = 3
 LEGACY_SESSION_OPAQUE_KIND = "loushang.session.opaque"
@@ -306,8 +307,8 @@ def _convert_session_entry(value: dict[str, JSONValue]) -> AgentTranscriptRecord
         kind = MODEL_SELECTION_KIND
         payload = ModelSelectionSnapshot(
             provider=_text(value, "provider"),
+            endpoint_id=_text(value, "endpointId"),
             model_id=_text(value, "modelId"),
-            endpoint_id=_optional_text(value, "endpointId", missing=None),
         )
     elif entry_type == "compaction":
         kind = CONTEXT_COMPACTION_CHECKPOINT_KIND
@@ -401,7 +402,8 @@ def _convert_message_entry(
                 message,
                 "excludeFromContext",
                 missing=False,
-            ),
+            )
+            is True,
             metadata=_optional_mapping(message, "metadata"),
         )
     if role in {"custom", "application"}:
@@ -427,7 +429,7 @@ def _application_message_from_entry(
 ) -> ApplicationMessage:
     content_value = _field(value, "content")
     if isinstance(content_value, str):
-        content: str | list[TextPart | ImagePart] = content_value
+        content: str | list[TextPart | ImagePart | SessionImagePart] = content_value
     elif isinstance(content_value, list):
         content = []
         for raw_part in content_value:
@@ -453,7 +455,7 @@ def _application_message_from_entry(
         custom_type=_text(value, "customType"),
         content=content,
         timestamp=timestamp,
-        display=_optional_bool(value, "display", missing=True),
+        display=_optional_bool(value, "display", missing=True) is not False,
         details=value.get("details"),
         origin=cast(str, origin),
         delivery_mode=cast(ApplicationDeliveryMode, delivery_mode),

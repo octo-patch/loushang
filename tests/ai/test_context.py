@@ -280,6 +280,7 @@ def test_normalize_context_uses_tuple_shell_and_copies_tool_parameters() -> None
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -379,6 +380,7 @@ def test_normalize_context_result_reports_missing_tool_result_repair() -> None:
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -407,6 +409,7 @@ def test_normalize_context_result_reports_tool_call_id_repairs() -> None:
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -456,6 +459,10 @@ def test_normalize_context_result_keeps_original_paths_after_system_messages() -
                 {
                     "role": "assistant",
                     "content": [{"type": "text", "text": "failed"}],
+                    "api": "openai-responses",
+                    "provider": "openai",
+                    "endpoint": "responses",
+                    "model": "gpt-test",
                     "stopReason": "error",
                     "errorMessage": "provider failed",
                 },
@@ -468,6 +475,40 @@ def test_normalize_context_result_keeps_original_paths_after_system_messages() -
             "error_assistant_dropped",
             "messages[1]",
             "Dropped error assistant message during normalization.",
+            "warning",
+        )
+    ]
+
+
+def test_normalize_context_result_drops_reasoning_only_assistant() -> None:
+    assistant = AssistantMessage(
+        role="assistant",
+        content=[ThinkingPart(type="thinking", thinking="unfinished reasoning")],
+        api="openai-completions",
+        provider="deepseek",
+        endpoint="openai-completions",
+        model="deepseek-v4-pro",
+        response_id=None,
+        usage=_usage(),
+        stop_reason="stop",
+        error_message=None,
+        timestamp=1.0,
+    )
+    follow_up = UserMessage(
+        role="user",
+        content=[TextPart(type="text", text="additional context")],
+        timestamp=2.0,
+    )
+
+    result = normalize_context_result({"messages": [assistant, follow_up]})
+
+    assert result.context.messages == (follow_up,)
+    assert _diagnostic_snapshot(result) == [
+        (
+            "non_visible_assistant_dropped",
+            "messages[0]",
+            "Dropped assistant message without visible text or tool calls during "
+            "normalization.",
             "warning",
         )
     ]
@@ -489,6 +530,7 @@ def test_normalize_context_result_skips_tool_diagnostics_for_dropped_error_assis
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -549,6 +591,7 @@ def test_normalize_context_result_skips_tool_diagnostics_for_aborted_boundary() 
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -608,6 +651,7 @@ def test_normalize_context_result_keeps_repair_paths_when_tool_ids_collide() -> 
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -686,6 +730,7 @@ def test_normalize_context_result_reports_cross_provider_downgrades_and_signatur
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -739,6 +784,62 @@ def test_normalize_context_result_reports_cross_provider_downgrades_and_signatur
     ]
 
 
+def test_normalize_context_propagates_target_endpoint_to_signature_coercion() -> None:
+    assistant = AssistantMessage(
+        role="assistant",
+        content=[
+            ThinkingPart(
+                type="thinking",
+                thinking="private reasoning",
+                thinking_signature="thinking-sig",
+            ),
+            TextPart(type="text", text="answer", text_signature="text-sig"),
+            ToolCall(
+                type="toolCall",
+                id="call_1",
+                name="calc",
+                arguments={"x": 1},
+                thought_signature="thought-sig",
+            ),
+        ],
+        api="openai-responses",
+        provider="openai",
+        endpoint="source-endpoint",
+        model="gpt-test",
+        response_id=None,
+        usage=_usage(),
+        stop_reason="toolUse",
+        error_message=None,
+        timestamp=1.0,
+    )
+    tool_result = ToolResultMessage(
+        role="toolResult",
+        tool_call_id="call_1",
+        tool_name="calc",
+        content=[TextPart(type="text", text="1")],
+        is_error=False,
+        timestamp=2.0,
+    )
+
+    normalized = normalize_context(
+        {"messages": [assistant, tool_result]},
+        model=SimpleNamespace(
+            api="openai-responses",
+            provider_id="openai",
+            endpoint_id="target-endpoint",
+            id="gpt-test",
+        ),
+    )
+
+    normalized_assistant = normalized.messages[0]
+    assert isinstance(normalized_assistant, AssistantMessage)
+    assert normalized_assistant.content == [
+        TextPart(type="text", text="private reasoning"),
+        TextPart(type="text", text="answer"),
+        ToolCall(type="toolCall", id="call_1", name="calc", arguments={"x": 1}),
+    ]
+
+
 def test_normalize_context_result_reports_dropped_thinking_blocks() -> None:
     assistant = AssistantMessage(
         role="assistant",
@@ -754,6 +855,7 @@ def test_normalize_context_result_reports_dropped_thinking_blocks() -> None:
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -804,6 +906,7 @@ def test_normalize_context_revalidates_existing_context_with_target_model() -> N
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -875,6 +978,7 @@ def test_normalize_context_revalidates_existing_context_for_pairing_mode() -> No
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -898,6 +1002,7 @@ def test_normalized_context_does_not_bypass_strict_pairing() -> None:
         ],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -953,6 +1058,7 @@ def test_normalized_context_rejects_typed_non_mapping_tool_arguments() -> None:
         content=[tool_call],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=_usage(),
@@ -1035,6 +1141,7 @@ def test_normalized_context_rejects_invalid_typed_usage() -> None:
         content=[],
         api="openai-responses",
         provider="openai",
+        endpoint="test-endpoint",
         model="gpt-test",
         response_id=None,
         usage=Usage(
@@ -1076,6 +1183,7 @@ def test_normalize_context_accepts_pi_style_assistant_and_tool_result_dicts() ->
                     ],
                     "api": "openai-responses",
                     "provider": "custom-openai",
+                    "endpoint": "test-endpoint",
                     "model": "gpt-5",
                     "responseId": "resp_1",
                     "usage": {
@@ -1175,6 +1283,7 @@ def test_normalize_context_preserves_unknown_usage_cost() -> None:
                     "content": [{"type": "text", "text": "hello"}],
                     "api": "openai-responses",
                     "provider": "openai",
+                    "endpoint": "test-endpoint",
                     "model": "gpt-4.1",
                     "responseId": "resp_1",
                     "usage": {
@@ -1229,6 +1338,7 @@ def test_normalize_context_rejects_invalid_usage_cost(
                     "content": [{"type": "text", "text": "hello"}],
                     "api": "openai-responses",
                     "provider": "openai",
+                    "endpoint": "test-endpoint",
                     "model": "gpt-4.1",
                     "usage": {
                         "input": 1,
@@ -1259,6 +1369,7 @@ def test_normalize_context_canonicalizes_usage_cost_aliases() -> None:
                     "content": [{"type": "text", "text": "hello"}],
                     "api": "openai-responses",
                     "provider": "openai",
+                    "endpoint": "test-endpoint",
                     "model": "gpt-4.1",
                     "usage": {
                         "input": 1,
@@ -1300,6 +1411,10 @@ def test_normalize_context_accepts_string_assistant_dict_content() -> None:
                 {
                     "role": "assistant",
                     "content": "Plain assistant text.",
+                    "api": "openai-responses",
+                    "provider": "openai",
+                    "endpoint": "responses",
+                    "model": "gpt-test",
                     "timestamp": 1,
                 },
             ],
@@ -1328,6 +1443,7 @@ def test_normalize_context_keeps_malformed_historical_tool_call_recoverable() ->
                     ],
                     api="anthropic-messages",
                     provider="moonshot",
+                    endpoint="test-endpoint",
                     model="kimi-for-coding",
                     response_id=None,
                     usage=_usage(),

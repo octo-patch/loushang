@@ -4,14 +4,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar, cast
 
+from loushang.foundation.json import JSONValue
+from loushang.foundation.json import require_json_value as snapshot_json_value
 from loushang.harness.conversation.types import (
     ConversationHeader,
     ConversationRecord,
     OpaquePayload,
 )
 from loushang.harness.journal import JournalCodecError
-from loushang.protocol import JSONValue, JsonValueError, require_json_mapping
-from loushang.protocol import require_json_value as snapshot_json_value
 
 PayloadT = TypeVar("PayloadT")
 
@@ -49,6 +49,7 @@ class ConversationPayloadCodecRegistry:
             tuple[str, int],
             ConversationPayloadCodec[object],
         ] = {}
+        self._required_kinds: set[str] = set()
 
     def register(
         self,
@@ -75,6 +76,19 @@ class ConversationPayloadCodecRegistry:
     def registered_keys(self) -> tuple[tuple[str, int], ...]:
         return tuple(sorted(self._codecs))
 
+    @property
+    def required_kinds(self) -> tuple[str, ...]:
+        return tuple(sorted(self._required_kinds))
+
+    def require_known_payload_versions(self, *kinds: str) -> None:
+        """Fail closed when one core kind uses an unregistered version."""
+
+        if not kinds:
+            raise ValueError("required conversation payload kinds must not be empty")
+        for kind in kinds:
+            _require_payload_kind(kind)
+            self._required_kinds.add(kind)
+
     def encode(
         self,
         kind: str,
@@ -82,15 +96,23 @@ class ConversationPayloadCodecRegistry:
         payload: object,
     ) -> JSONValue:
         key = _payload_key(kind, payload_version)
-        if isinstance(payload, OpaquePayload):
-            return payload.value
         codec = self._codecs.get(key)
         if codec is None:
+            if kind in self._required_kinds:
+                raise JournalCodecError(
+                    "Required conversation payload version is unsupported for "
+                    f"{kind!r} version {payload_version}",
+                    code="unsupported_required_payload_version",
+                )
+            if isinstance(payload, OpaquePayload):
+                return payload.value
             raise JournalCodecError(
                 "No conversation payload codec is registered for "
                 f"{kind!r} version {payload_version}",
                 code="unregistered_payload_codec",
             )
+        if isinstance(payload, OpaquePayload):
+            return payload.value
         try:
             encoded = codec.encode_payload(payload)
             return snapshot_json_value(
@@ -111,18 +133,18 @@ class ConversationPayloadCodecRegistry:
         value: object,
     ) -> object:
         key = _payload_key(kind, payload_version)
-        try:
-            snapshot = snapshot_json_value(
-                value,
-                name=f"conversation payload {kind!r} version {payload_version}",
-            )
-        except JsonValueError as exc:
-            raise JournalCodecError(
-                "Conversation payload is outside strict JSON",
-                code="invalid_record_payload",
-            ) from exc
+        # The envelope boundary (journal load + _require_envelope) has already
+        # validated this tree against the strict JSON algebra exactly once, so
+        # decode dispatches structurally instead of re-walking the payload.
+        snapshot = cast(JSONValue, value)
         codec = self._codecs.get(key)
         if codec is None:
+            if kind in self._required_kinds:
+                raise JournalCodecError(
+                    "Required conversation payload version is unsupported for "
+                    f"{kind!r} version {payload_version}",
+                    code="unsupported_required_payload_version",
+                )
             return OpaquePayload(snapshot)
         try:
             return codec.decode_payload(snapshot)
@@ -191,7 +213,7 @@ class ConversationJsonlRecordCodec:
 
     def encode_record(
         self,
-        record: ConversationRecord[object],
+        record: ConversationRecord[PayloadT],
     ) -> Mapping[str, object]:
         return {
             "type": CONVERSATION_RECORD_TYPE,
@@ -247,13 +269,18 @@ class ConversationJsonlRecordCodec:
 
 
 def _payload_key(kind: str, payload_version: int) -> tuple[str, int]:
-    if not isinstance(kind, str) or not kind.strip():
-        raise ValueError("conversation payload kind must be a non-empty string")
+    _require_payload_kind(kind)
     if isinstance(payload_version, bool) or not isinstance(payload_version, int):
         raise TypeError("conversation payload version must be an integer")
     if payload_version < 1:
         raise ValueError("conversation payload version must be positive")
     return kind, payload_version
+
+
+def _require_payload_kind(kind: object) -> str:
+    if not isinstance(kind, str) or not kind.strip():
+        raise ValueError("conversation payload kind must be a non-empty string")
+    return kind
 
 
 def _require_supported_format_version(version: int) -> None:
@@ -272,18 +299,18 @@ def _require_envelope(
     *,
     name: str,
 ) -> dict[str, JSONValue]:
+    # Structural check only.  Every caller reaches this codec through a
+    # boundary that already validated the tree against the strict JSON
+    # algebra exactly once: the journal (_load_mapping), the Session v3
+    # migration parser (_parse_jsonl), or the transcript header reader
+    # (jsonl_file).  Re-walking the tree here doubled the validation cost
+    # of every record on the load path.
     if not isinstance(value, Mapping):
         raise JournalCodecError(
             f"{name.capitalize()} must be a JSON object",
             code="invalid_envelope_shape",
         )
-    try:
-        return require_json_mapping(dict(value), name=name)
-    except JsonValueError as exc:
-        raise JournalCodecError(
-            f"{name.capitalize()} contains a value outside strict JSON",
-            code="invalid_envelope_value",
-        ) from exc
+    return cast(dict[str, JSONValue], dict(value))
 
 
 def _require_field(value: Mapping[str, JSONValue], name: str) -> JSONValue:
@@ -342,13 +369,12 @@ def _require_metadata_field(
     value: Mapping[str, JSONValue],
 ) -> dict[str, JSONValue]:
     field = value.get("metadata", {})
-    try:
-        return require_json_mapping(field, name="conversation envelope metadata")
-    except JsonValueError as exc:
+    if not isinstance(field, Mapping):
         raise JournalCodecError(
             "Conversation envelope metadata must be a JSON object",
             code="invalid_envelope_field",
-        ) from exc
+        )
+    return cast(dict[str, JSONValue], dict(field))
 
 
 def _require_discriminator(

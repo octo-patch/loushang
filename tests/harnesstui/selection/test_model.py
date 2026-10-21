@@ -3,6 +3,7 @@ from __future__ import annotations
 from loushang.harnesstui.selection.model import (
     MODEL_SELECTOR_SELECTED_STYLE,
     ModelSelectorSurface,
+    _screen_input_intent_or_none,
 )
 from loushang.tui import InputEvent, InputIntent, RenderConstraints, SelectItem
 from loushang.tui.cell_width import strip_control_sequences
@@ -24,6 +25,43 @@ def test_model_selector_surface_keeps_selected_item_and_style() -> None:
     assert intent == InputIntent(kind="select", text="model-2")
     assert MODEL_SELECTOR_SELECTED_STYLE == {"color": 33, "bold": True}
     assert rendered.lines[1].text.startswith("\x1b[1;38;5;33m> 2. model-2")
+
+
+def test_model_selector_structural_adapter_preserves_open_intent_kinds() -> None:
+    class StructuralIntent:
+        def __init__(self, kind: str) -> None:
+            self.kind = kind
+            self.text = "model-2"
+            self.note = "plugin"
+
+    for kind in ("example_plugin.openArtifact", ""):
+        assert _screen_input_intent_or_none(StructuralIntent(kind)) == InputIntent(
+            kind=kind,
+            text="model-2",
+            note="plugin",
+        )
+
+    assert _screen_input_intent_or_none(object()) is None
+
+
+def test_model_selector_surface_preserves_long_endpoint_identity_when_space_allows() -> (
+    None
+):
+    identity = "1. dashscope:openai-completions:cn:qwen3.6-plus"
+    surface = ModelSelectorSurface(
+        (
+            SelectItem(
+                label=identity,
+                value="dashscope:openai-completions:cn:qwen3.6-plus",
+                description="current - Qwen 3.6 Plus",
+            ),
+        )
+    )
+
+    rendered = surface.render(RenderConstraints(width=120, max_height=3))
+    lines = tuple(strip_control_sequences(line.text) for line in rendered.lines)
+
+    assert lines == (f"> {identity}  current - Qwen 3.6 Plus",)
 
 
 def test_model_selector_surface_keeps_multidigit_ordinal_selection() -> None:
@@ -53,3 +91,18 @@ def test_model_selector_surface_preserves_filter_across_scope_changes() -> None:
     assert any("model-3" in line for line in all_lines)
     assert not any("model-1" in line for line in scoped_lines[2:])
     assert not any("model-1" in line for line in all_lines[2:])
+    assert surface.footer_help == "↑/↓ choose · Enter switch · Esc keep current"
+    assert any(
+        "\x1b[1;36mSearch: " in line.text for line in all_models.lines
+    )
+
+
+def test_model_selector_surface_unfiltered_footer_matches_available_shortcuts() -> (
+    None
+):
+    surface = ModelSelectorSurface(_items(12))
+
+    assert surface.footer_help == (
+        "Type to filter · ↑/↓ choose · Enter switch · "
+        "1–9 quick select · Esc keep current"
+    )

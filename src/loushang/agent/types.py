@@ -42,7 +42,7 @@ from loushang.ai.types import (
     ToolResultMessage,
     Usage,
 )
-from loushang.protocol import JSONValue, require_json_value
+from loushang.foundation.json import JSONValue, require_json_value
 
 TDetails = TypeVar("TDetails")
 
@@ -282,7 +282,7 @@ def _snapshot_tool_output_content(
                 path=error_path,
                 value_type=value_type,
             ) from exc
-        snapshot.append(restored)
+        snapshot.append(cast(TextPart | ImagePart, restored))
     return snapshot
 
 
@@ -421,14 +421,53 @@ class TransformContextFn(Protocol):
     ) -> Awaitable[list[AgentMessage]]: ...
 
 
+@dataclass(frozen=True)
+class ModelCallPreparation:
+    """Final Agent-level model context awaiting caller-owned options binding."""
+
+    purpose: str
+    sequence: int
+    model: Model
+    context: Context
+    options: CallOptions
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.purpose, str) or not self.purpose.strip():
+            raise ValueError("model call purpose must be a non-empty string")
+        if (
+            isinstance(self.sequence, bool)
+            or not isinstance(self.sequence, int)
+            or self.sequence < 1
+        ):
+            raise ValueError("model call sequence must be a positive integer")
+
+
+class PrepareModelCallFn(Protocol):
+    def __call__(
+        self,
+        preparation: ModelCallPreparation,
+    ) -> CallOptions | Awaitable[CallOptions]: ...
+
+
 @runtime_checkable
 class AgentTool(Protocol[TDetails]):
-    name: str
-    description: str
-    parameters: dict[str, Any]
-    label: str
-    prepare_arguments: Callable[[object], dict[str, Any]] | None
-    execution_mode: ToolExecutionMode
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def description(self) -> str: ...
+
+    @property
+    def parameters(self) -> dict[str, Any]: ...
+
+    @property
+    def label(self) -> str: ...
+
+    @property
+    def prepare_arguments(self) -> Callable[[object], dict[str, Any]] | None: ...
+
+    @property
+    def execution_mode(self) -> ToolExecutionMode: ...
 
     def execute(
         self,
@@ -561,6 +600,8 @@ class AgentLoopConfig:
         ]
         | None
     ) = None
+    prepare_model_call: PrepareModelCallFn | None = None
+    require_prepared_request_conformance: bool = False
 
 
 class AgentState:
@@ -640,6 +681,7 @@ class AgentOptions:
     thinking_budgets: AgentThinkingBudgetMap | None = None
     max_retry_delay_ms: int | None = None
     tool_execution: ToolExecutionMode = "parallel"
+    prepare_model_call: PrepareModelCallFn | None = None
 
 
 class AgentStartEvent(TypedDict):
@@ -831,6 +873,8 @@ __all__ = [
     "CustomAgentMessage",
     "ProxyAssistantMessageEvent",
     "ProxyStreamOptions",
+    "ModelCallPreparation",
+    "PrepareModelCallFn",
     "StreamFn",
     "ThinkingLevel",
     "ToolExecutionMode",

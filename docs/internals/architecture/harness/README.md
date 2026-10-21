@@ -6,17 +6,146 @@ prepare and run agent work without depending on another product package.
 It is intentionally narrower than a product framework and broader than the
 initial prepared-run facade. Harness owns product-neutral contracts, helper
 engines, registries, and lifecycle shapes that `coding`, `design`, `research`,
-`ppt`, `cowork`, and OEM products can share.
+`ppt`, `cowork`, and Products supplied or configured by OEMs can share.
 
 Harness may provide explicitly overridable cross-product platform defaults. It
 does not own domain content/defaults, product stores, product UI state, method
 planning, work event persistence, or AI provider behavior.
 
-## Documents
+## Accepted Resume Contract
+
+Harness owns read-only transcript projection, Writer fencing, and the original single-record commit and reconciliation mechanisms. Product policy and activation admission remain outside Harness.
+
+The project owner accepted the cross-scope #696 boundaries on 2026-10-12:
+[ARD-004](../decisions/accepted/ARD-004-resume-history-and-current-authority.md),
+[ARD-005](../decisions/accepted/ARD-005-resume-continuation-commit.md), and
+[ARD-006](../decisions/accepted/ARD-006-hosted-resume-readiness-and-admission.md).
+The [Delta ledger](../current-target-gap-ledger.md) records remaining work;
+acceptance does not establish writable release or performance readiness.
+
+## Start Here
+
+- [Screen-first Session Startup](screen-first-session-startup-plan.md) defines
+  the separately reviewed embedded startup successor: first frame before Session
+  preparation, same-screen attachment and explicit cleanup ownership. See its
+  [three-view review and validation](screen-first-session-startup-review.md).
+- [G18 Linux-first Startup Performance Plan](startup-performance-plan.md) scopes
+  isolated startup measurement and import/dispatch optimization, with Linux-first
+  delivery and later external macOS/Windows acceptance; it does not change runtime
+  ownership or readiness semantics.
+- [Linux Hosted Two-turn Boundary](linux-hosted-two-turn-boundary.md) records
+  the independent admission/projection diagnostic work and Windows handoff;
+  it is not a startup-performance or cross-platform acceptance claim.
+- [Current Owner Map](current-owner-map.md) is the short, authoritative map of
+  implemented owners, dependency direction, Product-owned exclusions, Session
+  assembly phases, and public loading boundaries.
+- [Shared Capability Boundaries](shared-capability-boundaries.md) provides the
+  detailed owner matrix for cross-Product capabilities.
+- [Capability Dependency And Mount Lifecycle](capability-dependency-and-mount-lifecycle.md)
+  defines top-level Capability IDs, dependency direction, Mount identity,
+  graph lifecycle, and graph diagnostics.
+- [Session Capability Boundary](session-capability-boundary.md) defines the
+  incremental Session Bundle contracts, ownership handoffs, and deferred
+  transcript/continuity facets.
+- [Harness Capability Catalog](capability-catalog.md) is the generated,
+  source-backed inventory of role-complete Capability Definition / Provider /
+  Consumer seams and their lifecycle metadata.
+- [Capability Runtime Convergence Plan](capability-runtime-convergence-plan.md)
+  records the completed PR0-PR9 delivery for owner-scoped reversible registration,
+  Definition/Provider/Consumer separation, composed Profile/Mount/registration
+  projection, and reconstruction of model-visible inputs from committed facts.
+- [Capability Composition Lifecycle Authority Plan](composition-lifecycle-authority-plan.md)
+  records the completed CLA0-CLA8 convergence of Profile, Mount, Registration,
+  and Extension/Resource construction authority around one publisher per owned
+  live object while preserving independent fact clocks.
+- [Plugin Architecture Hub](plugin/README.md) is the single entrypoint for the
+  active Plugin architecture, PLC delivery status, Resource/Skill convergence,
+  frozen declaration/lifecycle/execution/admission contracts, baselines, and
+  review evidence. It also records which cross-domain runtime boundaries remain
+  outside the Plugin directory under their exact owners.
+- [Composition Lifecycle Authority CLA0 Baseline](composition-lifecycle-authority-cla0-baseline.md)
+  retains the executable inventory shape, revised through CLA8, for current
+  construction/publication owners, supported entrypoint
+  counts, Profile-slot handoff classes, Binder ordering, and production
+  construction allowlists.
+- [Capability Runtime Convergence PR0 Baseline](capability-runtime-convergence-pr0-baseline.md)
+  freezes the mutable-surface, compatibility, model-call, package-owner, and
+  lifecycle-fault evidence that later convergence PRs must preserve or revise.
+- [Session And Model-Call Closure Boundary](session-model-call-closure-boundary.md)
+  fixes PR8's Session/candidate-graph nesting, per-sampling commit seam, complete
+  model-call inventory, compaction lineage compatibility, and failure policy.
+- [Model Input Persistence And Capacity Recovery](model-input-persistence-capacity-recovery.md)
+  is the proposed corrective boundary for incremental Model Input persistence,
+  typed invocation outcomes, capability-safe model selection, Provider request
+  budgets, and bounded overflow recovery after PR #451.
+- [Effective Runtime Diagnostics Boundary](effective-runtime-diagnostics-boundary.md)
+  fixes PR9's four-clock composed view, explicit skew, explain, JSON, and diff
+  semantics while retaining the existing graph projector as the only projector.
+- [Runtime Provenance Boundary](runtime-provenance-boundary.md) separates
+  pre-bootstrap installation identity from effective runtime component facts,
+  defines the strict-JSON contributor seam, and keeps Product/TUI presentation
+  outside Harness.
+- [Continuity Stable Reference Boundary](continuity-stable-reference-boundary.md)
+  defines the implemented CLA7d process-owned typed stable
+  continuity reference and the explicit Session-before-continuity shutdown
+  order; the graph `stable_reference` binding remains fail-closed.
+- [Refactoring Principles](refactoring-principles.md) defines the evidence and
+  neutrality gates for moving code into Harness.
+
+The source tree and architecture gates are authoritative. Boundary documents
+describe accepted decisions. Files named `plan`, `inventory`, `ledger`,
+`status`, or `migration` are delivery and historical records; they do not
+override the current owner map merely because they contain a target-state
+description.
+
+## Boundary And Migration Document Catalog
 
 - [Product And OEM Glossary](../../glossary/loushang-product.md) defines the
-  canonical Product, OEM, Product Package, Capability Pack, Product Capability
-  Bundle, Plugin, and multi-Product launch vocabulary used by these boundaries.
+  canonical Product, OEM, Capability, Harness Capability, Package, Plugin,
+  Extension, Product Capability Bundle, and multi-Product launch vocabulary
+  used by these boundaries.
+- [Capability Dependency And Mount Lifecycle](capability-dependency-and-mount-lifecycle.md)
+  separates static Capability Plan nodes from live Mounted Capabilities,
+  fixes `A -> B` as "A depends on B", and defines graph planning, incremental
+  binding, disposal, diagnostics, and multi-Product observation.
+- [Harness Capability Catalog](capability-catalog.md) is regenerated from
+  source-backed seam metadata and fails verification when an implemented
+  Definition, Provider, requirement, or Consumer drifts.
+- [Capability Variation And Replacement Boundary](capability-variation-and-replacement-boundary.md)
+  defines aggregate contribution, ordered interception and decoration,
+  exclusive replacement, protocol injection, composition-root ownership, and
+  the invariant enforcement layer that Product and Plugin variation cannot
+  bypass.
+- [Capability Runtime Convergence Plan](capability-runtime-convergence-plan.md)
+  records the completed migration sequence that joined registration ownership
+  and disposal, Capability role separation, graph projection, and durable
+  model-input reconstruction. It does not override implemented source or
+  accepted boundary documents.
+- [Capability Composition Lifecycle Authority Plan](composition-lifecycle-authority-plan.md)
+  records the completed CLA0-CLA8 delivery of a Session-owned graph,
+  production-mounted Resources/Session/Workspace slices, and contraction of
+  duplicate live construction paths. Its
+  [independent review brief](composition-lifecycle-authority-review-brief.md)
+  can be given to reviewers without prior conversation context.
+- [Plugin Architecture Hub](plugin/README.md) catalogs the canonical Plugin
+  architecture, sole delivery plan, exact incremental contracts, Resource/Skill
+  convergence, baselines, and reviews without duplicating their volatile status
+  in this Harness-wide catalog.
+- [Composition Lifecycle Authority CLA0 Baseline](composition-lifecycle-authority-cla0-baseline.md)
+  is the executable inventory for that plan, revised through CLA8 to freeze the
+  single-candidate authority and forbid removed peer construction paths.
+- [Capability Runtime Convergence PR0 Baseline](capability-runtime-convergence-pr0-baseline.md)
+  is the executable pre-change inventory for that sequence. It records current
+  compatibility and assigns each future contract to one package owner.
+- [Session And Model-Call Closure Boundary](session-model-call-closure-boundary.md)
+  defines the implemented PR8 Session graph, per-sampling commit, complete
+  model-call inventory, and compaction-lineage boundary.
+- [Model Input Persistence And Capacity Recovery](model-input-persistence-capacity-recovery.md)
+  proposes a v1-compatible Model Input v2 representation and the selection,
+  error, capacity, and recovery boundaries required before it is implemented.
+- [Effective Runtime Diagnostics Boundary](effective-runtime-diagnostics-boundary.md)
+  defines PR9's Product-neutral effective runtime diagnostics and clock-skew
+  semantics without introducing another authority.
 - [Refactoring Principles](refactoring-principles.md) defines what may move
   into harness and how migration slices should be shaped.
 - [Shared Capability Boundaries](shared-capability-boundaries.md) maps tools,
@@ -31,10 +160,19 @@ planning, work event persistence, or AI provider behavior.
   mandatory rebaseline ledger, revised six delivery waves, and closure gates
   for turning Coding into a declarative Product adapter.
 - [Coding Shared-Layer Migration Ledger](coding-shared-layer-migration-ledger.md)
-  records the concrete source-to-owner cutover scope for each delivery wave.
+  is the closed historical record of the concrete source-to-owner cutover
+  completed through Wave 7, Slice Z.
 - [CLI Product Host Collapse](cli-product-host-collapse.md) defines ordered
   standard CLI operation dispatch and shared session/resource/package host
   operations while Products retain grammar, policy, and mode selection.
+- [Product Host Runtime Boundary](product-host-runtime-boundary.md) defines
+  Product-neutral input, task, stream, and disposal lifecycle mechanics below
+  Channel and Product protocols.
+- [JSONL Command Host Boundary](jsonl-command-host-boundary.md) defines strict
+  Product-owned JSONL command input and remote UI correlation without making
+  either mechanism a Channel protocol.
+- [Product CLI Lifecycle Boundary](product-cli-lifecycle-boundary.md) records
+  shared turn ordering, stream binding, TTY detection, and failure disposal.
 - [Coding Shared-Layer Owner Rebaseline](coding-shared-layer-owner-rebaseline.md)
   records shared owners, actual Coding adapters and kernels, and the source
   boundary required before a further migration wave can claim LOC.
@@ -67,6 +205,9 @@ planning, work event persistence, or AI provider behavior.
 - [Extension Context Runtime Boundary](extension-context-runtime-boundary.md)
   defines the standard extension context, lifecycle records, generation-bound
   capability injection, and snake_case-only extension UI contract.
+- [Extension And Resource Generation Lifecycle](extension-generation-lifecycle-boundary.md)
+  defines candidate admission, exact owner/generation registrations,
+  synchronous runtime/resource publication, rollback, and reverse unload.
 - [Control Plane Runtime Boundary](control-plane-runtime-boundary.md) defines
   deterministic extension routing, neutral policy subjects and evaluator
   composition, pending approval lifecycle, and the Product adapters that retain
@@ -76,10 +217,25 @@ planning, work event persistence, or AI provider behavior.
   authorization runtime, scoped grants, execution-time revalidation, common
   approval coordination, and explicit Coding/TUI/Work/daemon/MCP/multi-agent
   integration boundaries.
+- [Tool Execution Binding Boundary](tool-execution-binding-boundary.md) defines
+  one hosted dispatch path, a Product-neutral authoring API, explicit direct or
+  authorized bindings, typed common effects, a session-owned authorization
+  gateway, and the migration that removes raw tool execution bypasses without
+  changing permission behavior.
+- [One-Shot Agent Invocation Tool Boundary](agent-invocation-tool-boundary.md)
+  records the implemented `delegate_agent` P0: a finite authorized subprocess
+  tool, Coding-owned CLI semantics, non-widening child tools, bounded output,
+  and the evidence gates before jobs or multi-agent semantics are introduced.
+- [Harness Tool Authoring](tool-authoring-guide.md) is the short developer guide
+  for pure tools, common filesystem actions, and custom action adapters.
 - [Sandbox Runtime Boundary](sandbox-runtime-boundary.md) defines the optional,
   disabled-by-default process containment service, its cross-platform
   Protocols, centralized host detection and backend selection, existing
   `ExecService` integration, and session/child lifecycle.
+- [Process Hosting Boundary](process-hosting-boundary.md) defines the narrow
+  session-owned long-lived child-process substrate, fixed lifecycle limits,
+  public contract restraint, execution-scope authorization, private Sandbox
+  containment planning, and ordered Session fallback cleanup.
 - [Context Budget And Accounting Boundary](context-budget-accounting-boundary.md)
   defines deterministic compaction-budget and usage-estimate record ownership
   while keeping message estimation and compaction policy in product adapters.
@@ -149,21 +305,30 @@ planning, work event persistence, or AI provider behavior.
   defines live tool activation, dynamic command composition and dispatch, and
   selected command-tool execution while Products retain policy, command
   implementations, extension semantics, prompts, and presentation.
+- [Tool Governance Glossary](tool-governance-glossary.md) defines the canonical
+  terms for Tool identity, publication, intent, policy, effective planning,
+  execution, and compatibility surfaces.
+- [Harness Tool Governance](tool-governance.md) defines the target Catalog,
+  session Intent, Policy, immutable per-Model-Call Tool Plan, owner-generation
+  publication, concurrency, persistence, observability, and migration contract.
 - [Standard Session Command Pack Boundary](session-command-pack-boundary.md)
   defines the shared parsing and callback delegation for selected session
   commands while Products retain descriptor order, wording, result projection,
   local commands, and UI/transport behavior.
-- [Session RPC Operation Cutover Boundary](session-rpc-operation-boundary.md)
+- [Session RPC Operation Boundary](session-rpc-operation-boundary.md) records
+  the current Product command wire, command-group, dynamic-session, and
+  Channel-separation ownership.
 - [Session Interaction And Command Collapse Boundary](session-interaction-command-collapse-boundary.md)
-  defines how Channel command routing and Harness session operations replace
-  Coding RPC glue without changing Coding's public JSONL contract.
+  records the historical UI/command composition slice that preceded the final
+  Harness RPC cutover.
 - [Session Facade Boundary](session-facade-boundary.md) defines the common
   Product-facing operation surface over already-bound session runtimes while
   Products retain model/auth, prompts, extension protocols, lifecycle policy,
   and channel projection.
 - [Session RPC Operations Boundary](session-rpc-operations-boundary.md) defines
   typed capability-grouped session operations below transport schemas while
-  Products retain RPC mapping, lifecycle tracking, and output projection.
+  the Harness RPC host owns wire mapping and Products retain runtime and
+  selected event/diagnostic projections.
 - [Mode Host Boundary](mode-host-boundary.md) defines the shared RPC/plain host
   implementation and the remaining Coding Work/event/diagnostic bindings.
 - [Session Product Adapter Collapse](session-product-adapter-collapse.md)
@@ -250,7 +415,7 @@ planning, work event persistence, or AI provider behavior.
   OEM customisation, extension contributions, and harness upgrades interact,
   including override mechanisms, extension categories, surface-type gaps, and
   upgrade-compatibility guarantees.
-- [Multi-Agent Architecture](multiagent/system-context.md) (draft proposal)
+- [Multi-Agent Architecture](multiagent/system-context.md) (implemented)
   defines the target boundary for `loushang.harness.multiagent`: sub-agent
   spawning, context isolation and forking, agent input facade notification,
   concurrency and residency limits, and approval bubbling, with ownership in
@@ -262,7 +427,11 @@ planning, work event persistence, or AI provider behavior.
   [control](multiagent/control-boundary.md),
   [registry](multiagent/registry-boundary.md),
   [limits and projection](multiagent/limits-and-projection-boundary.md),
-  [tool surface](multiagent/tool-surface-boundary.md).
+  [tool surface](multiagent/tool-surface-boundary.md). The proposed
+  [remote Agent capability boundary](multiagent/remote-agent-capability-boundary.md)
+  keeps one-shot invocation, asynchronous jobs, and persistent collaboration
+  as separate contracts and defers a common execution port until mixed
+  placement or recovery proves it necessary.
 - [Workspace Execution Boundary](workspace-execution-boundary.md) defines
   harness-owned truncation, exec records, backend protocols, process execution,
   and coding compatibility ownership.
@@ -275,6 +444,9 @@ planning, work event persistence, or AI provider behavior.
 - [Workspace And Terminal Platform Capabilities Boundary](workspace-platform-capabilities-boundary.md)
   defines canonical Harness Git and Native TUI clipboard ownership, direct
   Product adoption, and retired Coding platform paths.
+- [Machine-Local Runtime Storage](machine-local-runtime-storage.md) defines
+  lifecycle-based platform roots, injected run scopes, live leases, safe stale
+  sweeping, and bounded clipboard draft ownership.
 - [Workspace Tool Pack Boundary](workspace-tool-pack-boundary.md) defines
   reusable concrete read/search/edit/exec ownership and the product-owned
   activation and policy boundary.
@@ -336,3 +508,10 @@ Harness refactoring should not block TUI, agent, or AI provider work:
 When a migration slice touches a product adapter, it must prove product behavior
 is unchanged with focused tests and must keep the architecture import-boundary
 tests passing.
+
+## Quality Gate
+
+Run `make check-harness` before integrating Harness changes. The gate runs Ruff
+over Harness production and tests, mypy over the complete Harness source tree,
+the full Harness test suite, and the architecture import-boundary contracts.
+The same command runs in the dedicated Harness CI workflow.

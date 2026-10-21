@@ -16,9 +16,11 @@ from typing import Generic, Protocol, TypeVar
 
 from loushang.ai.types import UserMessage
 from loushang.harness.runtime import (
+    FileCopy,
     SessionOperationFailure,
     SessionOperationPhase,
     SessionOperationResult,
+    VerifiedFileCopy,
     copy_file_exclusive,
 )
 from loushang.harness.session.diagnostics import SessionDiagnosticsRuntime
@@ -29,7 +31,6 @@ from loushang.harness.session.lifecycle import (
     MissingSessionCwdError,
     SessionLifecycleHooks,
     SessionLifecycleRuntime,
-    SessionLifecycleStore,
     SessionLifecycleTransition,
     resolve_fork_target,
 )
@@ -37,9 +38,9 @@ from loushang.harness.session.lifecycle_adapter import (
     SessionLifecycleOperationAdapter,
 )
 from loushang.harness.session.transcript_lifecycle import (
-    AgentTranscriptSessionRuntime,
     ProductTranscriptSessionLifecyclePorts,
     ProductTranscriptSessionLifecycleStore,
+    TranscriptImportFactory,
     require_session_operation_session,
 )
 from loushang.harness.transcript import (
@@ -51,12 +52,22 @@ from loushang.harness.transcript import (
 
 SessionT = TypeVar("SessionT")
 TranscriptT = TypeVar("TranscriptT")
+TranscriptT_contra = TypeVar("TranscriptT_contra", contravariant=True)
 PayloadT = TypeVar("PayloadT")
 
-SessionBuilder = Callable[
-    [TranscriptT, SessionT | None, SessionLifecycleTransition],
-    SessionT | Awaitable[SessionT],
-]
+
+class SessionBuilder(Protocol[TranscriptT_contra, SessionT]):
+    """Build one Product runtime session from its transcript binding."""
+
+    def __call__(
+        self,
+        transcript: TranscriptT_contra,
+        current_session: SessionT | None,
+        transition: SessionLifecycleTransition,
+        /,
+    ) -> SessionT | Awaitable[SessionT]: ...
+
+
 TranscriptValidator = Callable[[TranscriptT], None | Awaitable[None]]
 RenameTranscript = Callable[
     [Path, str | None], SessionSummary | Awaitable[SessionSummary]
@@ -98,11 +109,12 @@ class ProductSessionRuntimePorts(Generic[SessionT, TranscriptT, PayloadT]):
     transcript_cwd: Callable[[TranscriptT], str]
     transcript_session_ref: Callable[[TranscriptT], str | None]
     transcript_leaf_entry_id: Callable[[TranscriptT], str | None]
-    build_session: SessionBuilder[SessionT, TranscriptT]
+    build_session: SessionBuilder[TranscriptT, SessionT]
     validate_restored_transcript: TranscriptValidator[TranscriptT] | None
     fork_profile: ForkProfile
     fork_target_resolver: ForkTargetResolver[SessionT, PayloadT]
-    copy_file: Callable[[Path, Path], None] = copy_file_exclusive
+    copy_file: FileCopy = copy_file_exclusive
+    verified_copy_file: VerifiedFileCopy | None = None
     hooks: SessionLifecycleHooks[SessionT, PayloadT] = SessionLifecycleHooks()
     diagnostics_runtime: SessionDiagnosticsRuntime | Callable[
         [SessionT | None], SessionDiagnosticsRuntime
@@ -115,11 +127,12 @@ class ProductSessionRuntimePorts(Generic[SessionT, TranscriptT, PayloadT]):
     record_replacement_callback_failure: ReplacementFailureRecorder | None = None
     resolve_import_cwd: Callable[[str | Path], str] | None = None
     translate_missing_cwd_error: Callable[[MissingSessionCwdError], Exception] | None = None
+    prepare_import_transcript: TranscriptImportFactory[TranscriptT] | None = None
+    mark_import_delivered: Callable[[TranscriptT], None] | None = None
 
 
 class ProductSessionRuntime(
     SessionLifecycleOperationAdapter[SessionT, PayloadT],
-    AgentTranscriptSessionRuntime[SessionT, PayloadT],
     Generic[SessionT, TranscriptT, PayloadT],
 ):
     """Compose standard session runtimes for any Agent product.
@@ -144,7 +157,7 @@ class ProductSessionRuntime(
         self._product_lifecycle_hooks = ports.hooks
         self.session_factory = ports.session_factory
         self.persist = ports.persist
-        lifecycle_store: SessionLifecycleStore[SessionT] = (
+        lifecycle_store = (
             ProductTranscriptSessionLifecycleStore(
                 ports=ProductTranscriptSessionLifecyclePorts(
                     create_transcript=ports.create_transcript,
@@ -155,17 +168,23 @@ class ProductSessionRuntime(
                     transcript_cwd=ports.transcript_cwd,
                     transcript_session_ref=ports.transcript_session_ref,
                     transcript_leaf_entry_id=ports.transcript_leaf_entry_id,
+                    prepare_import_transcript=ports.prepare_import_transcript,
+                    mark_import_delivered=ports.mark_import_delivered,
                 ),
                 build_session=ports.build_session,
                 validate_restored_transcript=ports.validate_restored_transcript,
             )
         )
+        self._transcript_construction_store = lifecycle_store
         lifecycle = SessionLifecycleRuntime(
             store=lifecycle_store,
             current_session=current_session,
             fork_profile=ports.fork_profile,
             fork_target_resolver=ports.fork_target_resolver,
             copy_file=ports.copy_file,
+            verified_copy_file=ports.verified_copy_file,
+            prepare_import_candidate=lifecycle_store.prepare_import,
+            mark_candidate_delivered=lifecycle_store.mark_import_delivered,
             hooks=SessionLifecycleHooks(
                 before_transition=ports.hooks.before_transition,
                 prepare_session=ports.hooks.prepare_session,
@@ -201,6 +220,25 @@ class ProductSessionRuntime(
         parent_session: str | None = None,
     ) -> SessionT:
         return await self.new_session(cwd=cwd, parent_session=parent_session)
+
+    async def dispose_session_runtime(
+        self, *, metadata: dict[str, object] | None = None,
+    ) -> None:
+        self._transcript_construction_store.fence()
+        failure: BaseException | None = None
+        try:
+            await super().dispose_session_runtime(metadata=metadata)
+        except BaseException as error:
+            failure = error
+        try:
+            await self._transcript_construction_store.close()
+        except BaseException as error:
+            if failure is None:
+                failure = error
+            else:
+                failure.add_note(f"transcript construction cleanup retained: {type(error).__name__}")
+        if failure is not None:
+            raise failure
 
     async def rename_session(
         self,

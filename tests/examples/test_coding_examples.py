@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -152,6 +153,99 @@ def test_kimi_code_examples_use_the_builtin_catalog(
         assert model.id == "kimi-for-coding"
 
 
+@pytest.mark.parametrize(
+    "example",
+    (
+        "examples/coding/08_online_resume_repo_session.py",
+        "examples/coding/09_print_mode_text.py",
+        "examples/coding/10_print_mode_json.py",
+        "examples/coding/14_simple_code_writer.py",
+        "examples/coding/15_simple_write_tool.py",
+        "examples/coding/16_write_tool_trace.py",
+    ),
+)
+def test_catalog_owned_tool_examples_start_and_render_help(example: str) -> None:
+    completed = subprocess.run(
+        [sys.executable, example, "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "usage:" in completed.stdout.lower()
+
+
+@pytest.mark.parametrize(
+    "example",
+    (
+        "examples/coding/04_builtin_bash_tool.py",
+        "examples/coding/05_model_with_builtin_bash.py",
+        "examples/coding/06_nl_with_builtin_bash.py",
+        "examples/coding/extensions/11_online_tool_guard.py",
+        "examples/coding/extensions/12_online_dynamic_resources.py",
+        "examples/coding/extensions/13_online_resume_with_extension.py",
+    ),
+)
+def test_catalog_owned_tool_examples_import_without_compatibility_exports(
+    example: str,
+) -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import runpy,sys; runpy.run_path(sys.argv[1], run_name='example_smoke')",
+            example,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_example_active_tool_intent_resolves_to_the_host_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loushang.harness.environment import LocalHostEnvironmentProbe
+
+    monkeypatch.delenv("LOUSHANG_EXAMPLES_MODEL_CATALOG", raising=False)
+    monkeypatch.delenv("LOUSHANG_EXAMPLES_ARTIFACT_ROOT", raising=False)
+    monkeypatch.delenv("LOUSHANG_EXAMPLES_SESSION_DIR", raising=False)
+    module = _load_module(
+        Path("examples/coding/_support.py"),
+        "examples_coding_support_active_catalog",
+    )
+    command_tool_name = (
+        "shell"
+        if LocalHostEnvironmentProbe().detect().os_family == "windows"
+        else "bash"
+    )
+
+    async def scenario() -> list[str]:
+        runtime = module.create_kimi_runtime(
+            cwd=tmp_path,
+            model=module.build_kimi_model(),
+            active_tool_names=["bash", "write"],
+            persist=False,
+        )
+        try:
+            session = await runtime.create_session(cwd=str(tmp_path))
+            await session.prepare_model_call_runtime()
+            return [tool.name for tool in session.agent.tools]
+        finally:
+            await runtime.dispose_session_runtime()
+
+    active_tools = asyncio.run(scenario())
+
+    assert set(active_tools) == {command_tool_name, "write"}
+    assert len(active_tools) == 2
+
+
 def test_usage_inspect_example_marks_unknown_cost(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -171,6 +265,7 @@ def test_usage_inspect_example_marks_unknown_cost(
             content=[TextPart(type="text", text="ok")],
             api="anthropic-messages",
             provider="kimi-code",
+            endpoint="kimi-code-anthropic",
             model="kimi-for-coding",
             response_id=None,
             usage=Usage(
@@ -188,7 +283,9 @@ def test_usage_inspect_example_marks_unknown_cost(
 
     monkeypatch.setattr(sys, "argv", ["22_usage_inspect.py"])
     monkeypatch.setattr(module, "_resolve_model_catalog", lambda: None)
-    monkeypatch.setattr(module, "build_kimi_model", lambda **kwargs: SimpleNamespace(pricing=None))
+    monkeypatch.setattr(
+        module, "build_kimi_model", lambda **kwargs: SimpleNamespace(pricing=None)
+    )
     monkeypatch.setattr(
         module,
         "describe_model",
@@ -212,3 +309,33 @@ def test_usage_inspect_example_marks_unknown_cost(
         "known": False
     }
     assert "cost: {'known': False}" in output
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="macOS env-sensitive golden/smoke; may hide a real macOS product bug — tracked separately as issue #455",
+)
+def test_runtime_capability_replacement_extension_example_runs_offline() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "examples/coding/extensions/06_runtime_capability_replacement.py",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert "Selected source: extension" in completed.stdout
+    assert "Selected layer: extension:examples.side-question" in completed.stdout
+    assert (
+        "Implementation: "
+        "extension:examples.side-question:interaction.side_question:demo"
+        in completed.stdout
+    )
+    assert "Answer: extension:What is the current status?" in completed.stdout
+    assert (
+        "Lifecycle: create -> bind -> ask:What is the current status? -> dispose"
+        in (completed.stdout)
+    )

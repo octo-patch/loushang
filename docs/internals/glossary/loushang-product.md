@@ -33,6 +33,40 @@ Harness supplies product-neutral mechanisms. A Product supplies domain
 semantics, defaults, and policy. An OEM selects and overlays Products. Plugins
 contribute optional resources or behavior only after Product and OEM admission.
 
+## Concept Dimensions
+
+The core terms name different architectural dimensions and must not be used as
+substitutes for one another:
+
+| Term | Dimension | Governing question |
+| --- | --- | --- |
+| Product | domain identity | What coherent domain experience owns this Session? |
+| OEM | platform selection and overlay | Which Products, defaults, policy, resources, and branding does this distribution select? |
+| Capability | runtime composition | What named ability must the runtime bind? |
+| Harness Capability | shared mechanism ownership | Which Product-neutral contract or mechanism does Harness own? |
+| Package | distribution and materialization | How are software or resources delivered? |
+| Plugin | optional identity and activation | Which manifest-backed contribution source can be admitted and enabled independently? |
+| Extension | executable or declarative contribution | What optional behavior enters a defined extension surface? |
+
+The runtime relationship is:
+
+```text
+OEM selects and overlays Products
+  -> Product declares and binds Capability Slots
+     -> Harness supplies Product-neutral Harness Capabilities
+     -> admitted Plugins contribute resources or Extensions
+```
+
+Distribution is an orthogonal relationship:
+
+```text
+Product Package  -> registers a Product
+OEM Package      -> provides an OEM Profile and optional overlays or Plugins
+Resource Package -> distributes resources and optional Extensions
+Plugin           -> gives optional identity and activation to a contribution source
+Extension        -> contributes behavior to an admitted runtime surface
+```
+
 ## Platform And Launch Model
 
 ### Platform
@@ -47,6 +81,19 @@ Product routing, shared process or tenant services, and runtime disposal.
 
 A Platform Host may expose a CLI, TUI, RPC, web, embedded, or other channel. It
 does not supply Coding, PPT, Research, or other domain semantics.
+
+### AppHost
+
+The accepted top-level physical owner of the logical Platform Host role.
+`loushang.apphost` owns admitted cross-Product catalog/routing, canonical
+per-Session Product Runtime bindings, deployment-profile selection, and
+process-level release ordering. "Platform Host" remains the logical role;
+"AppHost" names its Loushang Architecture Scope and package.
+
+AppHost core does not own Product semantics, Harness mechanisms, AppServer
+transport, AppService coordination, Hosting process lifetime, or presentation.
+Optional hosted and launcher adapters compose those sibling contracts without
+merging their owners.
 
 ### Platform CLI
 
@@ -157,6 +204,30 @@ When restoring a session, the persisted `product_id` is authoritative unless an
 explicit migration is performed. Routing must not silently reinterpret one
 Product's session as another Product.
 
+### Session Identity Envelope
+
+A small generic, versioned routing header committed atomically by the canonical
+Session persistence owner. It contains an explicit `product_id`, continuity
+and Session identity, and bounded opaque provider/locator discriminators. It
+contains no Product payload, credential, mutable runtime state, path, or trust
+decision.
+
+AppHost consumes the envelope through an injected, revision-pinned Session
+identity/catalog port before Product-specific parsing. Legacy candidates
+without an envelope require explicit Product-owned import and are never assigned
+a default Product by AppHost.
+
+### Host/Presentation Profile Plugin
+
+A canonical manifest-backed Plugin contribution for one admitted delivery form,
+such as embedded TUI, desktop application, WebUI, or remote client. Product
+identity and delivery profile are orthogonal: CodingTUI and CodingApp profiles
+may share the same Coding Product and scoped Product Runtime.
+
+This is not another Plugin kind, Product registry, AppHost instance, or runtime
+owner. Existing Product/OEM Plugin admission owns source trust and generation
+lifetime; AppHost receives only an admitted immutable descriptor and factory.
+
 ### Product Runtime Plan
 
 The Product-owned, data-only declaration of runtime capability slots, baseline
@@ -164,6 +235,21 @@ selections, allowed override sources, and configuration.
 
 A Product Runtime Plan does not contain factories, credentials, plugin
 discovery, or live objects.
+
+### Plugin Composition Set
+
+A Product-owned, data-only, reusable list of Plugin selections and default
+namespaced configuration that a Product Runtime Plan or OEM Profile may expand.
+
+A Plugin Composition Set is not a Product Profile, OEM Profile, Runtime
+Profile, Capability Bundle, or live generation. It cannot contain callables,
+credentials, mounted Providers, or authority beyond the selecting Product/OEM
+ceiling.
+
+Product-owned selections compile once into the defaults of a derived
+`ProductRuntimePlan` with Plugin provenance; they are not supplied as an
+external Product layer. OEM, Extension, and Session selections retain their
+existing admitted layer paths, after which `RuntimeProfileResolver` runs once.
 
 ### Resolved Runtime Profile
 
@@ -208,6 +294,34 @@ one Product Session to another Product.
 For example, Coding may create a deck artifact and hand it to a PPT Product
 Session for canvas-level editing. A Product Handoff is not an in-place mutation
 of the source session's `product_id`.
+
+### Code-Enabled Product
+
+A Product that mounts Product-approved, Product-neutral workspace, file,
+process, Sandbox, Approval, or automation Capabilities without adopting the
+Coding Product's domain identity or complete repository-engineering lifecycle.
+
+Every Product may be code-enabled, but not every Product is the Coding Product.
+Mounting Harness-owned read, list, search, write, edit, or process-execution
+mechanisms does not create a second Product, change the active `product_id`, or
+authorize unrestricted shell, network, package-install, or workspace access.
+The owning Product still selects the capability packs, grants, roots, defaults,
+prompt wording, artifact meanings, and presentation.
+
+### Coding Product
+
+The Product whose kernel owns the complete repository-engineering experience,
+including Coding-specific prompts, tool-pack defaults, repository and Git
+workflow, session compatibility, diagnostics, and Product presentation.
+
+The accepted target Coding-specific mountable Capability IDs are `coding.arch`
+and `coding.lsp`; matching Coding constants already exist, while the top-level
+planner and live Mount graph do not. Workspace read, list, search, write, edit,
+and process-execution facets belong to the Product-neutral
+`harness.workspace` Capability selected and configured by Coding; they are not
+Coding-owned merely because Coding was their first consumer. Other Coding-
+exclusive Product Kernel semantics remain Product-owned even when they are not
+expressed as mountable Capability IDs.
 
 ## OEM Model
 
@@ -262,17 +376,209 @@ Coding launch, or a Product with OEM overlays.
 
 ## Capability Composition
 
+This section defines vocabulary. The binding, conflict, dependency, authority,
+and lifecycle rules are defined by the
+[Harness Capability Variation And Replacement Boundary](../architecture/harness/capability-variation-and-replacement-boundary.md).
+Top-level dependency direction and Mount lifecycle are defined by the
+[Capability Dependency And Mount Lifecycle](../architecture/harness/capability-dependency-and-mount-lifecycle.md)
+decision.
+
 ### Capability
 
 A named runtime or domain concern, such as a conversation store, memory
 provider, compaction planner, tool definition, command descriptor, deck
 renderer, or artifact handler.
 
+### Capability ID
+
+A stable owner-qualified identity for a top-level Capability, such as
+`harness.workspace`, `harness.resources`, `harness.session`, `coding.lsp`, or
+`coding.arch`.
+
+A Capability ID names the definition and dependency target. It is not a live
+Mount, implementation key, Python Protocol, permission, tool name, or Plugin
+identity. Architecture documents may call it *mountable* when a Product exposes
+Mount Policy for that Capability.
+
+### Capability Bundle
+
+The owner-composed runtime boundary that implements exactly one Capability ID.
+It may contain tools, resources, typed public facet views, and private Binding
+Facets with more detailed scope, refresh, selection, and diagnostic lifecycles.
+
+One top-level Mount generation describes the public Bundle binding. Private
+Facet generations remain authoritative for internal refreshes, and a Bundle
+may hold explicit leases or stable references to broader-lived Facets. It must
+not capture a shorter-lived concrete value across its safe boundary.
+
+A Capability Bundle is not a Product Capability Bundle. The former implements
+one Capability ID at runtime; the latter is an assembly or distribution
+grouping that may deliver several Capability Bundles, resource families, and
+Capability Packs.
+
+### Harness Capability
+
+A Product-neutral Capability whose public contract, reusable mechanism, or
+explicitly overridable platform default is owned by Harness. Examples include
+authorized process launching, workspace operations, resource discovery,
+approval coordination, runtime-profile resolution, and shared lifecycle
+mechanics.
+
+`Harness Capability` is the canonical owner-oriented term. `Shared capability`
+may describe its cross-Product reuse, but it is not a Plugin manifest kind or a
+separate activation object. Shared does not mean global singleton, mandatory
+for every Product, or identically configured by every Product. Products still
+own domain defaults, admission, activation, policy, and presentation unless a
+specific boundary says otherwise.
+
+### Product Capability Requirement
+
+An opaque Product-level request for a named capability, declared by an admitted
+Skill, Method, Work plan, Session operation, or Product default. A requirement
+does not name executable handlers, select a Harness implementation, grant
+authority, or imply activation. The Active Product resolves it through its
+admitted capability catalog and policy.
+
+### Capability Dependency
+
+A declared requirement from one Capability ID to another. In architecture
+graphs `A -> B` means A depends on B. The depended-on Capability binds first and
+disposes last.
+
+A dependency may request a narrow facet view, but that view does not create a
+new top-level node or grant authority. Permissions, configuration values, and
+injected implementation Protocols are not Capability dependencies.
+
+### Binding Facet
+
+An owner-private selection, provider, contribution family, or lifecycle unit
+inside a Capability Bundle. Runtime Profile slots such as `prompt.sections` or
+`interaction.side_question` may act as Binding Facets without becoming
+top-level Capability IDs.
+
+A Binding Facet can retain focused selection, refresh, snapshot, and diagnostic
+semantics. Its owner projects an aggregate Capability state to the top-level
+graph.
+
 ### Capability Slot
 
 A Product-declared location at which one or more implementations of a
 Capability may bind. The slot defines composition shape, lifecycle scope,
-refresh boundary, and allowed contribution sources.
+refresh boundary, and allowed contribution sources. When the slot exposes
+replaceable or composable behavior, `variation_semantic` separately records
+Aggregate Contribution, Ordered Interception, or Exclusive Replacement.
+
+A Capability Slot is not automatically a top-level Capability dependency node.
+It may be a private Binding Facet of a coarser Capability Bundle.
+
+### Runtime Capability Shape
+
+The profile-resolution cardinality and identity rule declared by a
+`RuntimeCapabilitySlot`: `single`, `exclusive`, `ordered`, or `append_only`.
+Shape answers how selections are retained and bound; it is separate from the
+behavioral variation semantic applied by the resolved provider or extension
+surface.
+
+An `ordered` shape can feed either Aggregate Contribution or Ordered
+Interception. A `single` or `exclusive` shape can supply one provider without
+implying that every source is allowed to replace it. `exclusive` additionally
+requires a sealed refresh boundary. `append_only` retains repeated selections
+where the owning aggregate contract permits them.
+
+### Capability Provider
+
+A factory, adapter, or live implementation that can satisfy a Capability Slot
+after discovery, admission, and resolution. A provider does not acquire
+authority merely by being installed or discovered.
+
+For a top-level complete-Bundle replacement, the Capability owner first grants
+eligibility and later performs final admission over the fully normalized
+candidate and effective grants. Product policy selects only among those final
+admissions. The candidate fingerprint includes its declaration, configuration,
+dependency/source/scope and target Capability Definition facts; Provider ID and
+version alone are not sufficient authority or resume identity.
+
+### Capability Component
+
+A typed contribution aggregated inside an existing Capability Bundle under a
+versioned owner-defined schema, such as one language-server route inside
+`coding.lsp` or one analyzer inside `coding.arch`.
+
+The exact Capability owner defines component identity, conflicts, ordering,
+facets, refresh and disposal, then publishes the admitted set in one owner
+generation. A Capability Component cannot replace the complete Bundle, publish
+a Graph Mount, or mutate a live Bundle registry.
+
+### Override
+
+An umbrella term for an allowed variation of a Product or platform default.
+`Override` does not define a conflict rule. Architecture documents must name
+the applicable Aggregate Contribution, Ordered Interception, Resource Overlay,
+or Exclusive Replacement semantic instead of relying on unspecified
+last-write-wins behavior.
+
+Runtime Capability Shape and variation semantics are orthogonal. Architecture
+documents must record both when a runtime-profile slot binds replaceable or
+composable behavior.
+
+### Aggregate Contribution
+
+A composition semantic in which every admitted contribution remains active
+and the owning Product or Harness mechanism combines them deterministically.
+Tools, commands, hooks, and server-definition catalogs may use this semantic
+when their owning boundary permits multiple entries.
+
+### Ordered Interception
+
+A composition semantic in which admitted handlers form an explicit ordered
+pipeline. Each handler delegates to, observes, or transforms the next result
+under a declared error policy. Ordering is part of the resolved contract and
+must not depend on incidental discovery order.
+
+### Decoration
+
+A restricted form of Ordered Interception that wraps an already resolved
+capability without taking ownership of its selection. Tracing, metrics, and
+caching are typical decorators. A decorator must preserve the underlying
+authority and lifecycle contract and cannot weaken an invariant enforcement
+layer.
+
+### Exclusive Replacement
+
+A composition semantic in which exactly one admitted provider is active for a
+declared variation surface. Selection is explicit and explainable: the owning
+surface may define deterministic precedence, require a named provider, or
+reject candidates that its policy cannot disambiguate. It must not rely on
+incidental last-write or discovery order. When profile-bound, Runtime
+Capability Shape independently governs selection retention and refresh. Any
+fallback is selected by the owning Product or Platform policy.
+
+### Protocol Injection
+
+Composition-root wiring of an implementation through a stable Protocol or
+public capability contract. Runtime invocation of the injected object does not
+create a reverse source dependency: Harness must not import or interpret a
+Product implementation that was injected through a neutral contract.
+
+### Composition Root
+
+The outer lifecycle owner that discovers, admits, resolves, constructs, binds,
+and disposes a runtime object graph. A composition root may know concrete
+implementations from multiple layers; the composed layers must continue to
+depend only on their public inward-facing contracts.
+
+### Invariant Enforcement Layer
+
+A non-bypassable wrapper that preserves authority, approval, sandbox,
+resource-limit, validation, or cleanup guarantees around a replaceable
+provider or private mechanism. Product and Plugin variation may tighten these
+guarantees but cannot replace or weaken the enforcement layer.
+
+### Trusted Backend Substitution
+
+Replacement of a private mechanism by an explicitly trusted Platform
+composition point. This is not an ordinary Plugin right and exists only where
+the owning boundary deliberately publishes such a seam.
 
 ### Capability Pack
 
@@ -299,14 +605,42 @@ A Product Capability Bundle does not become the Active Product. If PPT-specific
 canvas state, session compatibility, compaction, approval, or artifact lifecycle
 is required, use the PPT Product and an explicit Product Handoff.
 
+A Product Capability Bundle is not a top-level Capability DAG node. Its
+contents enter their owner-defined Capability Bundles, resource overlays, or
+Capability Pack admission paths independently.
+
 ### Capability Mount
 
-The Product-owned activation of an admitted Product Capability Bundle or
-Capability Pack for a specific runtime scope.
+The Product-owned act and resulting binding by which an admitted Capability
+Bundle becomes available in a specific runtime scope.
 
-For example, Coding may mount `ppt-authoring` while remaining the Active
-Product. The Product Session should snapshot continuity-critical mounted
-identities and compatible versions.
+A Capability ID such as `coding.lsp` names the definition; it is not itself a
+Mount. A concrete Mount combines that Capability ID with a process, tenant,
+workspace, Session, turn, or Channel scope instance and a live generation.
+
+### Mount Policy
+
+Product policy that decides when an admitted Capability is mounted. Common
+values are `disabled`, `on_demand`, and `always`. Mount Policy does not select a
+provider, grant authority, or identify a live runtime instance.
+
+### Mounted Capability
+
+One admitted Capability Bundle bound to a concrete runtime scope. For example,
+`coding.lsp@session:session-42` is a useful diagnostic label for one Mounted
+Capability, while `coding.lsp` remains its Capability ID.
+
+Scoped Mounts from Product defaults, manual selection, Skills, and Method/Work
+steps are additive and independently owned; releasing one scope must not remove
+another scope's request. A Mounted Capability owns or imports the lifecycle
+required by its declared dependencies. It is unrelated to an AppService
+control lease.
+
+For example, Coding may activate the `ppt-authoring` Product Capability Bundle
+while remaining the Active Product. Its admitted contents may contribute
+resources and Capability Packs or request owner-defined Capability Mounts. The
+Product Session should snapshot continuity-critical Mounted Capability
+identities, compatible versions, and separately activated bundle provenance.
 
 ## Package, Plugin, Extension, And Resource Model
 
@@ -317,7 +651,9 @@ documents.
 
 Use Product Package for an installable Product, OEM Package for an installable
 OEM configuration, and Resource Package for an installable resource
-collection. Do not use unqualified Package when ownership matters.
+collection. Use Python package only for the Python import/distribution concept;
+it does not imply a Loushang Resource Package, Plugin, or Product Package. Do
+not use unqualified Package when ownership matters.
 
 ### Resource Package
 
@@ -330,12 +666,57 @@ Package registration contract.
 
 ### Plugin
 
-An optional, independently enabled contribution source resolved into resource
-roots and, where supported, extension contributions.
+An independently selectable activation identity that groups one or more typed
+contribution declarations and their management provenance. A Plugin may carry
+Resources, Tool or Command packs, Capability Providers, Extensions, or future
+owner-defined contribution kinds. It is not synonymous with its Package bytes,
+Resource roots, execution process, or any contributed Capability.
 
 A Plugin runs under Product and OEM activation and trust policy. It does not own
 the Product lifecycle, select the Active Product, or acquire execution authority
-merely by being installed.
+merely by being installed. A Plugin is the manifest-backed identity and
+activation boundary, not the installed bytes or materialized directory itself.
+
+Create a Plugin identity only when independent selection, update, revocation,
+trust/execution decision, or atomic contribution grouping is required. Native
+Skills and other directly discovered Resources need no synthesized Plugin
+identity. Product-embedded contributions likewise remain Product build input
+unless the Product intentionally exposes independent Plugin lifecycle.
+
+Manifest parsing is inert. If a Plugin has an executable declaration
+entrypoint, Product/OEM enablement, source trust, immutable content identity,
+scope, security-relevant configuration, and execution approval are decided
+before that entrypoint is imported or launched. Final contribution admission
+still belongs to the exact Capability, Extension, Resource, Agent, event, or
+other owner.
+
+### Plugin Management Service
+
+The sole Product-scoped coordinator for Plugin installation, enablement,
+updates, repair, removal, and final data deletion. Every CLI, RPC, UI, SDK, ACP,
+or JSON-RPC adapter submits the same typed, idempotent, revision-checked command
+and observes its durable operation status.
+
+The service coordinates Package, configuration, selection, and exact owner
+transactions but does not replace their parsing, admission, publication,
+retirement, or projection authority.
+
+### Agent Definition
+
+A data-only Product contribution describing an Agent role and references to
+admitted prompts, model policy, Tool/Skill selectors, memory policy, isolation
+policy, and optionally a named Plugin Composition Set.
+
+An Agent Definition does not create an Agent during discovery, declaration, or
+binding. The Product Agent Host admits it and either joins the parent Product
+Session composition or creates an explicit child Product Session when a
+different composition is requested.
+
+It may reference optional admitted prompts, model/effort requests,
+Tool/Skill/MCP selectors, stricter permission/isolation modes, memory facets,
+background policy and limits, but cannot widen Product ceilings. Hooks remain
+Event/Extension contributions, and the initial user prompt belongs to the spawn
+request and committed Model Input rather than the reusable Agent Definition.
 
 ### Extension
 
@@ -344,7 +725,23 @@ extension surface, such as a Tool, command, hook, policy interceptor, approval
 replacement, renderer, or channel adapter.
 
 An Extension is one possible contribution carried by a Plugin or Resource
-Package. Product or OEM policy decides whether it is admitted and active.
+Package. Product or OEM policy decides whether it is admitted and active. An
+Extension does not become a Product or acquire execution authority merely
+because its descriptor was discovered.
+
+The canonical relationship is:
+
+```text
+source authority -> immutable package artifact -> Plugin manifest
+                 -> typed declarations -> exact Capability/Resource/Tool/
+                                          Command/Extension owners
+```
+
+Not every Resource Package is a Plugin: a configured package root can be
+consumed directly. Not every Plugin carries a Resource or Extension: it may
+provide only a Capability Provider or Tool pack. Not every Extension needs a
+dedicated Package: built-in Product composition may contribute one without
+independent Plugin identity.
 
 ### Skill
 
@@ -389,11 +786,12 @@ loushang
 acme
   -> start the shared Platform Host with OEM Profile "acme"
   -> select Product "coding"
-  -> mount admitted OEM and ppt-authoring capabilities
+  -> activate admitted OEM and ppt-authoring bundle contributions
 ```
 
 In this example, `coding` remains the Active Product. The OEM Profile and
-mounted capability identities are recorded separately.
+activated Product Capability Bundle provenance and resulting Mounted Capability
+identities are recorded separately.
 
 ### Full PPT Launch Or Handoff
 
@@ -413,8 +811,8 @@ policy, or presentation semantics.
 - An OEM Package may configure multiple Product Packages.
 - One Platform Host may run multiple Products concurrently.
 - One Product Session has exactly one Active Product.
-- A Product may mount many admitted Capability Packs and Product Capability
-  Bundles.
+- A Product may activate many admitted Capability Packs and Product Capability
+  Bundles; only owner-defined Capability IDs produce Mounted Capabilities.
 - A Product Capability Bundle augments a Product; it does not silently replace
   it.
 - Product Handoff crosses Product-session boundaries explicitly.

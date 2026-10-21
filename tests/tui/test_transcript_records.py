@@ -30,6 +30,26 @@ def rendered_text(view: TranscriptView, *, width: int = 60, height: int = 20) ->
     return tuple(line.text for line in result.lines)
 
 
+def test_streaming_assistant_prefix_preserves_fitted_styled_lines() -> None:
+    lines = (
+        "short",
+        "",
+        "\x1b[32mgreen\x1b[0m",
+        "┌──────────┐",
+        "中 text",
+    )
+    for width in (2, 30):
+        target = transcript_module.autowrap_safe_width(width)
+        expected = tuple(
+            transcript_module._prefixed_rendered_lines(
+                "* ", "  ", lines, width=target
+            )
+        )
+        assert transcript_module._prefix_streaming_assistant_segment(
+            lines, width=width, use_first_prefix=True
+        ) == expected
+
+
 def test_assistant_streaming_chunks_update_one_draft_until_commit() -> None:
     transcript = TranscriptBuffer()
     transcript.append(UserPromptRecord(text="hello"))
@@ -88,9 +108,19 @@ def test_worked_divider_commits_as_stable_transcript_record() -> None:
 
 
 def test_context_compaction_record_renders_as_single_stable_transcript_line() -> None:
-    view = TranscriptView([ContextCompactionRecord(summary="older context summarized", tokens_before=500_000)])
+    view = TranscriptView(
+        [
+            ContextCompactionRecord(
+                summary="older context\nsummarized",
+                tokens_before=500_000,
+            )
+        ]
+    )
 
-    assert rendered_text(view, width=80) == ("* Context compacted: older context summarized (500000 tokens before)",)
+    lines = rendered_text(view, width=80)
+
+    assert lines == ("* Context compacted (500000 tokens before)",)
+    assert all("\n" not in line and "\r" not in line for line in lines)
 
 
 def test_status_record_renders_message_without_thinking_prefix() -> None:

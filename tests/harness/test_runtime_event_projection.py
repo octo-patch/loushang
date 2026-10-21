@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from loushang.ai.types import AssistantMessage, Usage
 from loushang.harness.events import (
     BranchSummaryCompleted,
+    ContextCompactionCompleted,
     ContextCompactionStarted,
     PackageProgressChanged,
     QueueChanged,
@@ -40,9 +41,7 @@ def _event(kind: str, payload: object) -> RuntimeEvent[object]:
 def test_runtime_projection_preserves_agent_owned_event() -> None:
     payload = {"type": "agent_start"}
 
-    projected = project_session_runtime_event(
-        _event("agent.agent_start", payload)
-    )
+    projected = project_session_runtime_event(_event("agent.agent_start", payload))
 
     assert projected is payload
 
@@ -54,9 +53,7 @@ def test_runtime_projection_converts_common_session_payloads() -> None:
             follow_up=(QueuedMessageSnapshot("q2", "follow_up", "continue"),),
         )
     )
-    assert project_session_runtime_event(
-        _event("session.queue_update", queue)
-    ) == {
+    assert project_session_runtime_event(_event("session.queue_update", queue)) == {
         "type": "queue_update",
         "steering": ["adjust"],
         "follow_up": ["continue"],
@@ -70,6 +67,41 @@ def test_runtime_projection_converts_common_session_payloads() -> None:
         "type": "compaction_start",
         "reason": "threshold",
         "usage": {"tokens": 90},
+    }
+    assert project_session_runtime_event(
+        _event(
+            "session.compaction_end",
+            ContextCompactionCompleted(
+                "manual",
+                {"summary": "done"},
+                False,
+                False,
+                usage_before={"tokens": 90},
+                usage_after={"tokens": 30},
+                stage="committed",
+                product_id="research",
+                session_id="s1",
+                duration_ms=12.5,
+                tokens_before=90,
+                tokens_after=30,
+                checkpoint_record_id="checkpoint-1",
+            ),
+        )
+    ) == {
+        "type": "compaction_end",
+        "reason": "manual",
+        "result": {"summary": "done"},
+        "aborted": False,
+        "will_retry": False,
+        "usage_before": {"tokens": 90},
+        "usage_after": {"tokens": 30},
+        "stage": "committed",
+        "product_id": "research",
+        "session_id": "s1",
+        "duration_ms": 12.5,
+        "tokens_before": 90,
+        "tokens_after": 30,
+        "checkpoint_record_id": "checkpoint-1",
     }
     assert project_session_runtime_event(
         _event(
@@ -155,6 +187,7 @@ def test_runtime_projection_converts_tool_policy_audit_event() -> None:
 
 def test_runtime_projection_creates_transport_view_with_source_identity() -> None:
     message = AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[],
         api="test",

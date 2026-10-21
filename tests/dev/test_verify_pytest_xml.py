@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+
+def test_verifier_accepts_nonempty_passing_report_and_required_property(
+    tmp_path: Path,
+) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="2" skipped="0" failures="0" errors="0">'
+        '<properties><property name="terminal_backend" value="conpty"/>'
+        "</properties></testsuite></testsuites>",
+        "--require-property",
+        "terminal_backend=conpty",
+    )
+
+    assert result.returncode == 0
+    assert "tests=2" in result.stdout
+
+
+def test_verifier_rejects_empty_report(tmp_path: Path) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="0" skipped="0" failures="0" errors="0"/>'
+        "</testsuites>",
+    )
+
+    assert result.returncode == 1
+    assert "tests must be greater than zero" in result.stderr
+
+
+def test_verifier_rejects_skipped_failed_or_error_results(tmp_path: Path) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="4" skipped="1" failures="1" errors="1"/>'
+        "</testsuites>",
+    )
+
+    assert result.returncode == 1
+    assert "skipped must be zero" in result.stderr
+    assert "failures must be zero" in result.stderr
+    assert "errors must be zero" in result.stderr
+
+
+def test_verifier_allows_platform_skips_when_at_least_one_test_passes(
+    tmp_path: Path,
+) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="11" skipped="10" failures="0" errors="0"/>'
+        "</testsuites>",
+        "--allow-skipped",
+    )
+
+    assert result.returncode == 0
+    assert "skipped=10" in result.stdout
+
+
+def test_verifier_rejects_all_skipped_report_even_when_skips_are_allowed(
+    tmp_path: Path,
+) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="10" skipped="10" failures="0" errors="0"/>'
+        "</testsuites>",
+        "--allow-skipped",
+    )
+
+    assert result.returncode == 1
+    assert "at least one test must pass" in result.stderr
+
+
+def test_verifier_rejects_wrong_required_property(tmp_path: Path) -> None:
+    result = _run_verifier(
+        tmp_path,
+        '<testsuites><testsuite tests="1" skipped="0" failures="0" errors="0">'
+        '<properties><property name="terminal_backend" value="posix-pty"/>'
+        "</properties></testsuite></testsuites>",
+        "--require-property",
+        "terminal_backend=conpty",
+    )
+
+    assert result.returncode == 1
+    assert "terminal_backend" in result.stderr
+
+
+def test_verifier_requires_exact_test_count(tmp_path: Path) -> None:
+    report = '<testsuites><testsuite tests="4" skipped="0" failures="0" errors="0"/></testsuites>'
+    accepted = _run_verifier(tmp_path, report, "--require-tests-count", "4")
+    assert accepted.returncode == 0
+
+    incomplete = _run_verifier(tmp_path, report, "--require-tests-count", "5")
+    assert incomplete.returncode == 1
+    assert "tests must be 5, got 4" in incomplete.stderr
+
+
+def test_verifier_requires_a_passing_case_from_each_batched_file(
+    tmp_path: Path,
+) -> None:
+    report = (
+        '<testsuites><testsuite tests="2" skipped="1" failures="0" errors="0">'
+        '<testcase classname="tests.demo.test_one" name="test_pass"/>'
+        '<testcase classname="tests.demo.test_two" name="test_skip"><skipped/></testcase>'
+        "</testsuite></testsuites>"
+    )
+    missing = _run_verifier(
+        tmp_path,
+        report,
+        "--allow-skipped",
+        "--required-files-json",
+        '["tests/demo/test_one.py", "tests/demo/test_two.py"]',
+    )
+    assert missing.returncode == 1
+    assert "tests/demo/test_two.py" in missing.stderr
+
+    accepted = _run_verifier(
+        tmp_path,
+        report.replace("<skipped/>", ""),
+        "--allow-skipped",
+        "--required-files-json",
+        '["tests/demo/test_one.py", "tests/demo/test_two.py"]',
+    )
+    assert accepted.returncode == 0
+
+
+def test_verifier_requires_each_batched_node_and_accepts_parameters(
+    tmp_path: Path,
+) -> None:
+    report = (
+        '<testsuites><testsuite tests="2" skipped="0" failures="0" errors="0">'
+        '<testcase classname="tests.demo.test_mixed" name="test_one[param]"/>'
+        '<testcase classname="tests.demo.test_mixed.TestGroup" name="test_method"/>'
+        "</testsuite></testsuites>"
+    )
+    accepted = _run_verifier(
+        tmp_path,
+        report,
+        "--required-files-json",
+        '["tests/demo/test_mixed.py::test_one", '
+        '"tests/demo/test_mixed.py::TestGroup::test_method"]',
+    )
+    assert accepted.returncode == 0
+
+    missing = _run_verifier(
+        tmp_path,
+        report,
+        "--required-files-json",
+        '["tests/demo/test_mixed.py::test_two"]',
+    )
+    assert missing.returncode == 1
+    assert "test_two" in missing.stderr
+
+
+def _run_verifier(
+    tmp_path: Path, xml: str, *args: str
+) -> subprocess.CompletedProcess[str]:
+    report = tmp_path / "pytest.xml"
+    report.write_text(xml, encoding="utf-8")
+    return subprocess.run(
+        [
+            sys.executable,
+            "scripts/dev/verify_pytest_xml.py",
+            str(report),
+            *args,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )

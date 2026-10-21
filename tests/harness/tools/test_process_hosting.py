@@ -1,0 +1,539 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from loushang.harness.authorization import (
+    EffectiveExecutionProfile,
+    ExecutionAuthorizationError,
+)
+from loushang.harness.policy import PolicyDecision
+from loushang.harness.tools.process_hosting import (
+    ProcessExecutionScope,
+    ScopeBoundProcessLauncher,
+    _managed_process_launch_request,
+    _process_launch_fingerprint,
+)
+from loushang.harness.tools.workspace.policy import PolicyEnforcementError
+from loushang.harness.workspace.process import (
+    ProcessExit,
+    ProcessLaunchRequest,
+    ProcessStderrTail,
+)
+from loushang.harness.workspace.process._sealed_executable import (
+    SealedProcessExecutableUnavailable,
+    _capture_bound_process_directory,
+    _capture_sealed_process_executable,
+    _contained_process_launch_request,
+    _copy_stable_executable,
+    _process_inherited_file_descriptors,
+    _sealed_process_executable_from_request,
+)
+from loushang.harness.workspace.process.host import ProcessHostClosedError
+from loushang.harness.workspace.process.local import ProcessContainmentPlan
+
+
+class _Handle:
+    async def read_stdout(self, max_bytes: int = 64 * 1024) -> bytes:
+        del max_bytes
+        return b""
+
+    async def write_stdin(self, data: bytes) -> None:
+        del data
+
+    async def close_stdin(self) -> None:
+        return None
+
+    async def wait(self) -> ProcessExit:
+        return ProcessExit(0)
+
+    async def terminate(self) -> ProcessExit:
+        return ProcessExit(0)
+
+    async def close(self) -> None:
+        return None
+
+    def stderr_tail(self) -> ProcessStderrTail:
+        return ProcessStderrTail()
+
+
+class _Host:
+    def __init__(self) -> None:
+        self.requests: list[ProcessLaunchRequest] = []
+        self.closed = False
+
+    async def start(self, request, *, containment_planner=None):
+        if self.closed:
+            raise ProcessHostClosedError("host is closed")
+        assert containment_planner is not None
+        plan = await containment_planner(request)
+        self.requests.append(plan.request)
+        return _Handle()
+
+
+class _Containment:
+    def __init__(self) -> None:
+        self.profiles: list[EffectiveExecutionProfile | None] = []
+
+    async def plan(self, request, *, execution_profile=None):
+        self.profiles.append(execution_profile)
+        return ProcessContainmentPlan(request)
+
+
+class _Policy:
+    def __init__(
+        self,
+        decision: PolicyDecision,
+        *,
+        gate: asyncio.Event | None = None,
+    ) -> None:
+        self.decision = decision
+        self.gate = gate
+        self.entered = asyncio.Event()
+        self.subjects: list[object] = []
+
+    async def evaluate(self, subject):
+        self.subjects.append(subject)
+        self.entered.set()
+        if self.gate is not None:
+            await self.gate.wait()
+        return self.decision
+
+
+class _UnusedActorApprovalResolver:
+    actor_id = "coding-lsp"
+
+    def resolve(self, request):
+        del request
+        raise AssertionError("allow policy must not invoke approval")
+
+
+class _Signal:
+    aborted = False
+
+
+def _request(
+    tmp_path: Path,
+    *,
+    command: tuple[str, ...] = ("server", "--stdio"),
+    environment: tuple[tuple[str, str], ...] = (("TOKEN", "secret-one"),),
+) -> ProcessLaunchRequest:
+    return ProcessLaunchRequest(
+        command=command,
+        cwd=str(tmp_path),
+        effective_environment=environment,
+    )
+
+
+def test_live_process_selection_is_frozen_before_policy_and_bounded(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        ceiling = EffectiveExecutionProfile(readable_roots=(tmp_path,), network="denied")
+        selected = EffectiveExecutionProfile(readable_roots=(workspace,))
+        gate = asyncio.Event()
+        policy = _Policy(PolicyDecision.allow(), gate=gate)
+        host = _Host()
+        containment = _Containment()
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(
+                policy_evaluator=policy, execution_profile_ceiling=ceiling,
+                execution_profile_provider=lambda: selected,
+            ), host=host, containment=containment,  # type: ignore[arg-type]
+        )
+        pending = asyncio.create_task(launcher.start(_request(tmp_path), correlation_id="frozen"))
+        await policy.entered.wait()
+        # Enabling Full cannot retroactively widen an action already admitted.
+        selected = EffectiveExecutionProfile(
+            readable_roots=(tmp_path.parent,), writable_roots=(tmp_path.parent,),
+        )
+        gate.set()
+        with pytest.raises(ExecutionAuthorizationError):
+            await pending
+        assert host.requests == []
+        await launcher.start(_request(tmp_path), correlation_id="full")
+        assert containment.profiles[-1] == ceiling
+        selected = EffectiveExecutionProfile(readable_roots=(workspace,))
+        with pytest.raises(ExecutionAuthorizationError):
+            await launcher.start(_request(tmp_path), correlation_id="standard")
+        assert len(host.requests) == 1
+
+    asyncio.run(scenario())
+
+
+def test_scope_bound_launcher_silently_allows_and_audits_each_start(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        events: list[dict[str, object]] = []
+        policy = _Policy(PolicyDecision.allow())
+        host = _Host()
+        containment = _Containment()
+        ceiling = EffectiveExecutionProfile(
+            readable_roots=(tmp_path,),
+            writable_roots=(tmp_path,),
+            network="restricted",
+        )
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(
+                policy_evaluator=policy,
+                approval_resolver=_UnusedActorApprovalResolver(),
+                audit_sink=events.append,
+                execution_profile_ceiling=ceiling,
+            ),
+            host=host,  # type: ignore[arg-type]
+            containment=containment,
+        )
+
+        await launcher.start(_request(tmp_path), correlation_id="inspect-1")
+        await launcher.start(
+            _request(tmp_path, environment=(("TOKEN", "secret-two"),)),
+            correlation_id="inspect-2",
+        )
+
+        assert launcher.scope_actor_id == "coding-lsp"
+        assert len(policy.subjects) == 2
+        assert len(host.requests) == 2
+        assert containment.profiles == [ceiling, ceiling]
+        assert not any(event["type"] == "tool_approval_requested" for event in events)
+        frozen = [event for event in events if event["type"] == "tool_action_frozen"]
+        assert len(frozen) == 2
+        assert frozen[0]["action_fingerprint"] != frozen[1]["action_fingerprint"]
+        assert {event.get("tool_call_id") for event in frozen} == {
+            "inspect-1",
+            "inspect-2",
+        }
+        assert {event.get("actor_id") for event in frozen} == {"coding-lsp"}
+        serialized = json.dumps(events, sort_keys=True)
+        assert "secret-one" not in serialized
+        assert "secret-two" not in serialized
+
+    asyncio.run(scenario())
+
+
+def test_launcher_deny_and_late_allow_never_reach_spawn(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        denied_host = _Host()
+        denied = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(
+                policy_evaluator=_Policy(PolicyDecision.deny("blocked")),
+            ),
+            host=denied_host,  # type: ignore[arg-type]
+            containment=_Containment(),
+        )
+        with pytest.raises(PolicyEnforcementError, match="blocked"):
+            await denied.start(_request(tmp_path), correlation_id="denied")
+        assert denied_host.requests == []
+
+        gate = asyncio.Event()
+        policy = _Policy(PolicyDecision.allow(), gate=gate)
+        late_host = _Host()
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(policy_evaluator=policy),
+            host=late_host,  # type: ignore[arg-type]
+            containment=_Containment(),
+        )
+        launch_task = asyncio.create_task(
+            launcher.start(_request(tmp_path), correlation_id="late")
+        )
+        await policy.entered.wait()
+        late_host.closed = True
+        gate.set()
+
+        with pytest.raises(ProcessHostClosedError):
+            await launch_task
+        assert late_host.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_launcher_rechecks_abort_before_policy_and_immediately_before_spawn(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        already_aborted = _Signal()
+        already_aborted.aborted = True
+        untouched_policy = _Policy(PolicyDecision.allow())
+        untouched_host = _Host()
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(policy_evaluator=untouched_policy),
+            host=untouched_host,  # type: ignore[arg-type]
+            containment=_Containment(),
+        )
+        with pytest.raises(RuntimeError, match="Operation aborted"):
+            await launcher.start(
+                _request(tmp_path),
+                correlation_id="already-aborted",
+                signal=already_aborted,
+            )
+        assert untouched_policy.subjects == []
+        assert untouched_host.requests == []
+
+        gate = asyncio.Event()
+        policy = _Policy(PolicyDecision.allow(), gate=gate)
+        late_signal = _Signal()
+        late_host = _Host()
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(policy_evaluator=policy),
+            host=late_host,  # type: ignore[arg-type]
+            containment=_Containment(),
+        )
+        start_task = asyncio.create_task(
+            launcher.start(
+                _request(tmp_path),
+                correlation_id="late-abort",
+                signal=late_signal,
+            )
+        )
+        await policy.entered.wait()
+        late_signal.aborted = True
+        gate.set()
+
+        with pytest.raises(RuntimeError, match="Operation aborted"):
+            await start_task
+        assert late_host.requests == []
+
+    asyncio.run(scenario())
+
+
+def test_launcher_rejects_cwd_outside_execution_profile_before_spawn(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        admitted_root = tmp_path / "admitted"
+        admitted_root.mkdir()
+        outside_root = tmp_path / "outside"
+        outside_root.mkdir()
+        host = _Host()
+        containment = _Containment()
+        launcher = ScopeBoundProcessLauncher(
+            scope=ProcessExecutionScope(
+                execution_profile_ceiling=EffectiveExecutionProfile(
+                    readable_roots=(admitted_root,),
+                ),
+            ),
+            host=host,  # type: ignore[arg-type]
+            containment=containment,
+        )
+
+        with pytest.raises(
+            ExecutionAuthorizationError,
+            match="outside the authorized readable roots",
+        ):
+            await launcher.start(
+                _request(outside_root),
+                correlation_id="outside-root",
+            )
+
+        assert host.requests == []
+        assert containment.profiles == []
+
+    asyncio.run(scenario())
+
+
+def test_private_launch_fingerprint_covers_argv_cwd_and_complete_environment(
+    tmp_path: Path,
+) -> None:
+    base = _request(tmp_path)
+    other_root = tmp_path / "other"
+    other_root.mkdir()
+    variants = (
+        _request(tmp_path, command=("server", "--pipe")),
+        ProcessLaunchRequest(
+            command=base.command,
+            cwd=str(other_root),
+            effective_environment=base.effective_environment,
+        ),
+        _request(tmp_path, environment=(("TOKEN", "different"),)),
+    )
+
+    assert (
+        len(
+            {
+                _process_launch_fingerprint(base),
+                *map(_process_launch_fingerprint, variants),
+            }
+        )
+        == 4
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux memfd seals")
+@pytest.mark.parametrize(
+    ("command_path", "digest", "size"),
+    (
+        ("/wrong/runtime", None, None),
+        (None, "0" * 64, None),
+        (None, None, -1),
+    ),
+)
+def test_managed_request_rejects_executable_authorization_mismatch(
+    tmp_path: Path,
+    command_path: str | None,
+    digest: str | None,
+    size: int | None,
+) -> None:
+    executable = Path(sys.executable).resolve()
+    expected_digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    artifact = _capture_sealed_process_executable(
+        executable,
+        expected_digest=expected_digest,
+    )
+    try:
+        with pytest.raises(ValueError, match="authorization facts"):
+            _managed_process_launch_request(
+                command=(command_path or str(executable),),
+                cwd=str(tmp_path),
+                effective_environment=(),
+                declared_effects=(),
+                authorization_metadata={
+                    "runtimeDigest": digest or expected_digest,
+                    "runtimeSize": artifact.size if size is None else size,
+                },
+                pre_start_validator=artifact.verify,
+                sealed_executable=artifact,
+            )
+    finally:
+        artifact.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux memfd seals")
+def test_sealed_executable_owner_evidence_rejects_field_tampering() -> None:
+    executable = Path(sys.executable).resolve()
+    artifact = _capture_sealed_process_executable(
+        executable,
+        expected_digest=hashlib.sha256(executable.read_bytes()).hexdigest(),
+    )
+    try:
+        object.__setattr__(artifact, "logical_path", Path("/forged/runtime"))
+        with pytest.raises(
+            SealedProcessExecutableUnavailable,
+            match="identity changed",
+        ):
+            artifact.authorization_payload()
+    finally:
+        artifact.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX fd copy")
+def test_sealed_executable_capture_streams_in_bounded_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "runtime"
+    body = b"x" * (2 * 1024 * 1024 + 17)
+    source.write_bytes(body)
+    destination = os.open(
+        tmp_path / "sealed-copy",
+        os.O_CREAT | os.O_TRUNC | os.O_WRONLY,
+        0o600,
+    )
+    requested_sizes: list[int] = []
+    original_read = os.read
+
+    def bounded_read(descriptor: int, size: int) -> bytes:
+        requested_sizes.append(size)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", bounded_read)
+    try:
+        digest, size = _copy_stable_executable(source, destination)
+    finally:
+        os.close(destination)
+
+    assert digest == hashlib.sha256(body).hexdigest()
+    assert size == len(body)
+    assert requested_sizes
+    assert max(requested_sizes) <= 1024 * 1024
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux memfd seals")
+def test_contained_spawn_request_rejects_command_tampering(tmp_path: Path) -> None:
+    executable = Path(sys.executable).resolve()
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    artifact = _capture_sealed_process_executable(
+        executable,
+        expected_digest=digest,
+    )
+    try:
+        managed = _managed_process_launch_request(
+            command=(str(executable), "-"),
+            cwd=str(tmp_path),
+            effective_environment=(),
+            declared_effects=(),
+            authorization_metadata={
+                "runtimeDigest": digest,
+                "runtimeSize": artifact.size,
+            },
+            pre_start_validator=artifact.verify,
+            sealed_executable=artifact,
+        )
+        contained = _contained_process_launch_request(
+            managed,
+            command=("/usr/bin/bwrap", "--", str(executable), "-"),
+        )
+        assert _sealed_process_executable_from_request(contained) is artifact
+
+        object.__setattr__(contained, "command", ("/forged/launcher",))
+        with pytest.raises(
+            SealedProcessExecutableUnavailable,
+            match="spawn request changed",
+        ):
+            _sealed_process_executable_from_request(contained)
+    finally:
+        artifact.close()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux directory fd")
+def test_managed_spawn_retains_exact_cwd_directory_descriptor(tmp_path: Path) -> None:
+    executable = Path(sys.executable).resolve()
+    digest = hashlib.sha256(executable.read_bytes()).hexdigest()
+    runtime_artifact = _capture_sealed_process_executable(
+        executable,
+        expected_digest=digest,
+    )
+    identity = tmp_path.stat()
+    cwd_artifact = _capture_bound_process_directory(
+        tmp_path,
+        expected_identity=(identity.st_dev, identity.st_ino),
+    )
+    try:
+        managed = _managed_process_launch_request(
+            command=(str(executable), "-"),
+            cwd=str(tmp_path),
+            effective_environment=(),
+            declared_effects=(),
+            authorization_metadata={
+                "cwdDevice": cwd_artifact.device,
+                "cwdInode": cwd_artifact.inode,
+                "runtimeDigest": digest,
+                "runtimeSize": runtime_artifact.size,
+            },
+            pre_start_validator=runtime_artifact.verify,
+            sealed_executable=runtime_artifact,
+            bound_cwd_directory=cwd_artifact,
+        )
+        contained = _contained_process_launch_request(
+            managed,
+            command=("/usr/bin/bwrap", "--", str(executable), "-"),
+        )
+        assert _process_inherited_file_descriptors(contained) == (
+            runtime_artifact.descriptor,
+            cwd_artifact.descriptor,
+        )
+
+        object.__setattr__(cwd_artifact, "logical_path", Path("/forged/cwd"))
+        with pytest.raises(
+            SealedProcessExecutableUnavailable,
+            match="directory identity changed",
+        ):
+            _process_inherited_file_descriptors(contained)
+    finally:
+        cwd_artifact.close()
+        runtime_artifact.close()

@@ -2,24 +2,30 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Generic, Protocol, TypeVar
 
 from loushang.harness.diagnostics.types import DiagnosticDraft
 from loushang.harness.extensions.context import SessionRefreshEvent, SessionStartEvent
+from loushang.harness.extensions.declarations import (
+    ExtensionGraphProviderRestartRequiredError,
+)
 from loushang.harness.extensions.lifecycle import (
     ExtensionRuntimeCoordinator,
     ExtensionRuntimeOperation,
 )
 
+BindingT_contra = TypeVar("BindingT_contra", contravariant=True)
+BindingT = TypeVar("BindingT")
 
-class SessionExtensionRuntimePort(Protocol):
+
+class SessionExtensionRuntimePort(Protocol[BindingT_contra]):
     """Extension runtime operations common to a bound Product session."""
 
-    def bind_runtime(self, bindings: object) -> None: ...
+    def bind_runtime(self, bindings: BindingT_contra) -> None: ...
 
-    def refresh_runtime(self, bindings: object) -> None: ...
+    def refresh_runtime(self, bindings: BindingT_contra) -> None: ...
 
     async def emit_session_start(self, event: SessionStartEvent) -> None: ...
 
@@ -28,24 +34,24 @@ class SessionExtensionRuntimePort(Protocol):
     def invalidate_contexts(self, message: str) -> None: ...
 
 
-BuildBindings = Callable[[], object]
 RefreshResources = Callable[[], object | None]
 RecordRuntimeDiagnostic = Callable[[DiagnosticDraft], None]
 SyncExtensionDiagnostics = Callable[..., None]
 
 
 @dataclass
-class ExtensionSessionRuntime:
+class ExtensionSessionRuntime(Generic[BindingT]):
     """Adapt the neutral extension lifecycle coordinator to one session."""
 
-    extension_runtime: SessionExtensionRuntimePort | None
-    build_bindings: BuildBindings
+    extension_runtime: SessionExtensionRuntimePort[BindingT] | None
+    build_bindings: Callable[[], BindingT]
     session_start_event: SessionStartEvent
     refresh_resources: RefreshResources
     record_runtime_diagnostic: RecordRuntimeDiagnostic
     sync_extension_diagnostics: SyncExtensionDiagnostics
+    reload_generation: Callable[[BindingT], object | Awaitable[object]] | None = None
     _coordinator: (
-        ExtensionRuntimeCoordinator[object, SessionStartEvent, SessionRefreshEvent]
+        ExtensionRuntimeCoordinator[BindingT, SessionStartEvent, SessionRefreshEvent]
         | None
     ) = field(init=False, default=None)
 
@@ -63,6 +69,7 @@ class ExtensionSessionRuntime:
             record_failure=self._record_failure,
             sync_diagnostics=lambda: self.sync_extension_diagnostics(phase="runtime"),
             invalidate_contexts_driver=extension_runtime.invalidate_contexts,
+            reload_generation=self.reload_generation,
         )
 
     @property
@@ -101,6 +108,12 @@ class ExtensionSessionRuntime:
         operation: ExtensionRuntimeOperation,
         error: Exception,
     ) -> None:
+        if operation == "resource_refresh" and isinstance(
+            error,
+            ExtensionGraphProviderRestartRequiredError,
+        ):
+            self.record_runtime_diagnostic(error.diagnostic)
+            return
         code, prefix = _FAILURE_DIAGNOSTICS[operation]
         self.record_runtime_diagnostic(
             DiagnosticDraft(code=code, message=f"{prefix}: {error}")

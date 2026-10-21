@@ -1,0 +1,284 @@
+name: AppHost Quality
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  apphost-quality:
+    if: ${{ fromJSON(inputs.plan).checks.apphost }}
+    name: apphost-quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+
+      - name: Lint AppHost G8 through G13
+        run: >-
+          uv run --extra dev ruff check
+          src/loushang/apphost
+          src/loushang/appserver
+          src/loushang/appservice
+          src/loushang/coding/_apphost_canary_child.py
+          src/loushang/coding/_apphost_canary_control.py
+          src/loushang/coding/_product_worker_canary.py
+          src/loushang/coding/apphost_canary.py
+          src/loushang/coding/apphost_composition.py
+          src/loushang/coding/apphost_product.py
+          src/loushang/coding/appservice_adapter.py
+          src/loushang/coding/hosted_application.py
+          src/loushang/coding/hosted_continuity.py
+          src/loushang/coding/hosted_bootstrap.py
+          src/loushang/coding/hosted_local.py
+          src/loushang/coding/cli/hosted.py
+          src/loushang/coding/cli/mux.py
+          src/loushang/coding/cli/__main__.py
+          src/loushang/coding/cli/apphost.py
+          src/loushang/harness/machine_resources/control_plane.py
+          src/loushang/harnesstui/mux
+          scripts/dev/run_g10_installed_canary.py
+          scripts/dev/run_g16_installed_evidence.py
+          tests/dev/test_run_g16_installed_evidence.py
+          tests/architecture/test_detachable_local_workspace_g16_evidence.py
+          tests/coding/test_mux_native_evidence.py
+          tests/coding/test_mux_installed_evidence.py
+          scripts/dev/verify_evidence_manifest.py
+          tests/apphost
+          tests/appserver
+          tests/appservice
+          tests/coding/test_apphost_composition.py
+          tests/coding/test_apphost_canary.py
+          tests/coding/test_apphost_canary_control.py
+          tests/coding/test_apphost_product.py
+          tests/coding/test_appservice_adapter.py
+          tests/coding/test_hosted_application.py
+          tests/coding/test_hosted_bootstrap.py
+          tests/coding/test_hosted_local.py
+          tests/coding/test_hosted_local_ownership.py
+          tests/coding/test_mux_command.py
+          tests/coding/test_mux_terminal_process.py
+          tests/coding/test_mux_product_terminal.py
+          tests/coding/_local_product_child.py
+          tests/harnesstui/test_hosted_mux_shell.py
+          tests/harnesstui/test_hosted_mux_details.py
+          tests/tui/test_text_pager.py
+          src/loushang/tui/ui_parts/text_pager.py
+          tests/harnesstui/test_hosted_mux_terminal.py
+          tests/tui/test_terminal_session.py
+          tests/tui/test_composer_edit_buffer.py
+          src/loushang/tui/terminal_session.py
+          src/loushang/tui/composer_edit_buffer.py
+          src/loushang/tui/ui_parts/composer.py
+          tests/coding/test_mux_subprocess.py
+          tests/coding/test_cli_apphost.py
+          tests/dev/test_verify_evidence_manifest.py
+          tests/harness/worker/test_coding_product_worker_canary.py
+          tests/harnesstui/test_hosted_mux_profile.py
+          tests/harnesstui/test_hosted_mux_interaction.py
+          tests/architecture/test_apphost_a0_contract.py
+          tests/architecture/test_apphost_a02_architecture.py
+          tests/architecture/test_apphost_a03_a04_architecture.py
+          tests/architecture/test_hosted_product_runtime_g8_join.py
+          tests/architecture/test_hosted_product_runtime_g9_closure.py
+          tests/architecture/test_hosted_product_runtime_v1_baseline.py
+          tests/architecture/test_hosted_product_g10_explicit_canary_design.py
+          tests/architecture/test_hosted_product_g10_explicit_canary.py
+          tests/architecture/test_hosted_application_g11_design.py
+          tests/architecture/test_hosted_application_g11.py
+          tests/architecture/test_foreground_hosted_application_g12_design.py
+          tests/architecture/test_foreground_hosted_application_g12.py
+          tests/architecture/test_durable_hosted_application_continuity_g13_design.py
+          tests/architecture/test_durable_hosted_application_continuity_g13.py
+
+      - name: Typecheck AppHost G8 through G13
+        run: >-
+          uv run --extra dev mypy --follow-imports=silent
+          src/loushang/tui/ui_parts/text_pager.py
+          src/loushang/apphost
+          src/loushang/appserver
+          src/loushang/appservice
+          src/loushang/coding/_apphost_canary_child.py
+          src/loushang/coding/_apphost_canary_control.py
+          src/loushang/coding/_product_worker_canary.py
+          src/loushang/coding/apphost_canary.py
+          src/loushang/coding/apphost_composition.py
+          src/loushang/coding/apphost_product.py
+          src/loushang/coding/appservice_adapter.py
+          src/loushang/coding/hosted_application.py
+          src/loushang/coding/hosted_continuity.py
+          src/loushang/coding/hosted_bootstrap.py
+          src/loushang/coding/hosted_local.py
+          src/loushang/coding/cli/hosted.py
+          src/loushang/coding/cli/mux.py
+          src/loushang/harnesstui/mux
+          src/loushang/coding/cli/apphost.py
+
+      - name: Prepare regression reports
+        run: mkdir -p .artifacts
+
+      - name: Run AppHost regression once
+        run: >-
+          uv run --extra dev python scripts/dev/run_pytest.py
+          tests/dev/test_run_g16_installed_evidence.py
+          tests/architecture/test_detachable_local_workspace_g16_evidence.py
+          tests/apphost
+          tests/appserver
+          tests/appservice
+          tests/coding/test_apphost_canary.py
+          tests/coding/test_apphost_canary_control.py
+          tests/coding/test_apphost_composition.py
+          tests/coding/test_apphost_product.py
+          tests/harness/worker/test_coding_product_worker_canary.py::test_product_normal_close_retires_exact_attempt_without_global_rollback
+          tests/coding/test_appservice_adapter.py
+          tests/coding/test_hosted_application.py
+          tests/coding/test_hosted_bootstrap.py
+          tests/coding/test_hosted_local_ownership.py
+          tests/coding/test_mux_command.py
+          tests/harnesstui/test_hosted_mux_shell.py
+          tests/harnesstui/test_hosted_mux_details.py
+          tests/tui/test_text_pager.py
+          tests/harnesstui/test_hosted_mux_terminal.py
+          tests/tui/test_terminal_session.py
+          tests/tui/test_composer_edit_buffer.py
+          tests/coding/test_cli_apphost.py
+          tests/dev/test_verify_evidence_manifest.py
+          tests/architecture/test_apphost_a0_contract.py
+          tests/architecture/test_apphost_a02_architecture.py
+          tests/architecture/test_apphost_a03_a04_architecture.py
+          tests/architecture/test_hosted_product_runtime_g8_join.py
+          tests/architecture/test_hosted_product_runtime_g9_closure.py
+          tests/architecture/test_hosted_product_runtime_v1_baseline.py
+          tests/architecture/test_hosted_product_g10_explicit_canary_design.py
+          tests/architecture/test_hosted_product_g10_explicit_canary.py
+          tests/harnesstui/test_hosted_mux_profile.py
+          tests/harnesstui/test_hosted_mux_interaction.py
+          tests/architecture/test_hosted_application_g11_design.py
+          tests/architecture/test_hosted_application_g11.py
+          tests/architecture/test_foreground_hosted_application_g12_design.py
+          tests/architecture/test_foreground_hosted_application_g12.py
+          tests/architecture/test_durable_hosted_application_continuity_g13_design.py
+          tests/architecture/test_durable_hosted_application_continuity_g13.py
+          -q
+          --junitxml=.artifacts/apphost-regression.xml
+
+      - name: Derive Product join evidence
+        run: |
+          uv run --extra dev python scripts/ci/derive_junit.py .artifacts/apphost-regression.xml .artifacts/hosted-product-g8.xml --class tests.coding.test_apphost_product --case tests.harness.worker.test_coding_product_worker_canary::test_product_normal_close_retires_exact_attempt_without_global_rollback
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g8.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g8-evidence-manifest.json HOSTED-PRODUCT-G8-JOIN .artifacts/hosted-product-g8.xml
+
+      - name: Upload Hosted Product G8 JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-product-g8-linux-junit
+          path: .artifacts/hosted-product-g8.xml
+          if-no-files-found: error
+      - name: Derive composition and rollback evidence
+        run: |
+          uv run --extra dev python scripts/ci/derive_junit.py .artifacts/apphost-regression.xml .artifacts/hosted-product-g9-linux.xml --class tests.coding.test_apphost_composition
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g9-linux.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g9-evidence-manifest.json HOSTED-PRODUCT-G9-LINUX .artifacts/hosted-product-g9-linux.xml
+
+      - name: Upload Hosted Product G9 Linux JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-product-g9-linux-junit
+          path: .artifacts/hosted-product-g9-linux.xml
+          if-no-files-found: error
+
+      - name: Derive canary evidence and verify installed runtime
+        run: |
+          uv run --extra dev python scripts/ci/derive_junit.py .artifacts/apphost-regression.xml .artifacts/hosted-product-g10-linux.xml --class tests.coding.test_apphost_canary_control --class tests.coding.test_apphost_canary --class tests.coding.test_cli_apphost --class tests.architecture.test_hosted_product_g10_explicit_canary --name-contains G10
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g10-linux.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g10-evidence-manifest.json HOSTED-PRODUCT-G10-LINUX .artifacts/hosted-product-g10-linux.xml
+          uv run --extra dev python scripts/dev/run_g10_installed_canary.py --expected-backend posix-process-group-v1
+
+      - name: Upload complete AppHost regression report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apphost-regression-linux-junit
+          path: .artifacts/apphost-regression.xml
+          if-no-files-found: error
+
+      - name: Upload Hosted Product G10 Linux JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hosted-product-g10-linux-junit
+          path: .artifacts/hosted-product-g10-linux.xml
+          if-no-files-found: error
+
+  apphost-windows-native-gate:
+    if: ${{ fromJSON(inputs.plan).checks.apphost && fromJSON(inputs.plan).e2e }}
+    name: apphost-windows-native-gate
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v5
+      - name: Install dependencies
+        run: uv sync --locked --extra dev
+      - name: Prove unsupported native pinning fails closed
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force .artifacts | Out-Null
+          uv run --extra dev python scripts/dev/run_pytest.py tests/apphost/test_harness_session_integration.py -k windows_native_backend_is_explicitly_fail_closed --junitxml=.artifacts/apphost-harness-windows.xml -q
+      - name: Verify native gate JUnit
+        run: uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/apphost-harness-windows.xml
+      - name: Prove G8 deterministic join on Windows
+        shell: pwsh
+        run: |
+          uv run --extra dev python scripts/dev/run_pytest.py tests/coding/test_apphost_product.py --junitxml=.artifacts/hosted-product-g8.xml -q
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g8.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g8-evidence-manifest.json HOSTED-PRODUCT-G8-JOIN .artifacts/hosted-product-g8.xml
+      - name: Prove G9 composition and rollback drill on Windows
+        shell: pwsh
+        run: |
+          uv run --extra dev python scripts/dev/run_pytest.py tests/coding/test_apphost_composition.py --junitxml=.artifacts/hosted-product-g9-windows.xml -q
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g9-windows.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g9-evidence-manifest.json HOSTED-PRODUCT-G9-WINDOWS .artifacts/hosted-product-g9-windows.xml
+      - name: Prove G10 installed explicit canary on Windows
+        shell: pwsh
+        run: |
+          uv run --extra dev python scripts/dev/run_pytest.py tests/coding/test_apphost_canary_control.py tests/coding/test_apphost_canary.py tests/coding/test_cli_apphost.py tests/architecture/test_hosted_product_g10_explicit_canary.py -k G10 -q --junitxml=.artifacts/hosted-product-g10-windows.xml
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-product-g10-windows.xml
+          uv run --extra dev python scripts/dev/verify_evidence_manifest.py docs/internals/architecture/apphost/hosted-product-g10-evidence-manifest.json HOSTED-PRODUCT-G10-WINDOWS .artifacts/hosted-product-g10-windows.xml
+          uv run --extra dev python scripts/dev/run_g10_installed_canary.py --expected-backend windows-job-v1
+      - name: Prove G13 durable continuity on Windows
+        shell: pwsh
+        run: |
+          uv run --extra dev python scripts/dev/run_pytest.py tests/appservice/test_continuity.py tests/appservice/test_continuity_runtime.py tests/apphost/test_continuity.py tests/coding/test_hosted_application.py tests/architecture/test_durable_hosted_application_continuity_g13.py -k G13 -vv -o faulthandler_timeout=30 --junitxml=.artifacts/hosted-application-g13-windows.xml
+          uv run --extra dev python scripts/dev/verify_pytest_xml.py .artifacts/hosted-application-g13-windows.xml
+      - name: Upload native gate JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apphost-harness-windows-junit
+          path: |
+            .artifacts/apphost-harness-windows.xml
+            .artifacts/hosted-product-g8.xml
+            .artifacts/hosted-product-g9-windows.xml
+            .artifacts/hosted-product-g10-windows.xml
+            .artifacts/hosted-application-g13-windows.xml
+          if-no-files-found: error

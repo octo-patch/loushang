@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import errno
 import importlib
 import json
 import os
+import re
+import stat
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, Generic, Literal, TypeVar, cast
 
+from loushang.foundation.json import (
+    JsonValueError,
+    require_json_mapping,
+    validate_json_value,
+)
 from loushang.harness.journal.codec import (
     JournalCodecError,
     JournalHeaderCodec,
@@ -23,12 +31,16 @@ from loushang.harness.journal.types import (
     JournalLoadPolicy,
     JsonlSnapshot,
 )
-from loushang.protocol import JsonValueError, require_json_mapping
+from loushang.harness.private_directory import create_private_directory_chain
+
+if TYPE_CHECKING:
+    from loushang.harness.journal._rooted_io import RootedFile, RootedFileIO
 
 H = TypeVar("H")
 R = TypeVar("R")
 LockMode = Literal["exclusive", "shared"]
 LockFactory = Callable[[Path, LockMode], AbstractContextManager[None]]
+_JSONL_LINE_ENDING = re.compile(r"\r\n|\r|\n")
 
 
 @dataclass(frozen=True)
@@ -61,24 +73,60 @@ class JournalFileError(ValueError):
         self.line_number = line_number
 
 
+class JournalLockUnavailable(BlockingIOError):
+    """A requested non-blocking journal lock is currently held elsewhere."""
+
+    def __init__(self, *, path: Path) -> None:
+        super().__init__(f"Journal lock is unavailable: {path.name}")
+        self.path = path
+
+
 @contextmanager
 def journal_file_lock(
     path: Path,
     mode: LockMode,
     *,
     lock_suffix: str = ".lock",
+    blocking: bool = True,
+    create: bool = True,
     is_windows: Callable[[], bool] | None = None,
     load_fcntl: Callable[[], Any] | None = None,
     load_msvcrt: Callable[[], Any] | None = None,
 ) -> Iterator[None]:
+    if type(blocking) is not bool:
+        raise TypeError("Journal lock blocking mode must be a built-in bool")
+    if type(create) is not bool:
+        raise TypeError("Journal lock creation mode must be a built-in bool")
     lock_path = path.with_name(f"{path.name}{lock_suffix}")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open("a+b") as handle:
-        _prepare_lock_byte(handle)
+    if create:
+        create_private_directory_chain(lock_path.parent)
+    with _open_lock_file(lock_path, create=create) as handle:
+        if create:
+            _fchmod_private(handle.fileno())
+            _prepare_lock_byte(handle)
+        else:
+            opened = os.fstat(handle.fileno())
+            getuid = getattr(os, "getuid", None)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (os.name == "posix" and opened.st_mode & 0o077)
+                or (
+                    os.name == "posix"
+                    and callable(getuid)
+                    and opened.st_uid != getuid()
+                )
+            ):
+                raise OSError("Journal lock is not a private regular file")
         windows = (is_windows or _is_windows)()
         if windows:
             msvcrt = (load_msvcrt or _load_msvcrt)()
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            operation = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            try:
+                msvcrt.locking(handle.fileno(), operation, 1)
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise JournalLockUnavailable(path=lock_path) from exc
+                raise
             try:
                 yield
             finally:
@@ -88,11 +136,172 @@ def journal_file_lock(
 
         fcntl = (load_fcntl or _load_fcntl)()
         operation = fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH
-        fcntl.flock(handle.fileno(), operation)
+        if not blocking:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), operation)
+        except OSError as exc:
+            if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise JournalLockUnavailable(path=lock_path) from exc
+            raise
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def journal_file_read_lock(
+    path: Path,
+    mode: LockMode,
+    *,
+    lock_suffix: str = ".lock",
+    create_lock: bool = True,
+) -> Iterator[None]:
+    """Read an absent journal without materializing its lock file.
+
+    An existing journal with a missing lock fails closed. A concurrent first
+    writer may make an initially absent journal visible; strict load policy at
+    the caller must then handle a partial or changed observation.
+    """
+
+    if type(create_lock) is not bool:
+        raise TypeError("Journal read lock creation must be a built-in bool")
+    if not create_lock:
+        lock_path = path.with_name(f"{path.name}{lock_suffix}")
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            try:
+                lock_path.lstat()
+            except FileNotFoundError:
+                yield
+                return
+    with journal_file_lock(
+        path, mode, lock_suffix=lock_suffix, create=create_lock
+    ):
+        yield
+
+
+@contextmanager
+def journal_file_lock_at(
+    directory_fd: int,
+    name: str,
+    mode: LockMode,
+    *,
+    blocking: bool = True,
+    create: bool = False,
+) -> Iterator[BinaryIO]:
+    """Lock one private regular file and yield its pinned handle."""
+
+    _validate_journal_child_name(name, kind="lock")
+    if type(blocking) is not bool:
+        raise TypeError("Journal lock blocking mode must be a built-in bool")
+    if type(create) is not bool:
+        raise TypeError("Journal lock creation mode must be a built-in bool")
+    if os.name == "nt":
+        msvcrt = _load_msvcrt()
+        with _open_windows_file_at(
+            directory_fd,
+            name,
+            create=create,
+            write=True,
+        ) as handle:
+            if create:
+                _prepare_lock_byte(handle)
+            operation = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+            try:
+                msvcrt.locking(handle.fileno(), operation, 1)
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    raise JournalLockUnavailable(path=Path(name)) from exc
+                raise
+            try:
+                yield handle
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    if os.name != "posix" or os.open not in os.supports_dir_fd:
+        raise OSError("Descriptor-relative journal locks are unavailable")
+    flags = (
+        os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    if create:
+        flags |= os.O_CREAT
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+    with os.fdopen(descriptor, "r+b") as handle:
+        if create:
+            _fchmod_private(handle.fileno())
+        opened = os.fstat(handle.fileno())
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_mode & 0o077
+            or (callable(getuid) and opened.st_uid != getuid())
+        ):
+            raise OSError("Journal lock is not a private regular file")
+        fcntl = _load_fcntl()
+        operation = fcntl.LOCK_EX if mode == "exclusive" else fcntl.LOCK_SH
+        if not blocking:
+            operation |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(handle.fileno(), operation)
+        except OSError as exc:
+            if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                raise JournalLockUnavailable(path=Path(name)) from exc
+            raise
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def read_journal_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    encoding: str = "utf-8",
+) -> str:
+    """Read one existing regular file relative to a pinned directory."""
+
+    _validate_journal_child_name(name, kind="filename")
+    if os.name == "nt":
+        try:
+            with _open_windows_file_at(
+                directory_fd,
+                name,
+                create=False,
+                write=False,
+            ) as handle:
+                return handle.read().decode(encoding)
+        except FileNotFoundError:
+            return ""
+    if os.name != "posix" or os.open not in os.supports_dir_fd:
+        raise OSError("Descriptor-relative journal reads are unavailable")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(descriptor, "r", encoding=encoding) as handle:
+        opened = os.fstat(handle.fileno())
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_mode & 0o077
+            or (callable(getuid) and opened.st_uid != getuid())
+        ):
+            raise OSError("Journal file is not a private regular file")
+        return handle.read()
 
 
 def append_jsonl_record(
@@ -103,6 +312,8 @@ def append_jsonl_record(
     format_profile: JournalFormatProfile = DEFAULT_JSONL_FORMAT,
     durability: JournalDurabilityProfile = DURABLE_LOCKED_JOURNAL,
     lock_factory: LockFactory | None = None,
+    file_io: RootedFileIO | None = None,
+    bound_file: RootedFile | None = None,
 ) -> None:
     target = Path(path)
     line = _dump_mapping(record_codec.encode_record(record), format_profile)
@@ -111,12 +322,71 @@ def append_jsonl_record(
         "exclusive",
         durability=durability,
         lock_factory=lock_factory,
-    ):
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with target.open("a", encoding=format_profile.encoding) as handle:
+        file_io=file_io,
+        bound_file=bound_file,
+    ) as rooted:
+        if rooted is not None:
+            rooted.append_bytes(
+                (line + format_profile.newline).encode(format_profile.encoding),
+                fsync=durability.fsync,
+            )
+            return
+        create_private_directory_chain(target.parent)
+        existed = target.exists()
+        with target.open("a", encoding=format_profile.encoding, newline="") as handle:
+            _fchmod_private(handle.fileno())
             handle.write(line)
             handle.write(format_profile.newline)
             _sync_handle(handle, durability)
+        if not existed:
+            _sync_parent_directory(target, durability)
+
+
+def append_jsonl_records(
+    path: str | Path,
+    records: Sequence[R],
+    *,
+    record_codec: JournalRecordCodec[R],
+    format_profile: JournalFormatProfile = DEFAULT_JSONL_FORMAT,
+    durability: JournalDurabilityProfile = DURABLE_LOCKED_JOURNAL,
+    lock_factory: LockFactory | None = None,
+    file_io: RootedFileIO | None = None,
+    bound_file: RootedFile | None = None,
+) -> None:
+    """Append an ordered record batch with one lock, open, write, and sync."""
+
+    durable_records = tuple(records)
+    if not durable_records:
+        return
+    lines = tuple(
+        _dump_mapping(record_codec.encode_record(record), format_profile)
+        for record in durable_records
+    )
+    payload = format_profile.newline.join(lines) + format_profile.newline
+    target = Path(path)
+    with _lock_context(
+        target,
+        "exclusive",
+        durability=durability,
+        lock_factory=lock_factory,
+        file_io=file_io,
+        bound_file=bound_file,
+    ) as rooted:
+        if rooted is not None:
+            rooted.append_bytes(payload.encode(format_profile.encoding), fsync=durability.fsync)
+            return
+        create_private_directory_chain(target.parent)
+        existed = target.exists()
+        with target.open("a", encoding=format_profile.encoding, newline="") as handle:
+            _fchmod_private(handle.fileno())
+            handle.write(payload)
+            _sync_handle(handle, durability)
+        if not existed:
+            _sync_parent_directory(target, durability)
+
+
+class _JournalWriteEncodingError(ValueError):
+    """Encoding failed before write_jsonl entered its native write boundary."""
 
 
 def write_jsonl(
@@ -129,34 +399,45 @@ def write_jsonl(
     format_profile: JournalFormatProfile = DEFAULT_JSONL_FORMAT,
     durability: JournalDurabilityProfile = DURABLE_LOCKED_JOURNAL,
     lock_factory: LockFactory | None = None,
+    file_io: RootedFileIO | None = None,
+    bound_file: RootedFile | None = None,
+    _report_encoding_failure: bool = False,
 ) -> None:
     target = Path(path)
-    encoded: list[str] = []
-    if header is not None:
-        if header_codec is None:
-            raise ValueError("header_codec is required when writing a header")
-        encoded.append(
-            _dump_mapping(header_codec.encode_header(header), format_profile)
+    try:
+        encoded: list[str] = []
+        if header is not None:
+            if header_codec is None:
+                raise ValueError("header_codec is required when writing a header")
+            encoded.append(
+                _dump_mapping(header_codec.encode_header(header), format_profile)
+            )
+        encoded.extend(
+            _dump_mapping(record_codec.encode_record(record), format_profile)
+            for record in records
         )
-    encoded.extend(
-        _dump_mapping(record_codec.encode_record(record), format_profile)
-        for record in records
-    )
-    data = format_profile.newline.join(encoded)
-    if encoded:
-        data += format_profile.newline
+        data = format_profile.newline.join(encoded)
+        if encoded:
+            data += format_profile.newline
+    except Exception as error:
+        if _report_encoding_failure:
+            raise _JournalWriteEncodingError(str(error)) from error
+        raise
 
     with _lock_context(
         target,
         "exclusive",
         durability=durability,
         lock_factory=lock_factory,
-    ):
+        file_io=file_io,
+        bound_file=bound_file,
+    ) as rooted:
         _replace_text_unlocked(
             target,
             data,
             encoding=format_profile.encoding,
             durability=durability,
+            rooted=rooted,
         )
 
 
@@ -169,7 +450,16 @@ def load_jsonl(
     durability: JournalDurabilityProfile = DURABLE_LOCKED_JOURNAL,
     load_policy: JournalLoadPolicy = JournalLoadPolicy(),
     lock_factory: LockFactory | None = None,
+    file_io: RootedFileIO | None = None,
+    bound_file: RootedFile | None = None,
+    validate_snapshot: Callable[[JsonlSnapshot[H, R]], None] | None = None,
 ) -> JsonlSnapshot[H, R]:
+    """Load records, validating owner semantics before any partial-tail repair.
+
+    The optional validator runs under the same journal lock on the decoded
+    snapshot. Its failure propagates without modifying the journal. It must
+    only inspect the snapshot and must not reopen or mutate the locked journal.
+    """
     target = Path(path)
     lock_mode: LockMode = (
         "exclusive" if load_policy.partial_tail == "repair" else "shared"
@@ -179,8 +469,13 @@ def load_jsonl(
         lock_mode,
         durability=durability,
         lock_factory=lock_factory,
-    ):
-        raw = target.read_text(encoding=format_profile.encoding)
+        file_io=file_io,
+        bound_file=bound_file,
+    ) as rooted:
+        raw = (
+            rooted.read_bytes().decode(format_profile.encoding) if rooted is not None
+            else target.read_text(encoding=format_profile.encoding)
+        )
         snapshot = _decode_jsonl(
             raw,
             target=target,
@@ -188,6 +483,8 @@ def load_jsonl(
             header_codec=header_codec,
             load_policy=load_policy,
         )
+        if validate_snapshot is not None:
+            validate_snapshot(snapshot)
         partial_tail = next(
             (
                 diagnostic
@@ -205,8 +502,30 @@ def load_jsonl(
                 repaired,
                 encoding=format_profile.encoding,
                 durability=durability,
+                rooted=rooted,
             )
         return snapshot
+
+
+def decode_jsonl(
+    raw: str,
+    *,
+    target: str | Path,
+    record_codec: JournalRecordCodec[R],
+    header_codec: JournalHeaderCodec[H] | None = None,
+    load_policy: JournalLoadPolicy = JournalLoadPolicy(),
+) -> JsonlSnapshot[H, R]:
+    """Decode an already-authorized JSONL snapshot without reopening a path."""
+
+    if not isinstance(raw, str):
+        raise TypeError("JSONL source must be text")
+    return _decode_jsonl(
+        raw,
+        target=Path(target),
+        record_codec=record_codec,
+        header_codec=header_codec,
+        load_policy=load_policy,
+    )
 
 
 def _decode_jsonl(
@@ -218,9 +537,10 @@ def _decode_jsonl(
     load_policy: JournalLoadPolicy,
 ) -> JsonlSnapshot[H, R]:
 
+    physical_lines = _split_jsonl_physical_lines(raw)
     numbered_lines = [
         (line_number, line)
-        for line_number, line in enumerate(raw.splitlines(), start=1)
+        for line_number, line in enumerate(physical_lines, start=1)
         if line.strip()
     ]
     if load_policy.header == "required" and not numbered_lines:
@@ -273,17 +593,35 @@ def _decode_jsonl(
         record_lines = numbered_lines[1:]
 
     records: list[R] = []
-    last_nonblank_line = numbered_lines[-1][0] if numbered_lines else None
+    unterminated_tail_line = (
+        len(physical_lines) if raw and not _has_trailing_newline(raw) else None
+    )
     for line_number, line in record_lines:
+        is_partial_tail = line_number == unterminated_tail_line
+        if is_partial_tail and load_policy.partial_tail != "raise":
+            diagnostics.append(
+                _diagnostic(
+                    "partial_journal_tail",
+                    "Journal record was skipped because it is incomplete or invalid.",
+                    target,
+                    line_number,
+                )
+            )
+            continue
         try:
             value = _load_mapping(
                 line, path=target, line_number=line_number, kind="record"
             )
-            records.append(record_codec.decode_record(value))
+            record = record_codec.decode_record(value)
+            if is_partial_tail:
+                raise JournalFileError(
+                    "Journal record is missing its commit newline",
+                    path=target,
+                    code="partial_journal_tail",
+                    line_number=line_number,
+                )
+            records.append(record)
         except Exception as exc:
-            is_partial_tail = (
-                line_number == last_nonblank_line and not _has_trailing_newline(raw)
-            )
             behavior = (
                 load_policy.partial_tail
                 if is_partial_tail
@@ -311,6 +649,20 @@ def _decode_jsonl(
                     line_number,
                 )
             )
+
+    if (
+        unterminated_tail_line is not None
+        and not physical_lines[-1].strip()
+        and load_policy.partial_tail != "raise"
+    ):
+        diagnostics.append(
+            _diagnostic(
+                "partial_journal_tail",
+                "Journal trailing whitespace was skipped because it is incomplete.",
+                target,
+                unterminated_tail_line,
+            )
+        )
 
     return JsonlSnapshot(
         header=header,
@@ -347,6 +699,8 @@ class JsonlJournal(Generic[H, R]):
         durability: JournalDurabilityProfile = DURABLE_LOCKED_JOURNAL,
         load_policy: JournalLoadPolicy = JournalLoadPolicy(),
         lock_factory: LockFactory | None = None,
+        file_io: RootedFileIO | None = None,
+        bound_file: RootedFile | None = None,
     ) -> None:
         self.path = Path(path)
         self.record_codec = record_codec
@@ -355,6 +709,12 @@ class JsonlJournal(Generic[H, R]):
         self.durability = durability
         self.load_policy = load_policy
         self.lock_factory = lock_factory
+        if file_io is not None and lock_factory is not None:
+            raise ValueError("rooted Journal cannot use a pathname lock factory")
+        self.file_io = file_io
+        if bound_file is not None and (file_io is not None or lock_factory is not None or durability.locking):
+            raise ValueError("bound Journal requires its existing unlocked transaction")
+        self.bound_file = bound_file
 
     def append(self, record: R) -> None:
         append_jsonl_record(
@@ -364,6 +724,20 @@ class JsonlJournal(Generic[H, R]):
             format_profile=self.format_profile,
             durability=self.durability,
             lock_factory=self.lock_factory,
+            file_io=self.file_io,
+            bound_file=self.bound_file,
+        )
+
+    def append_batch(self, records: Sequence[R]) -> None:
+        append_jsonl_records(
+            self.path,
+            records,
+            record_codec=self.record_codec,
+            format_profile=self.format_profile,
+            durability=self.durability,
+            lock_factory=self.lock_factory,
+            file_io=self.file_io,
+            bound_file=self.bound_file,
         )
 
     def rewrite(self, records: Sequence[R], *, header: H | None = None) -> None:
@@ -376,6 +750,8 @@ class JsonlJournal(Generic[H, R]):
             format_profile=self.format_profile,
             durability=self.durability,
             lock_factory=self.lock_factory,
+            file_io=self.file_io,
+            bound_file=self.bound_file,
         )
 
     def load(self) -> JsonlSnapshot[H, R]:
@@ -387,6 +763,8 @@ class JsonlJournal(Generic[H, R]):
             durability=self.durability,
             load_policy=self.load_policy,
             lock_factory=self.lock_factory,
+            file_io=self.file_io,
+            bound_file=self.bound_file,
         )
 
 
@@ -396,12 +774,33 @@ def _lock_context(
     *,
     durability: JournalDurabilityProfile,
     lock_factory: LockFactory | None,
-) -> AbstractContextManager[None]:
+    file_io: RootedFileIO | None = None,
+    bound_file: RootedFile | None = None,
+) -> AbstractContextManager[RootedFile | None]:
+    if bound_file is not None:
+        if file_io is not None or lock_factory is not None or durability.locking:
+            raise ValueError("bound Journal requires its existing unlocked transaction")
+        bound_file._require_active()
+        return nullcontext(bound_file)
+    if file_io is not None and lock_factory is not None:
+        raise ValueError("rooted Journal cannot use a pathname lock factory")
+    if file_io is not None:
+        return _rooted_context(file_io, path, mode, durability)
     if not durability.locking:
         return nullcontext()
     if lock_factory is not None:
         return lock_factory(path, mode)
     return journal_file_lock(path, mode, lock_suffix=durability.lock_suffix)
+
+
+@contextmanager
+def _rooted_context(
+    file_io: RootedFileIO, path: Path, mode: LockMode, durability: JournalDurabilityProfile,
+) -> Iterator[RootedFile]:
+    with file_io.bind(path, create_parent=durability.locking or mode == "exclusive", durable=durability.fsync) as rooted:
+        if durability.locking:
+            rooted.acquire_lock(exclusive=mode == "exclusive", suffix=durability.lock_suffix)
+        yield rooted
 
 
 def _dump_mapping(
@@ -444,10 +843,7 @@ def _load_mapping(
             line_number=line_number,
         )
     try:
-        return cast(
-            Mapping[str, object],
-            require_json_mapping(dict(value), name=f"journal_{kind}"),
-        )
+        validate_json_value(value, name=f"journal_{kind}")
     except JsonValueError as exc:
         raise JournalFileError(
             f"Journal {kind} contains a value outside strict JSON",
@@ -455,6 +851,7 @@ def _load_mapping(
             code=f"invalid_{kind}_value",
             line_number=line_number,
         ) from exc
+    return value
 
 
 def _reject_json_constant(value: str) -> object:
@@ -476,16 +873,38 @@ def _sync_handle(handle: Any, durability: JournalDurabilityProfile) -> None:
         os.fsync(handle.fileno())
 
 
+def _fchmod_private(descriptor: int) -> None:
+    fchmod = getattr(os, "fchmod", None)
+    if callable(fchmod):
+        fchmod(descriptor, 0o600)
+
+
 def _has_trailing_newline(raw: str) -> bool:
     return raw.endswith(("\n", "\r"))
 
 
+def _split_jsonl_physical_lines(raw: str) -> list[str]:
+    """Split only on JSONL CR/LF framing, never Unicode string content."""
+
+    if not raw:
+        return []
+    lines = _JSONL_LINE_ENDING.split(raw) if "\r" in raw else raw.split("\n")
+    if _has_trailing_newline(raw):
+        lines.pop()
+    return lines
+
+
 def _line_start_offset(raw: str, line_number: int) -> int:
-    offset = 0
-    for current_line, line in enumerate(raw.splitlines(keepends=True), start=1):
-        if current_line == line_number:
-            return offset
-        offset += len(line)
+    if line_number < 1:
+        raise ValueError("line number must be positive")
+    if line_number == 1 and raw:
+        return 0
+    for ending_number, match in enumerate(
+        _JSONL_LINE_ENDING.finditer(raw),
+        start=1,
+    ):
+        if ending_number == line_number - 1 and match.end() < len(raw):
+            return match.end()
     raise ValueError(f"line {line_number} does not exist in journal")
 
 
@@ -495,14 +914,20 @@ def _replace_text_unlocked(
     *,
     encoding: str,
     durability: JournalDurabilityProfile,
+    rooted: RootedFile | None = None,
 ) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if rooted is not None:
+        rooted.atomic_write(data.encode(encoding), fsync=durability.fsync)
+        return
+    create_private_directory_chain(target.parent)
     temp_path = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        with temp_path.open("w", encoding=encoding) as handle:
+        with temp_path.open("w", encoding=encoding, newline="") as handle:
+            _fchmod_private(handle.fileno())
             handle.write(data)
             _sync_handle(handle, durability)
         temp_path.replace(target)
+        _sync_parent_directory(target, durability)
     except BaseException:
         with suppress(FileNotFoundError):
             temp_path.unlink()
@@ -532,6 +957,303 @@ def _prepare_lock_byte(handle: Any) -> None:
     handle.seek(0)
 
 
+def _validate_journal_child_name(name: str, *, kind: str) -> None:
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in {".", ".."}
+        or "\0" in name
+        or "/" in name
+        or "\\" in name
+        or ":" in name
+    ):
+        raise ValueError(
+            f"Descriptor-relative journal {kind} must be one direct component"
+        )
+
+
+@contextmanager
+def _open_lock_file(path: Path, *, create: bool) -> Iterator[Any]:
+    if os.name == "posix":
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if not nofollow:
+            raise OSError("No-follow journal lock opens are unavailable")
+        flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | nofollow
+        if create:
+            flags |= os.O_CREAT
+        else:
+            flags |= getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "r+b") as handle:
+            opened = os.fstat(handle.fileno())
+            getuid = getattr(os, "getuid", None)
+            if not stat.S_ISREG(opened.st_mode) or (
+                callable(getuid) and opened.st_uid != getuid()
+            ):
+                raise OSError("Journal lock is not a private regular file")
+            yield handle
+        return
+
+    if os.name == "nt":
+        with _open_windows_lock_file(path, create=create) as handle:
+            yield handle
+        return
+
+    metadata = path.lstat() if not create else None
+    if metadata is not None and _is_link_or_reparse(metadata):
+        raise OSError("Journal lock cannot be a symlink or reparse point")
+    with path.open("a+b" if create else "r+b") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or _is_link_or_reparse(opened):
+            raise OSError("Journal lock is not a private regular file")
+        if metadata is not None and not os.path.samestat(metadata, opened):
+            raise OSError("Journal lock identity changed while opening")
+        yield handle
+
+
+@contextmanager
+def _open_windows_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    create: bool,
+    write: bool,
+) -> Iterator[Any]:
+    """Open one direct child through an already validated Windows directory."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _UnicodeString(ctypes.Structure):
+        _fields_ = (
+            ("length", wintypes.USHORT),
+            ("maximum_length", wintypes.USHORT),
+            ("buffer", wintypes.LPWSTR),
+        )
+
+    class _IoStatusValue(ctypes.Union):
+        _fields_ = (
+            ("status", wintypes.LONG),
+            ("pointer", wintypes.LPVOID),
+        )
+
+    class _IoStatusBlock(ctypes.Structure):
+        _anonymous_ = ("value",)
+        _fields_ = (
+            ("value", _IoStatusValue),
+            ("information", ctypes.c_size_t),
+        )
+
+    class _ObjectAttributes(ctypes.Structure):
+        _fields_ = (
+            ("length", wintypes.ULONG),
+            ("root_directory", wintypes.HANDLE),
+            ("object_name", ctypes.POINTER(_UnicodeString)),
+            ("attributes", wintypes.ULONG),
+            ("security_descriptor", wintypes.LPVOID),
+            ("security_quality_of_service", wintypes.LPVOID),
+        )
+
+    win_dll = getattr(ctypes, "WinDLL")
+    ntdll = win_dll("ntdll")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    nt_create_file = ntdll.NtCreateFile
+    nt_create_file.argtypes = (
+        ctypes.POINTER(wintypes.HANDLE),
+        wintypes.DWORD,
+        ctypes.POINTER(_ObjectAttributes),
+        ctypes.POINTER(_IoStatusBlock),
+        wintypes.LPVOID,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.LPVOID,
+        wintypes.ULONG,
+    )
+    nt_create_file.restype = wintypes.LONG
+    rtl_status_to_dos_error = ntdll.RtlNtStatusToDosError
+    rtl_status_to_dos_error.argtypes = (wintypes.LONG,)
+    rtl_status_to_dos_error.restype = wintypes.ULONG
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    name_buffer = ctypes.create_unicode_buffer(name)
+    name_length = len(name.encode("utf-16-le"))
+    unicode_name = _UnicodeString(
+        length=name_length,
+        maximum_length=name_length + ctypes.sizeof(ctypes.c_wchar),
+        buffer=ctypes.cast(name_buffer, wintypes.LPWSTR),
+    )
+    get_osfhandle = getattr(msvcrt, "get_osfhandle")
+    root_handle = get_osfhandle(directory_fd)
+    object_attributes = _ObjectAttributes(
+        length=ctypes.sizeof(_ObjectAttributes),
+        root_directory=wintypes.HANDLE(root_handle),
+        object_name=ctypes.pointer(unicode_name),
+        attributes=0x00000040,  # OBJ_CASE_INSENSITIVE
+        security_descriptor=None,
+        security_quality_of_service=None,
+    )
+    io_status = _IoStatusBlock()
+    opened_handle = wintypes.HANDLE()
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    synchronize = 0x00100000
+    share_read_write = 0x00000001 | 0x00000002
+    file_open = 1
+    file_open_if = 3
+    file_attribute_normal = 0x00000080
+    file_synchronous_io_nonalert = 0x00000020
+    file_non_directory_file = 0x00000040
+    file_open_reparse_point = 0x00200000
+    desired_access = generic_read | synchronize
+    if write:
+        desired_access |= generic_write
+    status = nt_create_file(
+        ctypes.byref(opened_handle),
+        desired_access,
+        ctypes.byref(object_attributes),
+        ctypes.byref(io_status),
+        None,
+        file_attribute_normal,
+        share_read_write,
+        file_open_if if create else file_open,
+        file_synchronous_io_nonalert
+        | file_non_directory_file
+        | file_open_reparse_point,
+        None,
+        0,
+    )
+    if status < 0:
+        error_code = rtl_status_to_dos_error(status)
+        win_error = getattr(ctypes, "WinError")
+        raise win_error(error_code)
+
+    raw_handle = opened_handle.value
+    try:
+        open_osfhandle = getattr(msvcrt, "open_osfhandle")
+        flags = (
+            (os.O_RDWR if write else os.O_RDONLY)
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_NOINHERIT", 0)
+        )
+        descriptor = open_osfhandle(raw_handle, flags)
+    except BaseException:
+        close_handle(opened_handle)
+        raise
+    with os.fdopen(descriptor, "r+b" if write else "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if not stat.S_ISREG(opened.st_mode) or _is_link_or_reparse(opened):
+            raise OSError("Journal child is not a direct regular file")
+        yield handle
+
+
+@contextmanager
+def _open_windows_lock_file(path: Path, *, create: bool) -> Iterator[Any]:
+    """Open a regular Windows lock without following a reparse point.
+
+    The handle intentionally omits ``FILE_SHARE_DELETE`` so the opened lock
+    entry cannot be replaced while held.  Parent/root anchoring requires the
+    descriptor-relative APIs above; this path-based helper does not provide it.
+    """
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    win_dll = getattr(ctypes, "WinDLL")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    generic_read_write = 0x80000000 | 0x40000000
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    open_always = 4
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        generic_read_write,
+        share_read_write,
+        None,
+        open_always if create else open_existing,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        get_last_error = getattr(ctypes, "get_last_error")
+        win_error = getattr(ctypes, "WinError")
+        raise win_error(get_last_error())
+    try:
+        open_osfhandle = getattr(msvcrt, "open_osfhandle")
+        descriptor = open_osfhandle(
+            handle,
+            os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+        )
+    except BaseException:
+        close_handle(handle)
+        raise
+    try:
+        opened_file = os.fdopen(descriptor, "r+b")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with opened_file as opened_handle:
+        path_metadata = path.lstat()
+        opened = os.fstat(opened_handle.fileno())
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _is_link_or_reparse(path_metadata)
+            or _is_link_or_reparse(opened)
+            or not os.path.samestat(path_metadata, opened)
+        ):
+            raise OSError("Journal lock is not a direct regular file")
+        yield opened_handle
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_reparse_tag", 0)
+        or (
+            reparse_attribute
+            and getattr(metadata, "st_file_attributes", 0) & reparse_attribute
+        )
+    )
+
+
+def _sync_parent_directory(
+    target: Path,
+    durability: JournalDurabilityProfile,
+) -> None:
+    """Durably establish a newly created or atomically replaced entry."""
+
+    if not durability.fsync or os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(target.parent, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _is_windows() -> bool:
     return os.name == "nt"
 
@@ -552,7 +1274,11 @@ __all__ = [
     "LockFactory",
     "LockMode",
     "append_jsonl_record",
+    "append_jsonl_records",
+    "decode_jsonl",
     "journal_file_lock",
+    "journal_file_read_lock",
+    "journal_file_lock_at",
     "load_jsonl",
     "parse_legacy_jsonl_line",
     "write_jsonl",

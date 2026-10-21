@@ -6,6 +6,26 @@ import json
 import pytest
 
 
+def _bind_workspace_scope(
+    registry,
+    *,
+    policy_evaluator=None,
+    approval_resolver=None,
+):
+    from loushang.harness.policy_engine import PolicyEngine
+    from loushang.harness.tools.workspace.authorization import (
+        create_workspace_tool_execution_host,
+    )
+
+    registry.bind_execution_host(
+        create_workspace_tool_execution_host(
+            policy_evaluator=policy_evaluator or PolicyEngine(),
+            approval_resolver=approval_resolver,
+        )
+    )
+    return registry
+
+
 def _tool_context_provider(*, cwd: str):
     from loushang.harness.tools.workspace import ToolContext
 
@@ -36,10 +56,11 @@ def test_global_policy_engine_blocks_write_tool_before_mutation(tmp_path) -> Non
         WorkspaceToolRegistry as ToolRegistry,
     )
 
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry, policy_engine=PolicyEngine(blocked_tools=["write"])
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(blocked_tools=["write"]),
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -74,8 +95,11 @@ def test_global_policy_engine_blocks_bash_by_tool_name(tmp_path) -> None:
         WorkspaceToolRegistry as ToolRegistry,
     )
 
-    registry = ToolRegistry()
-    register_builtin_tools(registry, policy_engine=PolicyEngine(blocked_tools=["bash"]))
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(blocked_tools=["bash"]),
+    )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool("bash")
 
     with pytest.raises(PermissionError) as exc:
@@ -107,7 +131,7 @@ def test_default_tool_registration_does_not_enable_policy_by_default(tmp_path) -
             self.requests.append(request)
             return ExecResult(exit_code=0, stdout="ok", stderr="")
 
-    registry = ToolRegistry()
+    registry = _bind_workspace_scope(ToolRegistry())
     exec_service = RecordingExecService()
     register_builtin_tools(registry, exec_service=exec_service)
     runtime_tool = registry.materialize_tool("bash")
@@ -131,8 +155,11 @@ def test_default_approval_resolver_denies_ask_policy_before_write(tmp_path) -> N
         WorkspaceToolRegistry as ToolRegistry,
     )
 
-    registry = ToolRegistry()
-    register_builtin_tools(registry, policy_engine=PolicyEngine(ask_tools=["write"]))
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
+    )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -184,12 +211,12 @@ def test_sync_approval_resolver_can_allow_ask_policy_for_write(tmp_path) -> None
             return ApprovalDecision.allow()
 
     resolver = AllowingResolver()
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=resolver,
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -217,7 +244,6 @@ def test_live_child_context_overrides_the_root_definition_approval_actor(
     from loushang.harness.approval import (
         ActorBoundApprovalResolver,
         ApprovalDecision,
-        HeadlessApprovalResolver,
     )
     from loushang.harness.policy_engine import PolicyEngine
     from loushang.harness.tools.workspace import ToolContext
@@ -238,18 +264,17 @@ def test_live_child_context_overrides_the_root_definition_approval_actor(
         resolver=child_exit,
         actor_id="/root/worker@2",
     )
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
-        approval_resolver=HeadlessApprovalResolver(mode="deny"),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
+        approval_resolver=child_resolver,
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write",
         context_provider=lambda *, tool_call_id: ToolContext(
             tool_call_id=tool_call_id,
             cwd=str(tmp_path),
-            approval_resolver=child_resolver,
         ),
     )
 
@@ -281,12 +306,12 @@ def test_ask_policy_allow_emits_tool_approval_audit_events(tmp_path) -> None:
             return ApprovalDecision.allow()
 
     events: list[dict[str, object]] = []
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=AllowingResolver(),
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write",
         context_provider=_tool_context_provider_with_events(
@@ -338,10 +363,11 @@ def test_deny_policy_emits_tool_policy_evaluated_audit_event(tmp_path) -> None:
     )
 
     events: list[dict[str, object]] = []
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry, policy_engine=PolicyEngine(blocked_tools=["write"])
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(blocked_tools=["write"]),
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write",
         context_provider=_tool_context_provider_with_events(
@@ -384,12 +410,12 @@ def test_async_approval_resolver_can_deny_ask_policy_for_write(tmp_path) -> None
         async def resolve(self, request):
             return ApprovalDecision.deny(f"denied {request.tool_name}")
 
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=DenyingResolver(),
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -446,12 +472,12 @@ def test_interactive_approval_resolver_can_allow_ask_policy_for_write(tmp_path) 
     )
     resolver.set_request_presenter(present_request)
 
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=resolver,
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -498,12 +524,12 @@ def test_interactive_approval_resolver_can_deny_ask_policy_for_write(tmp_path) -
     )
     resolver.set_request_presenter(present_request)
 
-    registry = ToolRegistry()
-    register_builtin_tools(
-        registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=resolver,
     )
+    register_builtin_tools(registry)
     runtime_tool = registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -545,12 +571,12 @@ def test_headless_approval_resolver_modes_are_stable(tmp_path) -> None:
         WorkspaceToolRegistry as ToolRegistry,
     )
 
-    allow_registry = ToolRegistry()
-    register_builtin_tools(
-        allow_registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
+    allow_registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
         approval_resolver=HeadlessApprovalResolver(mode="allow"),
     )
+    register_builtin_tools(allow_registry)
     allow_tool = allow_registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )
@@ -561,12 +587,14 @@ def test_headless_approval_resolver_modes_are_stable(tmp_path) -> None:
         )
     )
 
-    deny_registry = ToolRegistry()
-    register_builtin_tools(
-        deny_registry,
-        policy_engine=PolicyEngine(ask_tools=["write"]),
-        approval_resolver=HeadlessApprovalResolver(mode="deny", reason="headless deny"),
+    deny_registry = _bind_workspace_scope(
+        ToolRegistry(),
+        policy_evaluator=PolicyEngine(ask_tools=["write"]),
+        approval_resolver=HeadlessApprovalResolver(
+            mode="deny", reason="headless deny"
+        ),
     )
+    register_builtin_tools(deny_registry)
     deny_tool = deny_registry.materialize_tool(
         "write", context_provider=_tool_context_provider(cwd=str(tmp_path))
     )

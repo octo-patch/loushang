@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from loushang.foundation.json import JSONValue
 from loushang.harness.conversation import (
     CommandExecutionRecord,
     ConversationHeader,
@@ -20,7 +21,6 @@ from loushang.harness.journal import (
     JournalLoadPolicy,
     JsonlJournal,
 )
-from loushang.protocol import JSONValue
 
 
 def _decode_text(value: JSONValue) -> str:
@@ -194,6 +194,43 @@ def test_unknown_kind_and_version_decode_as_defensive_opaque_payloads() -> None:
     unknown_kind["kind"] = "future.product_record"
     unknown_kind["payloadVersion"] = 1
     unknown_kind["payload"] = [1, {"still": "opaque"}]
+    assert isinstance(codec.decode_record(unknown_kind).payload, OpaquePayload)
+
+
+def test_required_payload_kind_rejects_an_unknown_version_instead_of_opaque() -> None:
+    registry = _registry()
+    registry.require_known_payload_versions("test.message")
+    codec = ConversationJsonlRecordCodec(registry)
+    encoded = {
+        "type": "record",
+        "recordId": "future",
+        "parentId": None,
+        "kind": "test.message",
+        "payloadVersion": 2,
+        "createdAt": "2026-07-16T00:00:00Z",
+        "payload": {"future": True},
+        "metadata": {},
+    }
+
+    with pytest.raises(JournalCodecError) as decode_error:
+        codec.decode_record(encoded)
+    with pytest.raises(JournalCodecError) as encode_error:
+        codec.encode_record(
+            _record(
+                "future",
+                None,
+                kind="test.message",
+                payload_version=2,
+                payload=OpaquePayload({"future": True}),
+            )
+        )
+
+    assert registry.required_kinds == ("test.message",)
+    assert decode_error.value.code == "unsupported_required_payload_version"
+    assert encode_error.value.code == "unsupported_required_payload_version"
+
+    unknown_kind = dict(encoded)
+    unknown_kind["kind"] = "extension.future"
     assert isinstance(codec.decode_record(unknown_kind).payload, OpaquePayload)
 
 

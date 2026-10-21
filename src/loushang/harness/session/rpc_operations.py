@@ -67,13 +67,14 @@ class SessionRpcOperationBinding:
         )
 
     def abort(self) -> bool:
-        return self._get_operations().abort()
+        return self._get_operations().abort_turn()
 
     async def new_session(
         self, payload: Mapping[str, object]
     ) -> SessionOperationResult[Any, Any]:
+        cwd = self._optional_path(payload.get("cwd"))
         operation = await self._get_operations().new_session(
-            cwd=self._optional_path(payload.get("cwd")),
+            cwd=str(cwd) if cwd is not None else None,
             parent_session=self._optional_string(
                 payload, "parentSession", "parent_session"
             ),
@@ -180,4 +181,3 @@ class SessionRpcOperationBinding:
         if isinstance(value, str | Path):
             return value
         raise ValueError("cwd must be a string")
-

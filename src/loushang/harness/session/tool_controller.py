@@ -2,53 +2,142 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from loushang.agent.types import AgentTool
+from loushang.ai.types import ToolCall
 from loushang.harness.approval import ApprovalResolver
 from loushang.harness.capabilities.prompt import PromptSectionComposer
+from loushang.harness.capabilities.prompt_assembly import (
+    SkillPromptSummary,
+    assemble_prompt,
+)
+from loushang.harness.capabilities.tool_intent import DefaultToolProfileSnapshot
+from loushang.harness.capabilities.tools import ToolSelection
 from loushang.harness.diagnostics.service import DiagnosticsService
 from loushang.harness.resources.activation import ResourceActivationRuntime
 from loushang.harness.resources.types import ResourceBundle
-from loushang.harness.session import (
+from loushang.harness.runtime.registration import RegistrationLease, RegistrationOwner
+from loushang.harness.session.tool_runtime import (
+    AgentToolPort,
     SessionToolRuntime,
-    ToolActivationProfile,
-    create_tool_prompt_rebuilder,
+    ToolPromptRebuilder,
 )
 from loushang.harness.tools.contribution import resolve_tool_contributions
 from loushang.harness.tools.core import ToolDefinition, project_tool_definition
-from loushang.harness.tools.workspace.context import ToolContext
+from loushang.harness.tools.execution import (
+    ToolCallContext,
+    ToolExecutionHost,
+)
+from loushang.harness.tools.workspace.authorization import (
+    create_workspace_tool_execution_host,
+)
+from loushang.harness.tools.workspace.policy import ToolPolicyEvaluator
 from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
 from loushang.harness.workspace.exec import ExecService
 
-_DEFAULT_ACTIVE_TOOL_NAMES: tuple[str, ...] = (
-    "read",
-    "ls",
-    "find",
-    "grep",
-    "bash",
-    "edit",
-    "write",
-)
 _BUILTIN_TOOL_NAMES: frozenset[str] = frozenset(
     ("bash", "read", "ls", "find", "grep", "write", "edit")
 )
 
 
-class AgentPort(Protocol):
+class AgentPort(AgentToolPort, Protocol):
     @property
     def system_prompt(self) -> str: ...
 
     @system_prompt.setter
     def system_prompt(self, value: str) -> None: ...
 
-    @property
-    def tools(self) -> list[AgentTool[Any]]: ...
 
-    @tools.setter
-    def tools(self, value: list[AgentTool[Any]]) -> None: ...
+@dataclass(frozen=True)
+class ToolActivationProfile:
+    """Deprecated unrevisioned Product profile adapter.
+
+    New composition paths inject :class:`DefaultToolProfileSnapshot`.
+    """
+
+    preferred_names: tuple[str, ...] = ()
+    builtin_names: frozenset[str] = frozenset()
+    activate_new_tools: bool = False
+
+    def default_names(
+        self,
+        definitions: Iterable[ToolDefinition],
+        allowed_names: set[str] | ToolSelection | None = None,
+    ) -> list[str]:
+        available = [definition.name for definition in definitions]
+        if allowed_names is None:
+            return []
+        if allowed_names is not ToolSelection.ALL:
+            return [name for name in available if name in allowed_names]
+        available_set = set(available)
+        selected = [name for name in self.preferred_names if name in available_set]
+        selected.extend(
+            name
+            for name in available
+            if name not in self.builtin_names and name not in selected
+        )
+        return selected
+
+    def should_activate_new(self, name: str, definition: ToolDefinition) -> bool:
+        del definition
+        return self.activate_new_tools and name not in self.builtin_names
+
+    def to_snapshot(
+        self,
+        *,
+        profile_id: str = "legacy.harness.tools.default",
+    ) -> DefaultToolProfileSnapshot:
+        return DefaultToolProfileSnapshot(
+            profile_id=profile_id,
+            profile_revision=0,
+            static_default_names=self.preferred_names,
+            automatic_selection_policy_fingerprint="legacy.harness.tools.auto.v1",
+            automatic_selection_enabled=self.activate_new_tools,
+        )
+
+
+def create_tool_prompt_rebuilder(
+    *,
+    agent: AgentPort,
+    base_prompt: str,
+    get_resource_bundle: Callable[[], ResourceBundle | None],
+    get_effective_skills: (
+        Callable[[], Sequence[SkillPromptSummary] | None] | None
+    ) = None,
+    show_empty_tool_prompt: bool = False,
+    resource_activation_runtime: ResourceActivationRuntime | None = None,
+    prompt_section_composer: PromptSectionComposer | None = None,
+) -> ToolPromptRebuilder:
+    """Build the prompt callback bound to a Product's Agent and resources."""
+
+    activation = resource_activation_runtime or ResourceActivationRuntime()
+    composer = prompt_section_composer or PromptSectionComposer()
+
+    def rebuild(active_definitions: list[ToolDefinition] | None) -> None:
+        if show_empty_tool_prompt and active_definitions is None:
+            active_definitions = []
+        tool_prompt = (
+            "Available tools:\n(none)"
+            if show_empty_tool_prompt and active_definitions == []
+            else None
+        )
+        bundle = get_resource_bundle()
+        assembly = assemble_prompt(
+            base_prompt=base_prompt,
+            resource_bundle=bundle,
+            tool_definitions=active_definitions,
+            tool_prompt=tool_prompt,
+            resource_activation=activation.activate(bundle),
+            skill_summaries=(
+                get_effective_skills() if get_effective_skills is not None else None
+            ),
+            prompt_section_composer=composer,
+        )
+        agent.system_prompt = assembly.system_prompt
+
+    return rebuild
 
 
 @dataclass
@@ -58,13 +147,14 @@ class SessionToolController:
     agent: AgentPort
     get_cwd: Callable[[], str]
     tool_registry: WorkspaceToolRegistry | None
-    allowed_tool_names: set[str] | None
+    allowed_tool_names: set[str] | ToolSelection | None
     initial_active_tool_names: list[str]
     base_prompt: str
     get_resource_bundle: Callable[[], ResourceBundle | None]
     get_diagnostics_service: Callable[[], DiagnosticsService | None]
     emit_tool_audit_event: Callable[[dict[str, object]], Awaitable[None]] | None = None
     default_activate_new_tools: bool = False
+    default_tool_profile: DefaultToolProfileSnapshot | None = None
     activation_profile: ToolActivationProfile | None = None
     show_empty_tool_prompt: bool = False
     resource_activation_runtime: ResourceActivationRuntime = field(
@@ -75,37 +165,88 @@ class SessionToolController:
     )
     get_exec_service: Callable[[], ExecService | None] | None = None
     get_approval_resolver: Callable[[], ApprovalResolver | None] | None = None
+    policy_evaluator: ToolPolicyEvaluator | None = None
+    operation_bindings: Mapping[str, object] = field(default_factory=dict)
+    get_effective_skills: Callable[[], Sequence[SkillPromptSummary] | None] | None = (
+        None
+    )
     _runtime: SessionToolRuntime = field(init=False, repr=False)
+    _execution_host: ToolExecutionHost = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        profile = self.activation_profile or ToolActivationProfile(
-            preferred_names=_DEFAULT_ACTIVE_TOOL_NAMES,
-            builtin_names=_BUILTIN_TOOL_NAMES,
-            activate_new_tools=self.default_activate_new_tools,
+        if self.tool_registry is None:
+            if self.agent.tools:
+                raise TypeError(
+                    "Harness sessions require explicitly bound ToolDefinitions; "
+                    "raw preinstalled AgentTool values are not admitted"
+                )
+            self.tool_registry = WorkspaceToolRegistry()
+        tool_registry = self.tool_registry
+        policy_evaluator = self.policy_evaluator
+        if policy_evaluator is None:
+            from loushang.harness.policy_engine import PolicyEngine
+
+            policy_evaluator = PolicyEngine()
+        approval_resolver = (
+            self.get_approval_resolver()
+            if self.get_approval_resolver is not None
+            else None
         )
-        if profile.activate_new_tools != self.default_activate_new_tools:
-            profile = ToolActivationProfile(
-                preferred_names=profile.preferred_names,
-                builtin_names=profile.builtin_names,
-                activate_new_tools=self.default_activate_new_tools,
-            )
+        self._execution_host = create_workspace_tool_execution_host(
+            policy_evaluator=policy_evaluator,
+            approval_resolver=approval_resolver,
+        )
+        tool_registry.bind_execution_host(self._execution_host)
+        profile = self.default_tool_profile
+        legacy_profile: ToolActivationProfile | None = None
+        if profile is None:
+            if self.activation_profile is None:
+                raise TypeError(
+                    "SessionToolController requires an injected revisioned "
+                    "default Tool profile"
+                )
+            legacy_profile = self.activation_profile
+            profile = self.activation_profile.to_snapshot()
+
+        def legacy_default_names() -> list[str]:
+            if legacy_profile is not None:
+                return legacy_profile.default_names(
+                    tool_registry.list_enabled_definitions(),
+                    self.allowed_tool_names,
+                )
+            names = list(profile.static_default_names)
+            if profile.automatic_selection_enabled:
+                for definition in tool_registry.list_enabled_definitions():
+                    if definition.name not in names:
+                        names.append(definition.name)
+            if self.allowed_tool_names is None:
+                names = []
+            elif self.allowed_tool_names is not ToolSelection.ALL:
+                names = [name for name in names if name in self.allowed_tool_names]
+            return names
+
+        excluded_automatic_names = frozenset(profile.automatic_selection_excluded_names)
+
         self._runtime = SessionToolRuntime(
             agent=self.agent,
-            tool_registry=self.tool_registry,
+            tool_registry=tool_registry,
             allowed_tool_names=self.allowed_tool_names,
             initial_active_tool_names=self.initial_active_tool_names,
-            default_active_tool_names=lambda: profile.default_names(
-                self.tool_registry.list_enabled_definitions()
-                if self.tool_registry is not None
-                else [],
-                self.allowed_tool_names,
+            default_active_tool_names=legacy_default_names,
+            should_activate_new_tool=(
+                legacy_profile.should_activate_new
+                if legacy_profile is not None
+                else lambda name, _definition: (
+                    profile.automatic_selection_enabled
+                    and name not in excluded_automatic_names
+                )
             ),
-            should_activate_new_tool=profile.should_activate_new,
             build_tool_context=self.build_tool_context,
             rebuild_prompt=create_tool_prompt_rebuilder(
                 agent=self.agent,
                 base_prompt=self.base_prompt,
                 get_resource_bundle=self.get_resource_bundle,
+                get_effective_skills=self.get_effective_skills,
                 show_empty_tool_prompt=self.show_empty_tool_prompt,
                 resource_activation_runtime=self.resource_activation_runtime,
                 prompt_section_composer=self.prompt_section_composer,
@@ -135,15 +276,16 @@ class SessionToolController:
     def apply_active_tools(self, tool_names: list[str]) -> None:
         self._runtime.apply_active_tools(tool_names)
 
-    def build_tool_context(self, *, tool_call_id: str) -> ToolContext:
-        return ToolContext(
+    def activate_tool_names(self, tool_names: list[str]) -> None:
+        self._runtime.activate_tool_names(tool_names)
+
+    def build_tool_context(self, *, tool_call_id: str) -> ToolCallContext:
+        return ToolCallContext(
             tool_call_id=tool_call_id,
             cwd=self.get_cwd(),
             diagnostics=self.get_diagnostics_service(),
             exec_service=(
-                self.get_exec_service()
-                if self.get_exec_service is not None
-                else None
+                self.get_exec_service() if self.get_exec_service is not None else None
             ),
             model=getattr(self.agent, "model", None),
             event_sink=(
@@ -151,10 +293,41 @@ class SessionToolController:
                 if self.emit_tool_audit_event is not None
                 else None
             ),
-            approval_resolver=(
-                self.get_approval_resolver()
-                if self.get_approval_resolver is not None
-                else None
+            operation_bindings=self.operation_bindings,
+        )
+
+    async def execute_tool_definition(
+        self,
+        definition: ToolDefinition,
+        *,
+        tool_call_id: str,
+        arguments: dict[str, Any],
+        signal: object | None = None,
+        on_update: object | None = None,
+        operation_bindings: Mapping[str, object] | None = None,
+    ) -> object:
+        base = self.build_tool_context(tool_call_id=tool_call_id)
+        return await self._execution_host.dispatch(
+            definition,
+            ToolCall(
+                type="toolCall",
+                id=tool_call_id,
+                name=definition.name,
+                arguments=dict(arguments),
+            ),
+            ToolCallContext(
+                tool_call_id=tool_call_id,
+                cwd=base.cwd,
+                diagnostics=base.diagnostics,
+                signal=signal,
+                model=base.model,
+                event_sink=base.event_sink,
+                exec_service=base.exec_service,
+                on_update=on_update if callable(on_update) else None,
+                operation_bindings={
+                    **(operation_bindings or {}),
+                    **self.operation_bindings,
+                },
             ),
         )
 
@@ -189,8 +362,54 @@ class SessionToolController:
     def register_runtime_tool(
         self, tool: object, *, source_info: object | None = None
     ) -> ToolDefinition:
+        """Compatibility path; owner-aware live callers use ``bind_runtime_tool``."""
+
         self.ensure_tool_registry()
         return self._runtime.register_runtime_tool(tool, source_info=source_info)
+
+    def bind_runtime_tool(
+        self,
+        tool: object,
+        *,
+        owner: RegistrationOwner,
+        source_info: object | None = None,
+    ) -> RegistrationLease:
+        self.ensure_tool_registry()
+        return self._runtime.bind_runtime_tool(
+            tool,
+            owner=owner,
+            source_info=source_info,
+        )
+
+    def stage_runtime_tool(
+        self,
+        tool: object,
+        *,
+        owner: RegistrationOwner,
+        enabled: bool = True,
+        source_info: object | None = None,
+    ) -> RegistrationLease:
+        self.ensure_tool_registry()
+        return self._runtime.stage_runtime_tool(
+            tool,
+            owner=owner,
+            enabled=enabled,
+            source_info=source_info,
+        )
+
+    def adopt_runtime_tool(
+        self,
+        tool: object,
+        *,
+        owner: RegistrationOwner,
+        source_info: object | None = None,
+    ) -> RegistrationLease | None:
+        self.ensure_tool_registry()
+        return self._runtime.adopt_runtime_tool(
+            tool,
+            owner=owner,
+            source_info=source_info,
+        )
 
     def rebuild_prompt_and_tools_view(self) -> None:
         self._runtime.rebuild_prompt_and_tools_view()
@@ -203,6 +422,31 @@ class SessionToolController:
             await self.emit_tool_audit_event(dict(event))
 
 
-ToolController = SessionToolController
+class ToolController(SessionToolController):
+    """Deprecated constructor-compatible controller adapter.
 
-__all__ = ["SessionToolController", "ToolController"]
+    Direct Harness composition uses :class:`SessionToolController` with an
+    injected revisioned profile.  Historical callers receive a neutral profile
+    derived only from their explicit constructor inputs; no Product defaults
+    live in Harness.
+    """
+
+    def __post_init__(self) -> None:
+        if self.default_tool_profile is None and self.activation_profile is None:
+            self.default_tool_profile = DefaultToolProfileSnapshot(
+                profile_id="legacy.harness.tools.default",
+                profile_revision=0,
+                static_default_names=tuple(self.initial_active_tool_names),
+                automatic_selection_policy_fingerprint=("legacy.harness.tools.auto.v1"),
+                automatic_selection_enabled=self.default_activate_new_tools,
+            )
+        super().__post_init__()
+
+
+__all__ = [
+    "AgentPort",
+    "SessionToolController",
+    "ToolActivationProfile",
+    "ToolController",
+    "create_tool_prompt_rebuilder",
+]

@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+from loushang.harnesstui.conversation.input_policy import (
+    ConversationCapabilities,
+    ConversationInputCapabilities,
+)
+from loushang.harnesstui.conversation.request_presentation import (
+    ConversationRequestPresentation,
+)
 from loushang.harnesstui.status.line import StatusLineSettings
 from loushang.tui.transcript import (
     AssistantMessageRecord,
@@ -33,22 +40,41 @@ class ScreenConversationState:
     transcript_window_generation: int = 0
     evicted_prefix_record_count: int = 0
     active_started_at: float | None = None
+    stopping: bool = field(default=False, kw_only=True)
     pending_followups: list[str] = field(default_factory=list)
     pending_steers: list[str] = field(default_factory=list)
+    input_capabilities: ConversationInputCapabilities = field(
+        default_factory=ConversationInputCapabilities
+    )
+    capabilities: ConversationCapabilities | None = field(default=None, kw_only=True)
     interruption_message: str | None = None
     status_message: str | None = None
+    request_presentation: ConversationRequestPresentation | None = field(
+        default=None, kw_only=True
+    )
+    startup_pending: bool = False
     model_label: str | None = None
     cwd: str = ""
     branch: str | None = None
     session_label: str | None = None
+    session_id: str | None = field(default=None, kw_only=True)
     permission_profile: str | None = "standard"
     statusline_visible: bool = True
     statusline_settings: StatusLineSettings = field(default_factory=StatusLineSettings)
+    context_usage: object | None = None
     _assistant_draft_buffer: StreamingTextBuffer | None = field(
         default=None, init=False, repr=False
     )
     _tool_record_indices: dict[str, int] = field(default_factory=dict, repr=False)
     _pending_user_echo: str | None = field(default=None, init=False, repr=False)
+
+    @property
+    def presentation_status_message(self) -> str | None:
+        if self.request_presentation is None:
+            return self.status_message
+        return self.request_presentation.message + (
+            "; " + self.status_message if self.status_message else ""
+        )
 
     @property
     def running(self) -> bool:
@@ -110,6 +136,7 @@ class ScreenConversationState:
             self.mark_records_changed()
             self._pending_user_echo = stripped
         self.active_started_at = started_at
+        self.stopping = False
         self._assistant_draft_buffer = None
         self.interruption_message = None
         self.status_message = None
@@ -117,6 +144,7 @@ class ScreenConversationState:
 
     def begin_run(self, *, started_at: float) -> None:
         self.active_started_at = started_at
+        self.stopping = False
         self.interruption_message = None
         self.status_message = None
         self._tool_record_indices.clear()
@@ -149,6 +177,7 @@ class ScreenConversationState:
             self.records.append(WorkedDividerRecord(elapsed_seconds))
             self.mark_records_changed()
         self.active_started_at = None
+        self.stopping = False
         self.status_message = None
         self._tool_record_indices.clear()
         self._pending_user_echo = None
@@ -190,6 +219,7 @@ class ScreenConversationState:
         self.mark_records_changed()
         self.interruption_message = message
         self.active_started_at = None
+        self.stopping = False
         self.status_message = None
         self._tool_record_indices.clear()
         self._pending_user_echo = None
@@ -218,14 +248,13 @@ class ScreenConversationState:
 
     def set_status(self, message: str | None) -> None:
         self.status_message = (
-            message.strip()
-            if isinstance(message, str) and message.strip()
-            else None
+            message.strip() if isinstance(message, str) and message.strip() else None
         )
 
     def upsert_tool_record(
         self, tool_call_id: str, record: ToolExecutionRecord
     ) -> None:
+        record = replace(record, activity_id=tool_call_id)
         existing = self._tool_record_indices.get(tool_call_id)
         if existing is not None and 0 <= existing < len(self.records):
             if self.records[existing] == record:

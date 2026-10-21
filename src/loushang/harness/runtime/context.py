@@ -8,7 +8,14 @@ from typing import Any
 from loushang.harness.diagnostics.types import DiagnosticDraft
 from loushang.harness.resources.source import SourceInfo
 from loushang.harness.runtime.bindings import RuntimeBindingLease
-from loushang.harness.workspace.exec import ExecResult, ExecUpdateCallback
+from loushang.harness.runtime.exec_contracts import (
+    RuntimeExecResult,
+    RuntimeExecUpdateCallback,
+)
+from loushang.harness.runtime.registration import (
+    RegistrationLease,
+    RegistrationLeaseCollector,
+)
 
 
 def _normalize_exec_args(args: Sequence[str]) -> list[str]:
@@ -65,13 +72,13 @@ class UnboundProductRuntimeContext:
         timeout_seconds: float | None = None,
         stdin: str | None = None,
         signal: object | None = None,
-        on_update: ExecUpdateCallback | None = None,
+        on_update: RuntimeExecUpdateCallback | None = None,
         preview_max_lines: int = 2000,
         preview_max_bytes: int = 50 * 1024,
         artifact_dir: str | None = None,
         capture_full_output: bool = True,
         rolling_max_bytes: int = 100 * 1024,
-    ) -> ExecResult:
+    ) -> RuntimeExecResult:
         del command, args, cwd, env, timeout_seconds, stdin, signal, on_update
         del (
             preview_max_lines,
@@ -249,10 +256,14 @@ class BoundProductRuntimeContext:
         runtime_bindings: RuntimeBindingLease[Any],
         tool_source_info: SourceInfo[Path] | None = None,
         *,
+        tool_owner_id: str | None = None,
+        registrations: RegistrationLeaseCollector | None = None,
         get_flag_value: Callable[[str], bool | str | None] | None = None,
     ) -> None:
         self._runtime_bindings = runtime_bindings
         self._tool_source_info = tool_source_info
+        self._tool_owner_id = tool_owner_id
+        self._registrations = registrations
         self._get_flag_value = get_flag_value or (lambda name: None)
 
     @property
@@ -293,13 +304,13 @@ class BoundProductRuntimeContext:
         timeout_seconds: float | None = None,
         stdin: str | None = None,
         signal: object | None = None,
-        on_update: ExecUpdateCallback | None = None,
+        on_update: RuntimeExecUpdateCallback | None = None,
         preview_max_lines: int = 2000,
         preview_max_bytes: int = 50 * 1024,
         artifact_dir: str | None = None,
         capture_full_output: bool = True,
         rolling_max_bytes: int = 100 * 1024,
-    ) -> ExecResult:
+    ) -> RuntimeExecResult:
         callback = self._require_bindings().exec_command
         if callback is None:
             raise RuntimeError("Extension runtime does not provide exec_command.")
@@ -326,7 +337,18 @@ class BoundProductRuntimeContext:
         return list(self._require_bindings().get_all_tools())
 
     def register_tool(self, tool: object) -> None:
-        self._require_bindings().register_tool(tool, self._tool_source_info)
+        bindings = self._require_bindings()
+        binder = bindings.bind_tool
+        registrations = self._registrations
+        owner = registrations.owner if registrations is not None else self._tool_owner_id
+        if binder is None or owner is None:
+            bindings.register_tool(tool, self._tool_source_info)
+            return
+        lease = binder(tool, owner, self._tool_source_info)
+        if not isinstance(lease, RegistrationLease):
+            raise TypeError("live tool binding must return a RegistrationLease")
+        if registrations is not None:
+            registrations.capture(lease)
 
     def get_flag(self, name: str) -> bool | str | None:
         return self._get_flag_value(name)

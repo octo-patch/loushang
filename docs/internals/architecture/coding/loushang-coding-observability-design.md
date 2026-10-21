@@ -38,7 +38,7 @@ TUI 中途排障入口是：
 开发者不应该在 `logger.warning(...)`、`trace.emit(...)`、`diagnostics.record(...)` 之间做选择。模块内只需要：
 
 ```python
-from loushang.observability import get_log
+from loushang.foundation.observability import get_log
 
 log = get_log(__name__)
 ```
@@ -57,12 +57,12 @@ log.debug_event("tui", "prompt.dispatch.start", active_run=True)
 
 ### No Session Dependency Cycle
 
-`loushang.observability` 是基础层，不允许依赖 `loushang.coding.session`、`loushang.coding.runtime`、`loushang.coding.ui` 或 provider 具体实现。session/run/cwd/mode 等信息通过 context variables 绑定。
+`loushang.foundation.observability` 是基础层，不允许依赖 `loushang.coding.session`、`loushang.coding.runtime`、`loushang.coding.ui` 或 provider 具体实现。session/run/cwd/mode 等信息通过 context variables 绑定。
 
 依赖方向：
 
 ```text
-loushang.observability
+loushang.foundation.observability
   <- loushang.ai
   <- loushang.coding
   <- loushang.tui
@@ -189,7 +189,7 @@ Debug Event 默认不需要用户看到；只有 `--debug=<scope>` 或 `--trace=
 ### Entry
 
 ```python
-from loushang.observability import get_log, log_context
+from loushang.foundation.observability import get_log, log_context
 
 log = get_log(__name__)
 ```
@@ -505,8 +505,11 @@ Slash command：
 2. 可用 `/debug <scope-list>` 指定 scope，scope 用逗号或空格分隔。
 3. 可用 `/debug off` 关闭当前进程的 debug log sink；ProblemStore 不受影响。
 4. 显示 debug log 路径、latest symlink 和当前 scope。
-5. 显示最近若干行 error/warning/problem 摘要。
-6. 提示用户复现问题后可查看或导出。
+5. 显示 active entrypoint、Python executable、模块路径、源码 revision、dirty
+   状态和随安装提供的组件 contract；不得把 source revision 伪装成 build
+   revision，也不得把 bundled component 表述为 active runtime。
+6. 显示最近若干行 error/warning/problem 摘要。
+7. 提示用户复现问题后可查看或导出。
 
 示例输出：
 
@@ -514,6 +517,19 @@ Slash command：
 Debug logging enabled:
 ~/.loushang/debug/latest
 Scopes: all
+
+Runtime provenance:
+entrypoint: /path/to/.venv/bin/loushang
+python_executable: /path/to/.venv/bin/python
+module_file: /path/to/src/loushang/__init__.py
+source_git_commit: <git-sha>
+source_git_dirty: False
+provenance_scope: installation
+components:
+  native-screen:
+    kind: renderer
+    availability: bundled
+    contract_version: 1
 
 Diagnostics bundle:
 loushang diag export --cwd /path/to/project --output /path/to/project/.loushang/diagnostics/loushang-diag.zip --debug-file ~/.loushang/debug/<session_id>.log
@@ -587,7 +603,8 @@ CLI 优先级高于 env。
 
 ## Migration Plan
 
-1. 新增 `loushang.observability` 包。
+1. 使用 canonical `loushang.foundation.observability` 包；旧
+   `loushang.observability` 入口已经退出。
    - `get_log(...)`
    - `log_context(...)`
    - `ObservabilityLog`

@@ -55,6 +55,12 @@ def test_product_runtime_binds_existing_agent_transcript_components(tmp_path) ->
             binding.product_binding.value("context.compaction").implementation
             == TURN_AWARE_SUMMARY_IMPLEMENTATION
         )
+        assert binding.runtime_profile_snapshot == profile.snapshot()
+        assert binding.get_compaction_capability is not None
+        assert (
+            binding.get_compaction_capability().implementation
+            == TURN_AWARE_SUMMARY_IMPLEMENTATION
+        )
 
         await binding.dispose()
 
@@ -93,6 +99,27 @@ def test_product_runtime_accepts_pre_release_current_format_alias() -> None:
     assert (
         restored.capabilities[1].selections[0].config
         == {"format": "current"}
+    )
+
+
+def test_product_runtime_accepts_legacy_snapshot_without_variation_semantics() -> None:
+    runtime = _runtime()
+    profile = runtime.resolve(persist=True)
+    metadata = runtime.snapshot_metadata(profile)
+    persisted = metadata["runtimeProfile"]
+    assert isinstance(persisted, dict)
+    capabilities = persisted["capabilities"]
+    assert isinstance(capabilities, list)
+    for capability in capabilities:
+        assert isinstance(capability, dict)
+        capability.pop("variationSemantic")
+
+    restored = runtime.validate_snapshot(metadata, profile, require_current=True)
+
+    assert restored is not None
+    assert all(
+        capability.variation_semantic is None
+        for capability in restored.capabilities
     )
 
 

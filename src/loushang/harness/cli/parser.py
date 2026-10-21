@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from argparse import ArgumentParser, RawTextHelpFormatter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, cast
 
 from loushang.harness.cli.profile import CliProfile
 from loushang.harness.cli.types import (
@@ -64,8 +65,9 @@ def register_profile_arguments(
             arguments.extend(command.arguments)
     else:
         arguments = list(profile_or_arguments)
+    add_argument = cast(Callable[..., Any], parser.add_argument)
     for spec in arguments:
-        parser.add_argument(*spec.flags, **spec.argparse_kwargs())
+        add_argument(*spec.flags, **spec.argparse_kwargs())
 
 
 def parse_args(
@@ -147,10 +149,13 @@ def format_agent_cli_help(
         "sources.\n"
         "  --enable-plugin/--disable-plugin persist project plugin toggles.\n"
         "  --command-result-format raw|json controls --command result output.\n"
-        "  --export-format html|jsonl controls exported session file type.\n"
+        "  --export-format bundle|html|jsonl controls exported session file type.\n"
         "  --export-result-format text|json controls --export CLI result output.\n"
         "  diag export --output PATH writes a diagnostics bundle without starting "
         "a model session.\n"
+        "  storage paths|status|clean|migrate manages machine-local resources "
+        "without starting a model session; clean and migrate preview unless "
+        "--apply is passed.\n"
         "\n\n"
         "Note:\n"
         "  Extensions can register additional flags. For extension-specific help, "

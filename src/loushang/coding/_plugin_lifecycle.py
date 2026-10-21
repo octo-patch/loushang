@@ -1,0 +1,2269 @@
+"""Coding Product adapter for the common durable Plugin lifecycle."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import secrets
+import stat
+import sys
+import threading
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, ExitStack, contextmanager
+from dataclasses import dataclass, field
+from importlib.metadata import version
+from pathlib import Path
+from typing import Literal
+
+from loushang.coding._plugin_owner_generations import (
+    CodingOwnerGenerationEvidenceLedger,
+)
+from loushang.coding.product_plan import CODING_PRODUCT_ID
+from loushang.foundation.platform_paths import PlatformPaths, resolve_platform_paths
+from loushang.harness.journal import (
+    JournalLoadPolicy,
+    JournalLockUnavailable,
+    journal_file_lock,
+    journal_file_lock_at,
+    read_journal_file_at,
+)
+from loushang.harness.plugin_management import (
+    PluginCleanupAttemptV1,
+    PluginDesiredStateLedger,
+    PluginDesiredStateMutationV1,
+    PluginEnablementCompatibilityProjectionV1,
+    PluginEnablementMigrationCoordinator,
+    PluginEnablementMigrationJournal,
+    PluginEnablementMigrationRequestV1,
+    PluginEnablementMigrationSnapshotV1,
+    PluginInstallationKeyV1,
+    PluginInstanceLeaseFamilyReleaseV1,
+    PluginInstanceLeaseFamilyV1,
+    PluginInstanceRetirementCompletionV1,
+    PluginInstanceRuntimeLedger,
+    PluginManagementApplicationPorts,
+    PluginManagementCommandApplication,
+    PluginManagementCommandV1,
+    PluginManagementReadModelProjector,
+    PluginManagementService,
+    PluginOwnerRetirementOutcomeV1,
+    PluginOwnerRetirementPlanV1,
+    PluginOwnerRetirementTargetV1,
+    PluginPackageLifecycleLedger,
+    PluginPackageRevisionRefV1,
+    PluginRetirementIntentLedger,
+    PluginRetirementSetLedger,
+    PluginSourceProjectionSourcePort,
+    decode_plugin_desired_state_snapshot,
+    decode_plugin_enablement_migration_snapshots,
+)
+from loushang.harness.plugin_management.package_gc_reservation import (
+    PluginPackageGcReservationJournal,
+)
+from loushang.harness.plugin_management.security_acceptance import (
+    PluginInstanceSecurityRetirementJournal,
+)
+from loushang.harness.resources.plugins import PluginInstanceRevisionRef
+from loushang.harness.runtime.registration import (
+    OwnerGenerationRetirementReceipt,
+)
+
+_PRODUCT_POLICY_REVISION = "coding-plugin-lifecycle-v1"
+_DEFAULT_APPROVAL_REFERENCE = "coding-first-party-default"
+_CODING_PLUGIN_RUNTIME_BOOT_ID = secrets.token_hex(16)
+_PROCESS_STARTUP_LEASES_LOCK = threading.Lock()
+_PROCESS_STARTUP_LEASES: dict[Path, AbstractContextManager[None]] = {}
+_PROCESS_SESSION_OWNER_LEASES_LOCK = threading.Lock()
+
+
+@dataclass(slots=True)
+class _ProcessSessionOwnerLeaseState:
+    owner_id: str
+    authority_id: str
+    lease: AbstractContextManager[None]
+    references: int = 1
+    runtime_claim_id: str | None = None
+    runtime_claim_references: int = 0
+
+
+_PROCESS_SESSION_OWNER_LEASES: dict[Path, _ProcessSessionOwnerLeaseState] = {}
+
+
+@dataclass(slots=True)
+class _ProcessSessionOwnerLease(AbstractContextManager[None]):
+    path: Path
+    owner_id: str
+    authority_id: str
+    _runtime_claim_id: str | None = field(default=None, init=False, repr=False)
+    _closed: bool = field(default=False, init=False, repr=False)
+    _state_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+
+    def claim_runtime(self, claim_id: str) -> None:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("Closed Coding Session owner cannot claim a runtime")
+            normalized_claim_id = _nonempty(
+                claim_id,
+                name="Session runtime claim id",
+            )
+            if self._runtime_claim_id == normalized_claim_id:
+                return
+            if self._runtime_claim_id is not None:
+                raise RuntimeError(
+                    "Coding Session owner lease already claimed another runtime"
+                )
+            _claim_session_owner_runtime(
+                self.path,
+                owner_id=self.owner_id,
+                authority_id=self.authority_id,
+                claim_id=normalized_claim_id,
+            )
+            self._runtime_claim_id = normalized_claim_id
+
+    def __exit__(self, *_args: object) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            try:
+                _release_session_owner_lease(
+                    self.path,
+                    owner_id=self.owner_id,
+                    authority_id=self.authority_id,
+                    runtime_claim_id=self._runtime_claim_id,
+                )
+            except BaseException:
+                with _PROCESS_SESSION_OWNER_LEASES_LOCK:
+                    current = _PROCESS_SESSION_OWNER_LEASES.get(self.path)
+                    authority_was_removed = (
+                        current is None or current.authority_id != self.authority_id
+                    )
+                # journal_file_lock closes its handle even when platform
+                # unlock reports an error. In that case the exact authority
+                # incarnation was removed and this wrapper cannot retry it.
+                if authority_was_removed:
+                    self._closed = True
+                raise
+            else:
+                self._closed = True
+
+
+class CodingPluginLifecycleError(RuntimeError):
+    """Stable Product failure at the common management boundary."""
+
+    def __init__(self, message: str, *, code: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class CodingPluginLifecycleStateLayout:
+    """One workspace namespace for every Coding Plugin Installation."""
+
+    root: Path
+    private_state_base: Path
+    package_root: Path
+    private_data_base: Path
+    scope_id: str
+    desired_state: Path
+    management_operations: Path
+    retirement_intents: Path
+    retirement_sets: Path
+    instance_runtime: Path
+    package_lifecycle: Path
+
+    @property
+    def package_install_root(self) -> Path:
+        return self.package_root / "installed"
+
+    @property
+    def package_lockfile(self) -> Path:
+        return self.package_root / "package-lock.json"
+
+    @property
+    def plugin_revision_root(self) -> Path:
+        return self.package_root / "plugin-revisions"
+
+    @property
+    def owner_generation_evidence(self) -> Path:
+        return self.root / "owner-generation-evidence.jsonl"
+
+    @property
+    def enablement_migration(self) -> Path:
+        return self.root / "enablement-migration.jsonl"
+
+    @property
+    def coordination_lock(self) -> Path:
+        return self.root / "lifecycle-coordination"
+
+    @property
+    def package_gc_reservations(self) -> Path:
+        return self.root / "package-gc-reservations.jsonl"
+
+
+@dataclass(frozen=True, slots=True)
+class _CodingPluginEnablementStateCapture:
+    desired_raw: str
+    migration_raw: str
+
+
+@dataclass(slots=True)
+class CodingPluginLifecycle:
+    """Installed common Harness authorities bound to Coding Product policy."""
+
+    layout: CodingPluginLifecycleStateLayout
+    startup_id: str
+    desired: PluginDesiredStateLedger = field(repr=False)
+    management: PluginManagementService = field(repr=False)
+    enablement_migrations: PluginEnablementMigrationCoordinator = field(repr=False)
+    instances: PluginInstanceRuntimeLedger = field(repr=False)
+    retirement_sets: PluginRetirementSetLedger = field(repr=False)
+    packages: PluginPackageLifecycleLedger = field(repr=False)
+    _gc_reservations: PluginPackageGcReservationJournal = field(repr=False)
+    security: PluginInstanceSecurityRetirementJournal = field(repr=False)
+    owner_evidence: CodingOwnerGenerationEvidenceLedger = field(repr=False)
+    _owns_process_startup_lease: bool = field(repr=False)
+
+    def prepare_gc_writer_epoch(self) -> None:
+        """Seal every reference journal before any executable GC can be exposed."""
+
+        with journal_file_lock(self.layout.coordination_lock, "exclusive"):
+            if (
+                not self.packages.gc_reservation_graph_bound_to(self._gc_reservations)
+                or self._gc_reservations.snapshot().active
+            ):
+                raise CodingPluginLifecycleError(
+                    "Coding Plugin GC writer graph is not quiescent and bound",
+                    code="coding_plugin_gc_writer_epoch_unavailable",
+                )
+            self.packages.gc_candidates()
+            self.desired.seal_gc_writer_epoch()
+            self.instances.seal_gc_writer_epoch()
+            self.packages.seal_gc_writer_epoch()
+
+    def gc_writer_epoch_ready(self) -> bool:
+        """Report the durable Product downgrade fence without enabling deletion."""
+
+        return (
+            self.packages.gc_reservation_graph_bound_to(self._gc_reservations)
+            and self.desired.gc_writer_epoch_sealed()
+            and self.instances.gc_writer_epoch_sealed()
+            and self.packages.gc_writer_epoch_sealed()
+        )
+
+    def release_owned_process_startup_lease(self) -> None:
+        """Release a startup lease acquired specifically by this lifecycle.
+
+        Durable Coding state deliberately keeps its startup lease for the
+        process lifetime. Disposable composition roots instead call this
+        before removing their private state directory.
+        """
+
+        if not self._owns_process_startup_lease:
+            return
+        _release_process_startup_lease(
+            self.layout,
+            startup_id=self.startup_id,
+        )
+        self._owns_process_startup_lease = False
+
+    def complete_startup_recovery(self) -> None:
+        """Seal Package recovery after the composition root reconciles Instances."""
+
+        with journal_file_lock(self.layout.coordination_lock, "exclusive"):
+            self._reconcile_retirements_unlocked()
+            self.packages.complete_startup_recovery(
+                operation_id=f"coding-package-recovery:{self.startup_id}",
+                idempotency_key=f"coding-package-recovery:{self.startup_id}",
+                recovery_reference=f"coding-runtime:{self.startup_id}",
+            )
+
+    def installation_key(self, plugin_id: str) -> PluginInstallationKeyV1:
+        return PluginInstallationKeyV1(
+            product_id=CODING_PRODUCT_ID,
+            installation_scope="workspace",
+            scope_id=self.layout.scope_id,
+            plugin_id=_nonempty(plugin_id, name="Plugin id"),
+        )
+
+    def migrate_legacy_enablement(
+        self,
+        key: PluginInstallationKeyV1,
+        package_revision: PluginPackageRevisionRefV1 | None,
+        *,
+        legacy_disabled: bool,
+        manifest_enabled_default: bool,
+        legacy_input_fingerprint: str,
+    ) -> PluginEnablementMigrationSnapshotV1:
+        """Import an immutable legacy snapshot once through canonical commands."""
+
+        if (
+            key.product_id != CODING_PRODUCT_ID
+            or key.installation_scope != "workspace"
+            or key.scope_id != self.layout.scope_id
+        ):
+            raise CodingPluginLifecycleError(
+                "Enablement migration Installation is outside this Coding scope",
+                code="coding_plugin_enablement_migration_scope_mismatch",
+            )
+        return self.enablement_migrations.migrate(
+            PluginEnablementMigrationRequestV1(
+                installation_key=key,
+                package_revision=package_revision,
+                legacy_disabled=legacy_disabled,
+                manifest_enabled_default=manifest_enabled_default,
+                legacy_input_fingerprint=legacy_input_fingerprint,
+            )
+        )
+
+    def bootstrap_first_party_default(
+        self,
+        key: PluginInstallationKeyV1,
+        package_revision: PluginPackageRevisionRefV1,
+    ) -> None:
+        """Install+enable only a truly unseen first-party Installation.
+
+        An absent record retained after remove is deliberately *seen* and is
+        therefore never resurrected by Product composition.
+        """
+
+        if (
+            not isinstance(key, PluginInstallationKeyV1)
+            or key.product_id != CODING_PRODUCT_ID
+            or key.installation_scope != "workspace"
+            or key.scope_id != self.layout.scope_id
+        ):
+            raise CodingPluginLifecycleError(
+                "First-party default Installation is outside this Coding scope",
+                code="coding_plugin_default_bootstrap_scope_mismatch",
+            )
+        if (
+            not isinstance(package_revision, PluginPackageRevisionRefV1)
+            or package_revision.plugin_id != key.plugin_id
+        ):
+            raise CodingPluginLifecycleError(
+                "First-party default Package Revision changed Plugin identity",
+                code="coding_plugin_default_bootstrap_revision_mismatch",
+            )
+        # The two management commands are individually durable.  This loop is
+        # the Product transaction coordinator: it resumes only its own exact
+        # default install, stops at any operator-authored state, and retries a
+        # CAS race with a fresh operation identity.
+        for _attempt in range(32):
+            snapshot = self.desired.snapshot()
+            state = snapshot.installation(key)
+            seen = any(item.installation_key == key for item in snapshot.installations)
+            if not seen:
+                error = self._submit_default(
+                    key,
+                    action="install",
+                    desired_state="installed_disabled",
+                    package_revision=package_revision,
+                    expected_inventory_revision=snapshot.inventory_revision,
+                )
+                if error == "plugin_inventory_revision_conflict":
+                    continue
+                if error is not None:
+                    raise CodingPluginLifecycleError(
+                        "First-party Plugin bootstrap install failed",
+                        code=error,
+                    )
+                continue
+            if state.selection.desired_state == "installed_enabled":
+                return
+            if not self._is_own_default_install(
+                key,
+                package_revision=package_revision,
+            ):
+                return
+            error = self._submit_default(
+                key,
+                action="enable",
+                desired_state="installed_enabled",
+                package_revision=None,
+                expected_inventory_revision=snapshot.inventory_revision,
+            )
+            if error == "plugin_inventory_revision_conflict":
+                continue
+            if error is not None:
+                raise CodingPluginLifecycleError(
+                    "First-party Plugin bootstrap enable failed",
+                    code=error,
+                )
+            return
+        raise CodingPluginLifecycleError(
+            "First-party Plugin bootstrap could not linearize",
+            code="coding_plugin_default_bootstrap_busy",
+        )
+
+    def _is_own_default_install(
+        self,
+        key: PluginInstallationKeyV1,
+        *,
+        package_revision: PluginPackageRevisionRefV1,
+    ) -> bool:
+        matching = tuple(
+            transition
+            for transition in self.desired.transitions()
+            if transition.mutation.installation_key == key
+        )
+        if not matching:
+            return False
+        mutation = matching[-1].mutation
+        return (
+            isinstance(mutation, PluginDesiredStateMutationV1)
+            and mutation.desired_state == "installed_disabled"
+            and mutation.package_revision == package_revision
+            and mutation.actor_id == "product:coding"
+            and mutation.policy_revision == _PRODUCT_POLICY_REVISION
+            and mutation.approval_reference == _DEFAULT_APPROVAL_REFERENCE
+        )
+
+    def reconcile_retirements(self) -> None:
+        """Project committed management cutovers into the Instance runtime."""
+
+        with journal_file_lock(self.layout.coordination_lock, "exclusive"):
+            self._reconcile_retirements_unlocked()
+
+    def _reconcile_retirements_unlocked(self) -> None:
+        """Reconcile while the Product-wide cross-journal lock is held."""
+
+        self._recover_inactive_session_families()
+        self.security.reconcile(self.instances)
+        runtime = self.instances.snapshot()
+        for intent in self.management_retirement_intents():
+            instance = runtime.instance(intent.instance_revision_ref)
+            if instance is None or instance.state in {"REVOKING", "RETIRED"}:
+                continue
+            if instance.state == "ACTIVE":
+                self.instances.begin_drain(intent)
+            runtime = self.instances.snapshot()
+            self._ensure_owner_retirement_plan(intent, runtime)
+            self._complete_ready_retirement(intent)
+            runtime = self.instances.snapshot()
+
+    def _recover_inactive_session_families(self) -> None:
+        """Release only Session families whose process death is lock-proven."""
+
+        runtime = self.instances.snapshot()
+        for family in runtime.open_families:
+            if family.lease_kind != "session_membership":
+                continue
+            evidence = _session_holder_evidence(family.holder_reference)
+            if (
+                evidence is None
+                or evidence.startup_id == self.startup_id
+                or not _startup_lease_is_inactive(
+                    self.layout,
+                    startup_id=evidence.startup_id,
+                )
+            ):
+                continue
+            [member] = family.members
+            owner_evidence = self.owner_evidence.family(family.family_id)
+            if owner_evidence is not None and not owner_evidence.retired:
+                self.owner_evidence.retire(
+                    family_id=family.family_id,
+                    instance_revision_ref=member.instance_revision_ref,
+                    receipts=owner_evidence.receipts,
+                    outcome_reference=(
+                        "coding-session-process-exit-confirmed:"
+                        f"{evidence.startup_id}:{family.family_id}"
+                    ),
+                )
+            self.instances.release_family(
+                _orphan_family_release(
+                    family,
+                    inactive_startup_id=evidence.startup_id,
+                )
+            )
+
+    def release_session_family_and_reconcile(
+        self,
+        family: PluginInstanceLeaseFamilyV1,
+    ) -> None:
+        """Linearize the last Session release with cross-journal retirement."""
+
+        if not isinstance(family, PluginInstanceLeaseFamilyV1):
+            raise TypeError("Coding Session release requires a Session family")
+        with journal_file_lock(self.layout.coordination_lock, "exclusive"):
+            self.instances.release_family(_family_release(family))
+            self._reconcile_retirements_unlocked()
+
+    def publish_session_owner_generations(
+        self,
+        family: PluginInstanceLeaseFamilyV1,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        """Publish only owner generations with prior durable preparation."""
+
+        if not isinstance(family, PluginInstanceLeaseFamilyV1):
+            raise TypeError("Coding owner publication requires a Session family")
+        [member] = family.members
+        self.owner_evidence.publish(
+            family_id=family.family_id,
+            instance_revision_ref=member.instance_revision_ref,
+            receipts=receipts,
+            publication_reference=f"coding-session-publication:{family.family_id}",
+        )
+
+    def prepare_session_owner_generations(
+        self,
+        family: PluginInstanceLeaseFamilyV1,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        """Write exact cleanup identities before owner publication can commit."""
+
+        if not isinstance(family, PluginInstanceLeaseFamilyV1):
+            raise TypeError("Coding owner preparation requires a Session family")
+        [member] = family.members
+        self.owner_evidence.prepare(
+            family_id=family.family_id,
+            instance_revision_ref=member.instance_revision_ref,
+            receipts=receipts,
+            preparation_reference=f"coding-session-preparation:{family.family_id}",
+        )
+
+    def retire_session_owner_generations(
+        self,
+        family: PluginInstanceLeaseFamilyV1,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        """Record success only after the exact owner runtimes fully disposed."""
+
+        if not isinstance(family, PluginInstanceLeaseFamilyV1):
+            raise TypeError("Coding owner retirement requires a Session family")
+        [member] = family.members
+        self.owner_evidence.retire(
+            family_id=family.family_id,
+            instance_revision_ref=member.instance_revision_ref,
+            receipts=receipts,
+            outcome_reference=f"coding-session-disposed:{family.family_id}",
+        )
+
+    def _ensure_owner_retirement_plan(self, intent, runtime) -> None:
+        retirement_set = self.retirement_sets.snapshot().retirement_set(
+            intent.retirement_id
+        )
+        if retirement_set is None:
+            raise CodingPluginLifecycleError(
+                "Coding retirement set is unavailable",
+                code="coding_plugin_retirement_set_unavailable",
+            )
+        if retirement_set.plan is None and any(
+            family.lease_kind == "session_membership"
+            and any(
+                member.instance_revision_ref == intent.instance_revision_ref
+                for member in family.members
+            )
+            for family in runtime.open_families
+        ):
+            # A family that acquired before cutover may still publish its exact
+            # owner generations.  Seal the plan only after every Session family
+            # has either retired its receipts or closed without publishing.
+            return
+        families = self.owner_evidence.retired_families_for_instance(
+            intent.instance_revision_ref
+        )
+        receipts = tuple(receipt for family in families for receipt in family.receipts)
+        targets = tuple(
+            PluginOwnerRetirementTargetV1.create(
+                owner_reference=receipt.owner_reference,
+                owner_generation_reference=receipt.owner_generation_reference,
+                retirement_handle=receipt.retirement_handle,
+                contribution_ids=receipt.contribution_ids,
+            )
+            for receipt in receipts
+        )
+        canonical_targets = tuple(sorted(targets, key=lambda item: item.target_id))
+        closure_digest = hashlib.sha256(
+            repr(tuple(item.target_id for item in canonical_targets)).encode("utf-8")
+        ).hexdigest()
+        # Re-submit the exact plan and outcomes idempotently.  A process may
+        # stop after sealing the plan or after only some target outcomes; the
+        # next reconciliation must finish that durable transition.
+        committed = self.retirement_sets.commit_plan(
+            PluginOwnerRetirementPlanV1.create(
+                retirement_id=intent.retirement_id,
+                owner_closure_reference=f"coding-owner-closure:{closure_digest}",
+                targets=canonical_targets,
+            )
+        )
+        if committed.plan is None:
+            raise CodingPluginLifecycleError(
+                "Coding owner retirement plan was not committed",
+                code="coding_plugin_owner_retirement_plan_unavailable",
+            )
+        outcome_references = {
+            (
+                receipt.owner_reference,
+                receipt.owner_generation_reference,
+                receipt.retirement_handle,
+            ): family.retirement_outcome_reference
+            for family in families
+            for receipt in family.receipts
+        }
+        for target in committed.plan.targets:
+            outcome_reference = outcome_references[
+                (
+                    target.owner_reference,
+                    target.owner_generation_reference,
+                    target.retirement_handle,
+                )
+            ]
+            if outcome_reference is None:
+                raise CodingPluginLifecycleError(
+                    "Coding owner retirement lacks an exact cleanup outcome",
+                    code="coding_plugin_owner_retirement_outcome_unavailable",
+                )
+            identity = hashlib.sha256(
+                repr((intent.retirement_id, target.target_id)).encode("utf-8")
+            ).hexdigest()
+            self.retirement_sets.record_outcome(
+                PluginOwnerRetirementOutcomeV1(
+                    retirement_id=intent.retirement_id,
+                    target_id=target.target_id,
+                    operation_id=f"coding-owner-retired:{identity}",
+                    idempotency_key=f"coding-owner-retired:{identity}",
+                    attempt=1,
+                    disposition="succeeded",
+                    result_code="coding.owner.exact_retired",
+                    owner_outcome_reference=outcome_reference,
+                )
+            )
+
+    def _complete_ready_retirement(self, intent) -> None:
+        retirement_set = self.retirement_sets.snapshot().retirement_set(
+            intent.retirement_id
+        )
+        if retirement_set is None or retirement_set.state != "succeeded":
+            return
+        runtime = self.instances.snapshot()
+        instance = runtime.instance(intent.instance_revision_ref)
+        if instance is None or instance.state == "RETIRED":
+            return
+        direct_family = instance.activation.direct_host_family
+        open_family_ids = set(instance.open_family_ids)
+        if open_family_ids not in ({direct_family.family_id}, set()):
+            return
+        identity = intent.retirement_id
+        # The cleanup handoff is write-ahead: after it appends the durable task
+        # it releases the direct-host family.  Therefore an empty family set is
+        # a valid interrupted state, and replaying the same operation must
+        # resume the task rather than wait forever for a family already handed
+        # off.
+        task = self.packages.handoff_cleanup_and_release(
+            direct_family.family_id,
+            retirement_target_id=None,
+            cleanup_kind="coding.product_host.shutdown",
+            operation_id=f"coding-host-cleanup:{identity}",
+            idempotency_key=f"coding-host-cleanup:{identity}",
+            cleanup_reference=f"coding-host:{self.layout.scope_id}",
+            family_release=_family_release(direct_family),
+        )
+        self.packages.record_cleanup_attempt(
+            PluginCleanupAttemptV1(
+                cleanup_id=task.cleanup_id,
+                operation_id=f"coding-host-cleaned:{identity}",
+                idempotency_key=f"coding-host-cleaned:{identity}",
+                attempt=1,
+                disposition="succeeded",
+                result_code="coding.host.retired",
+                retry_not_before_epoch_ms=None,
+                outcome_reference=f"coding-host-outcome:{self.layout.scope_id}",
+            )
+        )
+        self.instances.complete_retirement(
+            PluginInstanceRetirementCompletionV1.create(
+                completion_kind="graceful",
+                coordination_id=intent.retirement_id,
+                installation_key=instance.installation_key,
+                instance_revision_ref=instance.instance_revision_ref,
+                operation_id=f"coding-instance-retired:{identity}",
+                idempotency_key=f"coding-instance-retired:{identity}",
+                completion_reference=f"coding-instance:{self.layout.scope_id}",
+            )
+        )
+
+    def management_retirement_intents(self):
+        return (
+            PluginRetirementIntentLedger(self.layout.retirement_intents)
+            .snapshot()
+            .intents
+        )
+
+    def acquire_session(
+        self,
+        key: PluginInstallationKeyV1,
+        *,
+        session_id: str,
+        lease_attempt_id: str,
+        owner_contributions: tuple[tuple[str, tuple[str, ...]], ...],
+        session_owner_id: str | None = None,
+    ) -> CodingPluginSessionLease:
+        session_owner_lease = _acquire_session_owner_lease(
+            self.layout,
+            session_id=session_id,
+            owner_id=session_owner_id or secrets.token_hex(16),
+        )
+        try:
+            self.reconcile_retirements()
+            state = self.desired.snapshot().installation(key)
+            ref = state.selection.instance_revision_ref
+            if state.selection.desired_state != "installed_enabled" or ref is None:
+                raise CodingPluginLifecycleError(
+                    "Plugin Installation is not selected for a new Coding Session",
+                    code="coding_plugin_not_enabled",
+                )
+            instance = self.instances.snapshot().instance(ref)
+            activation_identity = _activation_identity(key, ref)
+            if instance is None:
+                instance = self.instances.activate_current(
+                    key,
+                    operation_id=f"coding-plugin-activate:{activation_identity}",
+                    idempotency_key=f"coding-plugin-activate:{activation_identity}",
+                    direct_host_reference=(
+                        "coding-plugin-host:"
+                        f"{self.layout.scope_id}:{ref.instance_id}:{ref.revision}"
+                    ),
+                )
+            if instance.state != "ACTIVE" or instance.instance_revision_ref != ref:
+                raise CodingPluginLifecycleError(
+                    "Selected Plugin Instance is not ACTIVE",
+                    code="coding_plugin_instance_not_active",
+                )
+            owners = _normalize_owner_contributions(owner_contributions)
+            identity = _lease_identity(
+                key,
+                ref,
+                session_id,
+                lease_attempt_id,
+                owners,
+            )
+            holder_reference = _session_holder_reference(
+                session_id=session_id,
+                lease_attempt_id=lease_attempt_id,
+                owner_contributions=owners,
+                startup_id=self.startup_id,
+            )
+            family = self.instances.acquire_current_family(
+                (key,),
+                lease_kind="session_membership",
+                operation_id=f"coding-plugin-session:{identity}",
+                idempotency_key=f"coding-plugin-session:{identity}",
+                holder_reference=holder_reference,
+            )
+            [member] = family.members
+            if member.instance_revision_ref != ref:
+                release = _family_release(family)
+                self.instances.release_family(release)
+                raise CodingPluginLifecycleError(
+                    "Session lease returned another Plugin Instance Revision",
+                    code="coding_plugin_instance_revision_stale",
+                )
+            return CodingPluginSessionLease(
+                lifecycle=self,
+                installation_key=key,
+                family=family,
+                package_revision=member.package_revision,
+                instance_revision_ref=member.instance_revision_ref,
+                owner_contributions=owners,
+                _session_owner_lease=session_owner_lease,
+            )
+        except BaseException:
+            session_owner_lease.__exit__(None, None, None)
+            raise
+
+    def _submit_default(
+        self,
+        key: PluginInstallationKeyV1,
+        *,
+        action: Literal["install", "enable"],
+        desired_state: Literal["installed_disabled", "installed_enabled"],
+        package_revision: PluginPackageRevisionRefV1 | None,
+        expected_inventory_revision: int,
+    ) -> str | None:
+        identity = hashlib.sha256(
+            repr((key, action, package_revision, expected_inventory_revision)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        event = self.management.submit(
+            PluginManagementCommandV1(
+                action=action,
+                mutation=PluginDesiredStateMutationV1(
+                    operation_id=f"coding-default:{identity}",
+                    idempotency_key=f"coding-default:{identity}",
+                    expected_inventory_revision=expected_inventory_revision,
+                    installation_key=key,
+                    desired_state=desired_state,
+                    package_revision=package_revision,
+                    actor_id="product:coding",
+                    policy_revision=_PRODUCT_POLICY_REVISION,
+                    approval_reference=_DEFAULT_APPROVAL_REFERENCE,
+                ),
+            )
+        )
+        result = getattr(event, "result", None)
+        if result is None:
+            return "coding_plugin_default_management_failed"
+        if result.disposition != "succeeded":
+            return result.error_code or "coding_plugin_default_management_failed"
+        return None
+
+
+@dataclass(slots=True)
+class CodingPluginSessionLease:
+    """One exact Plugin Instance family pinned by a Coding Session."""
+
+    lifecycle: CodingPluginLifecycle = field(repr=False)
+    installation_key: PluginInstallationKeyV1
+    family: PluginInstanceLeaseFamilyV1
+    package_revision: PluginPackageRevisionRefV1
+    instance_revision_ref: PluginInstanceRevisionRef
+    owner_contributions: tuple[tuple[str, tuple[str, ...]], ...]
+    _session_owner_lease: _ProcessSessionOwnerLease = field(
+        repr=False,
+    )
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def claim_runtime(self, runtime_claim_id: str | None = None) -> None:
+        if self._closed:
+            raise CodingPluginLifecycleError(
+                "Closed Coding Session cannot claim a runtime",
+                code="coding_plugin_session_lease_closed",
+            )
+        self._session_owner_lease.claim_runtime(
+            self.family.family_id
+            if runtime_claim_id is None
+            else _nonempty(runtime_claim_id, name="Session runtime claim id")
+        )
+
+    def evaluate_management_change(self) -> CodingPluginManagementChange:
+        snapshot = self.lifecycle.desired.snapshot()
+        state = snapshot.installation(self.installation_key)
+        current_ref = state.selection.instance_revision_ref
+        current_package = state.selection.package_revision
+        if (
+            state.selection.desired_state == "installed_enabled"
+            and current_ref == self.instance_revision_ref
+            and current_package == self.package_revision
+        ):
+            disposition: Literal["no_change", "restart_required"] = "no_change"
+            reason = "selected_revision_unchanged"
+        else:
+            disposition = "restart_required"
+            reason = {
+                "absent": "plugin_removed",
+                "installed_disabled": "plugin_disabled",
+                "installed_enabled": "plugin_updated",
+            }[state.selection.desired_state]
+        return CodingPluginManagementChange(
+            disposition=disposition,
+            reason=reason,
+            inventory_revision=snapshot.inventory_revision,
+            desired_state=state.selection.desired_state,
+            pinned_instance_revision_ref=self.instance_revision_ref,
+            current_instance_revision_ref=current_ref,
+            pinned_package_revision=self.package_revision,
+            current_package_revision=current_package,
+        )
+
+    def prepare_owner_generations(
+        self,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        if self._closed:
+            raise CodingPluginLifecycleError(
+                "Closed Coding Session cannot prepare owner generations",
+                code="coding_plugin_session_lease_closed",
+            )
+        self.lifecycle.prepare_session_owner_generations(self.family, receipts)
+
+    def publish_owner_generations(
+        self,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        if self._closed:
+            raise CodingPluginLifecycleError(
+                "Closed Coding Session cannot publish owner generations",
+                code="coding_plugin_session_lease_closed",
+            )
+        self.lifecycle.publish_session_owner_generations(self.family, receipts)
+
+    def retire_owner_generations(
+        self,
+        receipts: tuple[OwnerGenerationRetirementReceipt, ...],
+    ) -> None:
+        if self._closed:
+            raise CodingPluginLifecycleError(
+                "Closed Coding Session cannot retire owner generations",
+                code="coding_plugin_session_lease_closed",
+            )
+        self.lifecycle.retire_session_owner_generations(self.family, receipts)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        evidence = self.lifecycle.owner_evidence.family(self.family.family_id)
+        if evidence is not None and not evidence.retired:
+            raise CodingPluginLifecycleError(
+                "Coding Session owner generation cleanup remains pending",
+                code="coding_plugin_owner_generation_cleanup_pending",
+            )
+        self.lifecycle.release_session_family_and_reconcile(self.family)
+        self._session_owner_lease.__exit__(None, None, None)
+        self._closed = True
+
+
+@dataclass(frozen=True, slots=True)
+class CodingPluginManagementChange:
+    disposition: Literal["no_change", "restart_required"]
+    reason: str
+    inventory_revision: int
+    desired_state: Literal["absent", "installed_disabled", "installed_enabled"]
+    pinned_instance_revision_ref: PluginInstanceRevisionRef
+    current_instance_revision_ref: PluginInstanceRevisionRef | None
+    pinned_package_revision: PluginPackageRevisionRefV1
+    current_package_revision: PluginPackageRevisionRefV1 | None
+
+    def diagnostic_details(self) -> dict[str, object]:
+        return {
+            "currentInstanceRevisionRef": (
+                None
+                if self.current_instance_revision_ref is None
+                else self.current_instance_revision_ref.to_dict()
+            ),
+            "currentPackageRevision": (
+                None
+                if self.current_package_revision is None
+                else self.current_package_revision.to_dict()
+            ),
+            "desiredState": self.desired_state,
+            "inventoryRevision": self.inventory_revision,
+            "pinnedInstanceRevisionRef": self.pinned_instance_revision_ref.to_dict(),
+            "pinnedPackageRevision": self.pinned_package_revision.to_dict(),
+            "reason": self.reason,
+            "restartRequired": self.disposition == "restart_required",
+        }
+
+
+def resolve_coding_plugin_lifecycle_state_layout(
+    cwd: str | Path,
+    *,
+    platform_paths: PlatformPaths | None = None,
+) -> CodingPluginLifecycleStateLayout:
+    workspace = Path(cwd).expanduser().resolve(strict=False)
+    # Keep the deployed Continuity workspace identity and location.  PLC6D
+    # widens that namespace into the one Coding Product lifecycle authority;
+    # changing it would silently strand existing desired-state journals.
+    digest = hashlib.sha256(
+        b"loushang.coding-continuity-workspace/v1\0" + os.fsencode(str(workspace))
+    ).hexdigest()
+    paths = platform_paths or resolve_platform_paths()
+    root = paths.state / "plugins" / "coding" / "continuity" / "workspaces" / digest
+    package_root = paths.data / "plugins" / "coding" / "workspaces" / digest
+    private_state_base = (
+        paths.home
+        if paths.state == paths.home or paths.home in paths.state.parents
+        else paths.state
+    )
+    return CodingPluginLifecycleStateLayout(
+        root=root,
+        private_state_base=private_state_base,
+        package_root=package_root,
+        private_data_base=(
+            paths.home
+            if paths.data == paths.home or paths.home in paths.data.parents
+            else paths.data
+        ),
+        scope_id=f"workspace:{digest}",
+        desired_state=root / "desired-state.jsonl",
+        management_operations=root / "management-operations.jsonl",
+        retirement_intents=root / "retirement-intents.jsonl",
+        retirement_sets=root / "retirement-sets.jsonl",
+        instance_runtime=root / "instance-runtime.jsonl",
+        package_lifecycle=root / "package-lifecycle.jsonl",
+    )
+
+
+def resolve_ephemeral_coding_plugin_lifecycle_state_layout(
+    session_dir: str | Path,
+    *,
+    cwd: str | Path,
+) -> CodingPluginLifecycleStateLayout:
+    """Bind non-persistent Sessions to disposable management evidence."""
+
+    base = Path(session_dir).expanduser().resolve(strict=False)
+    root = base / "plugin-state" / "coding-lifecycle"
+    workspace = Path(cwd).expanduser().resolve(strict=False)
+    digest = hashlib.sha256(
+        b"loushang.coding-continuity-workspace/v1\0" + os.fsencode(str(workspace))
+    ).hexdigest()
+    return CodingPluginLifecycleStateLayout(
+        root=root,
+        private_state_base=base,
+        package_root=base / "plugin-packages" / "coding-lifecycle",
+        private_data_base=base,
+        scope_id=f"workspace:{digest}",
+        desired_state=root / "desired-state.jsonl",
+        management_operations=root / "management-operations.jsonl",
+        retirement_intents=root / "retirement-intents.jsonl",
+        retirement_sets=root / "retirement-sets.jsonl",
+        instance_runtime=root / "instance-runtime.jsonl",
+        package_lifecycle=root / "package-lifecycle.jsonl",
+    )
+
+
+def build_coding_plugin_lifecycle(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str | None = None,
+    security_acceptances: PluginInstanceSecurityRetirementJournal | None = None,
+) -> CodingPluginLifecycle:
+    if not isinstance(layout, CodingPluginLifecycleStateLayout):
+        raise TypeError("Coding Plugin lifecycle layout is required")
+    resolved_startup_id = startup_id or _CODING_PLUGIN_RUNTIME_BOOT_ID
+    owns_process_startup_lease = _hold_process_startup_lease(
+        layout,
+        startup_id=resolved_startup_id,
+    )
+    try:
+        if not owns_process_startup_lease:
+            _prepare_private_state_layout(layout)
+        gc_reservations = PluginPackageGcReservationJournal(
+            layout.package_gc_reservations
+        )
+        desired = PluginDesiredStateLedger(
+            layout.desired_state, gc_gate=gc_reservations
+        )
+        intents = PluginRetirementIntentLedger(layout.retirement_intents)
+        retirement_sets = PluginRetirementSetLedger(
+            layout.retirement_sets,
+            retirement_intents=intents,
+        )
+        management = PluginManagementService(
+            desired_state=desired,
+            operation_journal_path=layout.management_operations,
+            retirement_intents=intents,
+            retirement_sets=retirement_sets,
+        )
+        enablement_journal = PluginEnablementMigrationJournal(
+            layout.enablement_migration
+        )
+        enablement_journal.assert_runtime_compatible(
+            supported_migration_epoch=1,
+            runtime_version=version("loushang"),
+        )
+        management.recover()
+        enablement_migrations = PluginEnablementMigrationCoordinator(
+            journal=enablement_journal,
+            desired_state=desired,
+            commands=PluginManagementCommandApplication(management),
+            runtime_version=version("loushang"),
+        )
+        security = security_acceptances or (
+            PluginInstanceSecurityRetirementJournal.for_instance_runtime(
+                layout.instance_runtime
+            )
+        )
+        instances = PluginInstanceRuntimeLedger(
+            layout.instance_runtime,
+            management_operation_journal_path=layout.management_operations,
+            desired_state=desired,
+            retirement_intents=intents,
+            retirement_sets=retirement_sets,
+            security_acceptances=security,
+            gc_gate=gc_reservations,
+        )
+        packages = PluginPackageLifecycleLedger(
+            layout.package_lifecycle,
+            startup_id=resolved_startup_id,
+            desired_state=desired,
+            instance_runtime=instances,
+            retirement_sets=retirement_sets,
+            gc_gate=gc_reservations,
+        )
+        owner_evidence = CodingOwnerGenerationEvidenceLedger(
+            layout.owner_generation_evidence
+        )
+        return CodingPluginLifecycle(
+            layout=layout,
+            startup_id=resolved_startup_id,
+            desired=desired,
+            management=management,
+            enablement_migrations=enablement_migrations,
+            instances=instances,
+            retirement_sets=retirement_sets,
+            packages=packages,
+            _gc_reservations=gc_reservations,
+            security=security,
+            owner_evidence=owner_evidence,
+            _owns_process_startup_lease=owns_process_startup_lease,
+        )
+    except BaseException:
+        if owns_process_startup_lease:
+            _release_process_startup_lease(
+                layout,
+                startup_id=resolved_startup_id,
+            )
+        raise
+
+
+def build_coding_plugin_management_application(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    source: PluginSourceProjectionSourcePort | None = None,
+    read_only: bool = False,
+) -> PluginManagementApplicationPorts:
+    """Compose command/query ports without acquiring a Product runtime lease."""
+
+    if not isinstance(layout, CodingPluginLifecycleStateLayout):
+        raise TypeError("Coding Plugin lifecycle layout is required")
+    owns_process_startup_lease = (
+        not read_only
+        and (sys.platform.startswith("linux") or os.name == "nt")
+        and _hold_process_startup_lease(
+            layout,
+            startup_id=_CODING_PLUGIN_RUNTIME_BOOT_ID,
+        )
+    )
+    try:
+        if not read_only and not owns_process_startup_lease:
+            _prepare_private_state_layout(layout)
+        load_policy = (
+            JournalLoadPolicy(partial_tail="raise", create_lock=False)
+            if read_only
+            else None
+        )
+        gc_reservations = PluginPackageGcReservationJournal(
+            layout.package_gc_reservations, load_policy=load_policy
+        )
+        desired = PluginDesiredStateLedger(
+            layout.desired_state, gc_gate=gc_reservations, load_policy=load_policy
+        )
+        intents = PluginRetirementIntentLedger(
+            layout.retirement_intents, load_policy=load_policy
+        )
+        retirement_sets = PluginRetirementSetLedger(
+            layout.retirement_sets,
+            retirement_intents=intents,
+            load_policy=load_policy,
+        )
+        management = PluginManagementService(
+            desired_state=desired,
+            operation_journal_path=layout.management_operations,
+            retirement_intents=intents,
+            retirement_sets=retirement_sets,
+            load_policy=load_policy,
+        )
+        migrations = PluginEnablementMigrationJournal(
+            layout.enablement_migration, load_policy=load_policy
+        )
+        migrations.assert_runtime_compatible(
+            supported_migration_epoch=1,
+            runtime_version=version("loushang"),
+        )
+        if not read_only:
+            management.recover()
+        security = PluginInstanceSecurityRetirementJournal.for_instance_runtime(
+            layout.instance_runtime, load_policy=load_policy
+        )
+        instances = PluginInstanceRuntimeLedger(
+            layout.instance_runtime,
+            management_operation_journal_path=layout.management_operations,
+            desired_state=desired,
+            retirement_intents=intents,
+            retirement_sets=retirement_sets,
+            security_acceptances=security,
+            gc_gate=gc_reservations,
+            load_policy=load_policy,
+        )
+        packages = PluginPackageLifecycleLedger(
+            layout.package_lifecycle,
+            startup_id=_CODING_PLUGIN_RUNTIME_BOOT_ID,
+            desired_state=desired,
+            instance_runtime=instances,
+            retirement_sets=retirement_sets,
+            gc_gate=gc_reservations,
+            load_policy=load_policy,
+        )
+        return PluginManagementApplicationPorts(
+            commands=PluginManagementCommandApplication(management),
+            queries=PluginManagementReadModelProjector(
+                desired_state=desired,
+                operations=management,
+                migrations=migrations,
+                source=source,
+                instances=instances,
+                packages=packages,
+                retirement=retirement_sets,
+            ),
+        )
+    except BaseException:
+        if owns_process_startup_lease:
+            _release_process_startup_lease(
+                layout, startup_id=_CODING_PLUGIN_RUNTIME_BOOT_ID
+            )
+        raise
+
+
+def project_coding_plugin_enablement_compatibility(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    _capture: _CodingPluginEnablementStateCapture | None = None,
+) -> tuple[PluginEnablementCompatibilityProjectionV1, frozenset[str]]:
+    """Read Coding's derived downgrade view without exposing owner stores."""
+
+    if not isinstance(layout, CodingPluginLifecycleStateLayout):
+        raise TypeError("Coding Plugin lifecycle layout is required")
+    if _capture is None:
+        with _capture_existing_plugin_enablement_state(layout) as captured:
+            if captured is None:
+                return _empty_plugin_enablement_compatibility_projection()
+            return project_coding_plugin_enablement_compatibility(
+                layout,
+                _capture=captured,
+            )
+    desired = decode_plugin_desired_state_snapshot(
+        _capture.desired_raw,
+        path=layout.desired_state,
+        gc_gate=PluginPackageGcReservationJournal(layout.package_gc_reservations),
+    )
+    migrations = tuple(
+        item
+        for item in decode_plugin_enablement_migration_snapshots(
+            _capture.migration_raw,
+            path=layout.enablement_migration,
+        )
+        if item.request.installation_key.product_id == CODING_PRODUCT_ID
+        and item.request.installation_key.installation_scope == "workspace"
+        and item.request.installation_key.scope_id == layout.scope_id
+        and item.phase in {"compatibility_window", "finalized"}
+    )
+    migrated = frozenset(item.request.installation_key.plugin_id for item in migrations)
+    disabled = tuple(
+        sorted(
+            item.request.installation_key.plugin_id
+            for item in migrations
+            if desired.installation(
+                item.request.installation_key
+            ).selection.desired_state
+            != "installed_enabled"
+        )
+    )
+    projection = PluginEnablementCompatibilityProjectionV1(
+        desired_inventory_revision=desired.inventory_revision,
+        migration_journal_revision=max(
+            (item.journal_revision for item in migrations),
+            default=0,
+        ),
+        disabled_plugin_ids=disabled,
+    )
+    return projection, migrated
+
+
+def _empty_plugin_enablement_compatibility_projection() -> tuple[
+    PluginEnablementCompatibilityProjectionV1, frozenset[str]
+]:
+    return (
+        PluginEnablementCompatibilityProjectionV1(
+            desired_inventory_revision=0,
+            migration_journal_revision=0,
+            disabled_plugin_ids=(),
+        ),
+        frozenset(),
+    )
+
+
+def package_revision_ref(
+    *,
+    plugin_id: str,
+    plugin_version: str | None,
+    package_content_digest: str,
+    dependency_lock_digest: str,
+    package_source_identity: str,
+) -> PluginPackageRevisionRefV1:
+    return PluginPackageRevisionRefV1(
+        plugin_id=plugin_id,
+        plugin_version=plugin_version,
+        package_content_digest=package_content_digest,
+        dependency_lock_digest=dependency_lock_digest,
+        package_source_identity=package_source_identity,
+    )
+
+
+def _family_release(
+    family: PluginInstanceLeaseFamilyV1,
+) -> PluginInstanceLeaseFamilyReleaseV1:
+    return PluginInstanceLeaseFamilyReleaseV1(
+        family_id=family.family_id,
+        operation_id=f"coding-plugin-release:{family.family_id}",
+        idempotency_key=f"coding-plugin-release:{family.family_id}",
+        release_reference=family.holder_reference,
+    )
+
+
+def _orphan_family_release(
+    family: PluginInstanceLeaseFamilyV1,
+    *,
+    inactive_startup_id: str,
+) -> PluginInstanceLeaseFamilyReleaseV1:
+    identity = hashlib.sha256(
+        repr((family.family_id, inactive_startup_id)).encode("utf-8")
+    ).hexdigest()
+    return PluginInstanceLeaseFamilyReleaseV1(
+        family_id=family.family_id,
+        operation_id=f"coding-plugin-orphan-release:{identity}",
+        idempotency_key=f"coding-plugin-orphan-release:{identity}",
+        release_reference=(
+            "coding-session-process-exit-confirmed:"
+            f"{inactive_startup_id}:{family.family_id}"
+        ),
+    )
+
+
+def _activation_identity(
+    key: PluginInstallationKeyV1,
+    ref: PluginInstanceRevisionRef,
+) -> str:
+    return hashlib.sha256(repr((key, ref)).encode("utf-8")).hexdigest()
+
+
+def _lease_identity(
+    key: PluginInstallationKeyV1,
+    ref: PluginInstanceRevisionRef,
+    session_id: str,
+    lease_attempt_id: str,
+    owner_contributions: tuple[tuple[str, tuple[str, ...]], ...],
+) -> str:
+    return hashlib.sha256(
+        repr(
+            (
+                key,
+                ref,
+                _nonempty(session_id, name="Session id"),
+                _nonempty(lease_attempt_id, name="Lease attempt id"),
+                owner_contributions,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _normalize_owner_contributions(
+    values: tuple[tuple[str, tuple[str, ...]], ...],
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    if not isinstance(values, tuple):
+        raise TypeError("Coding owner contributions must be a tuple")
+    normalized: list[tuple[str, tuple[str, ...]]] = []
+    for owner_reference, contribution_ids in values:
+        owner = _nonempty(owner_reference, name="Owner reference")
+        if (
+            not isinstance(contribution_ids, tuple)
+            or not contribution_ids
+            or any(
+                not isinstance(item, str) or not item or item.strip() != item
+                for item in contribution_ids
+            )
+        ):
+            raise ValueError("Owner contribution ids must be non-empty strings")
+        canonical_ids = tuple(sorted(set(contribution_ids)))
+        normalized.append((owner, canonical_ids))
+    canonical = tuple(sorted(normalized))
+    if len({owner for owner, _items in canonical}) != len(canonical):
+        raise ValueError("Coding owner references must be unique")
+    return canonical
+
+
+_SESSION_HOLDER_PREFIX = "coding-session-owner-family:v2:"
+
+
+@dataclass(frozen=True, slots=True)
+class _CodingSessionHolderEvidence:
+    startup_id: str
+    owner_contributions: tuple[tuple[str, tuple[str, ...]], ...]
+
+
+def _session_holder_reference(
+    *,
+    session_id: str,
+    lease_attempt_id: str,
+    owner_contributions: tuple[tuple[str, tuple[str, ...]], ...],
+    startup_id: str,
+) -> str:
+    payload = {
+        "leaseAttemptId": _nonempty(lease_attempt_id, name="Lease attempt id"),
+        "owners": [
+            {
+                "contributionIds": list(contribution_ids),
+                "ownerReference": owner_reference,
+            }
+            for owner_reference, contribution_ids in owner_contributions
+        ],
+        "sessionId": _nonempty(session_id, name="Session id"),
+        "startupId": _nonempty(startup_id, name="Startup id"),
+    }
+    return _SESSION_HOLDER_PREFIX + json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _session_holder_evidence(
+    holder_reference: str,
+) -> _CodingSessionHolderEvidence | None:
+    if not holder_reference.startswith(_SESSION_HOLDER_PREFIX):
+        # V1 and foreign holder references contain no process epoch.  Preserve
+        # them fail-closed because inactivity cannot be proven.
+        return None
+    try:
+        payload = json.loads(holder_reference[len(_SESSION_HOLDER_PREFIX) :])
+        if not isinstance(payload, dict) or set(payload) != {
+            "leaseAttemptId",
+            "owners",
+            "sessionId",
+            "startupId",
+        }:
+            raise ValueError("invalid Session holder fields")
+        _nonempty(payload["leaseAttemptId"], name="Lease attempt id")
+        _nonempty(payload["sessionId"], name="Session id")
+        startup_id = _nonempty(payload["startupId"], name="Startup id")
+        owners = payload["owners"]
+        if not isinstance(owners, list):
+            raise ValueError("owners must be an array")
+        values = tuple(
+            (
+                item["ownerReference"],
+                tuple(item["contributionIds"]),
+            )
+            for item in owners
+            if isinstance(item, dict)
+            and set(item) == {"contributionIds", "ownerReference"}
+            and isinstance(item["contributionIds"], list)
+        )
+        if len(values) != len(owners):
+            raise ValueError("invalid owner entry")
+        return _CodingSessionHolderEvidence(
+            startup_id=startup_id,
+            owner_contributions=_normalize_owner_contributions(values),
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise CodingPluginLifecycleError(
+            "Coding Session family owner evidence is invalid",
+            code="coding_plugin_session_owner_evidence_invalid",
+        ) from exc
+
+
+def _startup_lease_path(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str,
+) -> Path:
+    identity = hashlib.sha256(
+        b"loushang.coding-plugin-startup/v1\0"
+        + _nonempty(startup_id, name="Startup id").encode("utf-8")
+    ).hexdigest()
+    return (layout.root / "process-startups" / f"{identity}.lease").resolve()
+
+
+def _session_owner_lease_path(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    session_id: str,
+) -> Path:
+    identity = hashlib.sha256(
+        b"loushang.coding-plugin-session-owner/v1\0"
+        + _nonempty(session_id, name="Session id").encode("utf-8")
+    ).hexdigest()
+    return (layout.root / "session-owners" / f"{identity}.lease").resolve()
+
+
+def _acquire_session_owner_lease(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    session_id: str,
+    owner_id: str,
+) -> _ProcessSessionOwnerLease:
+    lease_path = _session_owner_lease_path(layout, session_id=session_id)
+    normalized_owner_id = _nonempty(owner_id, name="Session owner id")
+    with _PROCESS_SESSION_OWNER_LEASES_LOCK:
+        existing = _PROCESS_SESSION_OWNER_LEASES.get(lease_path)
+        if existing is not None:
+            if existing.owner_id != normalized_owner_id:
+                raise CodingPluginLifecycleError(
+                    "Coding Session is already active in another runtime",
+                    code="coding_plugin_session_already_active",
+                )
+            existing.references += 1
+            return _ProcessSessionOwnerLease(
+                path=lease_path,
+                owner_id=normalized_owner_id,
+                authority_id=existing.authority_id,
+            )
+        lease = journal_file_lock(
+            lease_path,
+            "exclusive",
+            lock_suffix="",
+            blocking=False,
+        )
+        try:
+            lease.__enter__()
+        except JournalLockUnavailable as exc:
+            raise CodingPluginLifecycleError(
+                "Coding Session is already active in another runtime",
+                code="coding_plugin_session_already_active",
+            ) from exc
+        authority_id = secrets.token_hex(16)
+        _PROCESS_SESSION_OWNER_LEASES[lease_path] = _ProcessSessionOwnerLeaseState(
+            owner_id=normalized_owner_id,
+            authority_id=authority_id,
+            lease=lease,
+        )
+        return _ProcessSessionOwnerLease(
+            path=lease_path,
+            owner_id=normalized_owner_id,
+            authority_id=authority_id,
+        )
+
+
+def _claim_session_owner_runtime(
+    path: Path,
+    *,
+    owner_id: str,
+    authority_id: str,
+    claim_id: str,
+) -> None:
+    with _PROCESS_SESSION_OWNER_LEASES_LOCK:
+        existing = _PROCESS_SESSION_OWNER_LEASES.get(path)
+        if (
+            existing is None
+            or existing.owner_id != owner_id
+            or existing.authority_id != authority_id
+        ):
+            raise RuntimeError("Coding Session owner lease ownership was lost")
+        if existing.runtime_claim_id is None:
+            existing.runtime_claim_id = claim_id
+            existing.runtime_claim_references = 1
+            return
+        if existing.runtime_claim_id != claim_id:
+            raise CodingPluginLifecycleError(
+                "Coding Session already has another prepared runtime",
+                code="coding_plugin_session_runtime_already_active",
+            )
+        existing.runtime_claim_references += 1
+
+
+def _release_session_owner_lease(
+    path: Path,
+    *,
+    owner_id: str,
+    authority_id: str,
+    runtime_claim_id: str | None,
+) -> None:
+    with _PROCESS_SESSION_OWNER_LEASES_LOCK:
+        existing = _PROCESS_SESSION_OWNER_LEASES.get(path)
+        if (
+            existing is None
+            or existing.owner_id != owner_id
+            or existing.authority_id != authority_id
+        ):
+            raise RuntimeError("Coding Session owner lease ownership was lost")
+        if runtime_claim_id is not None:
+            if existing.runtime_claim_id != runtime_claim_id:
+                raise RuntimeError("Coding Session runtime claim ownership was lost")
+            existing.runtime_claim_references -= 1
+            if existing.runtime_claim_references < 0:
+                raise RuntimeError("Coding Session runtime claim count is invalid")
+            if existing.runtime_claim_references == 0:
+                existing.runtime_claim_id = None
+        if existing.references > 1:
+            existing.references -= 1
+            return
+        # Keep the process-local authority visible until the OS authority is
+        # actually released. A replacement acquisition then waits on this
+        # mutex instead of observing an empty registry and failing against the
+        # still-held non-blocking file lock.
+        try:
+            existing.lease.__exit__(None, None, None)
+        finally:
+            # The journal lock context always closes its file handle on exit.
+            # Never retain a ref-countable state after a reported unlock
+            # failure because the cross-process authority is already gone.
+            del _PROCESS_SESSION_OWNER_LEASES[path]
+
+
+def _hold_process_startup_lease(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str,
+) -> bool:
+    lease_path = _startup_lease_path(layout, startup_id=startup_id)
+    with _PROCESS_STARTUP_LEASES_LOCK:
+        if lease_path in _PROCESS_STARTUP_LEASES:
+            return False
+        lease = _legacy_process_startup_scope(
+            layout, startup_id=startup_id, lease_path=lease_path
+        )
+        try:
+            lease.__enter__()
+        except JournalLockUnavailable as exc:
+            raise CodingPluginLifecycleError(
+                "Coding Plugin startup id is active in another process",
+                code="coding_plugin_startup_already_active",
+            ) from exc
+        _PROCESS_STARTUP_LEASES[lease_path] = lease
+        return True
+
+
+@contextmanager
+def _legacy_process_startup_scope(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str,
+    lease_path: Path,
+) -> Iterator[None]:
+    registration = None
+    if sys.platform.startswith("linux"):
+        from loushang.coding.package_epoch_layout import (
+            resolve_coding_package_epoch_layout,
+        )
+        from loushang.harness.resources.packages.product_epoch_guard import (
+            PackageProductLegacyPreFenceAdmissionError,
+            register_package_product_legacy_runtime,
+        )
+
+        epoch = resolve_coding_package_epoch_layout(layout)
+        _prepare_private_tree(
+            epoch.authority_root,
+            private_base=layout.private_data_base,
+            label="data",
+        )
+        _prepare_private_tree(
+            epoch.control_root,
+            private_base=layout.private_state_base,
+            label="state",
+        )
+        try:
+            registration = register_package_product_legacy_runtime(
+                epoch.authority_root,
+                control_root=epoch.control_root,
+                store_id=epoch.store_id,
+                startup_id="coding:"
+                + hashlib.sha256(startup_id.encode("utf-8")).hexdigest(),
+            )
+        except PackageProductLegacyPreFenceAdmissionError as exc:
+            raise CodingPluginLifecycleError(str(exc), code=exc.code) from exc
+    elif os.name == "nt":
+        from loushang.coding.package_epoch_layout import (
+            resolve_coding_package_epoch_layout,
+        )
+        from loushang.harness.resources.packages.plugin_lifecycle.epoch_fence import (
+            PackageEpochFenceJournal,
+        )
+        from loushang.harness.resources.packages.plugin_lifecycle.windows_pre_fence_registration import (
+            PackageWindowsPreFenceRegistrationError,
+            PackageWindowsPreFenceRegistrationOwner,
+        )
+        from loushang.harness.resources.packages.product_windows_epoch_guard import (
+            prepare_windows_product_control_root,
+        )
+
+        epoch = resolve_coding_package_epoch_layout(layout)
+        _prepare_private_tree(
+            epoch.control_root.parent,
+            private_base=layout.private_state_base,
+            label="state",
+        )
+        try:
+            prepare_windows_product_control_root(epoch.control_root)
+            registration = PackageWindowsPreFenceRegistrationOwner(
+                epoch.control_root,
+                store_id=epoch.store_id,
+                fences=PackageEpochFenceJournal(epoch.control_root / "epoch.jsonl"),
+            ).register(
+                startup_id="coding:"
+                + hashlib.sha256(startup_id.encode("utf-8")).hexdigest(),
+            )
+        except (OSError, ValueError, PackageWindowsPreFenceRegistrationError) as exc:
+            raise CodingPluginLifecycleError(
+                "Coding Windows legacy Package admission failed",
+                code=getattr(exc, "code", "coding_plugin_state_permissions_failed"),
+            ) from exc
+    try:
+        _prepare_private_state_layout(layout)
+        with journal_file_lock(
+            lease_path,
+            "exclusive",
+            lock_suffix="",
+            blocking=False,
+        ):
+            yield
+    finally:
+        if registration is not None:
+            registration.release()
+
+
+def _release_process_startup_lease(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str,
+) -> None:
+    lease_path = _startup_lease_path(layout, startup_id=startup_id)
+    with _PROCESS_STARTUP_LEASES_LOCK:
+        lease = _PROCESS_STARTUP_LEASES.pop(lease_path, None)
+    if lease is not None:
+        lease.__exit__(None, None, None)
+
+
+def _startup_lease_is_inactive(
+    layout: CodingPluginLifecycleStateLayout,
+    *,
+    startup_id: str,
+) -> bool:
+    lease_path = _startup_lease_path(layout, startup_id=startup_id)
+    with _PROCESS_STARTUP_LEASES_LOCK:
+        if lease_path in _PROCESS_STARTUP_LEASES:
+            return False
+    try:
+        metadata = lease_path.lstat()
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or bool(getattr(metadata, "st_reparse_tag", 0))
+            or (os.name == "posix" and callable(getuid) and metadata.st_uid != getuid())
+        ):
+            raise OSError("startup lease is not a private regular file")
+        with journal_file_lock(
+            lease_path,
+            "exclusive",
+            lock_suffix="",
+            blocking=False,
+        ):
+            return True
+    except JournalLockUnavailable:
+        return False
+    except OSError as exc:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin startup liveness evidence is invalid",
+            code="coding_plugin_startup_evidence_invalid",
+        ) from exc
+
+
+def _prepare_private_state_layout(layout: CodingPluginLifecycleStateLayout) -> None:
+    _prepare_private_tree(
+        layout.root,
+        private_base=layout.private_state_base,
+        label="state",
+    )
+    _prepare_private_tree(
+        layout.package_root,
+        private_base=layout.private_data_base,
+        label="data",
+    )
+    # Compatibility readers require this existing coordination entry before
+    # anchoring all lock and journal opens to the validated Windows root handle.
+    with journal_file_lock(layout.coordination_lock, "exclusive"):
+        pass
+
+
+@contextmanager
+def _capture_existing_plugin_enablement_state(
+    layout: CodingPluginLifecycleStateLayout,
+) -> Iterator[_CodingPluginEnablementStateCapture | None]:
+    """Pin one private root and capture compatibility ledgers beneath it."""
+
+    if not _supports_descriptor_relative_private_state_io():
+        if _supports_portable_private_state_io():
+            with _capture_existing_plugin_enablement_state_portable(layout) as capture:
+                yield capture
+            return
+        if not _validate_existing_private_state_layout(layout):
+            yield None
+            return
+        raise CodingPluginLifecycleError(
+            "Secure Coding Plugin state handles are unavailable",
+            code="coding_plugin_state_permissions_failed",
+        )
+
+    descriptor = _open_existing_private_state_root(layout)
+    if descriptor is None:
+        yield None
+        return
+    try:
+        with ExitStack() as locks:
+            for name in _plugin_enablement_capture_lock_names(layout):
+                locks.enter_context(
+                    journal_file_lock_at(
+                        descriptor,
+                        name,
+                        "exclusive",
+                        create=True,
+                    )
+                )
+            yield _CodingPluginEnablementStateCapture(
+                desired_raw=_read_private_state_file(
+                    descriptor,
+                    layout.desired_state.name,
+                ),
+                migration_raw=_read_private_state_file(
+                    descriptor,
+                    layout.enablement_migration.name,
+                ),
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _supports_descriptor_relative_private_state_io() -> bool:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    return bool(
+        os.name == "posix"
+        and os.open in os.supports_dir_fd
+        and nofollow
+        and getattr(os, "O_DIRECTORY", 0)
+    )
+
+
+def _supports_portable_private_state_io() -> bool:
+    """Return whether identity-checked Windows root descriptors are available."""
+
+    return os.name == "nt"
+
+
+def _uses_windows_directory_pins() -> bool:
+    return os.name == "nt"
+
+
+@contextmanager
+def _pin_portable_private_directory_chain(
+    captured: tuple[tuple[Path, os.stat_result], ...],
+) -> Iterator[int | None]:
+    """Anchor Windows child I/O to the validated workspace-root handle."""
+
+    if not _uses_windows_directory_pins():
+        # Tests force the portable reader on POSIX to exercise its common
+        # sequencing; production reaches this branch only on Windows.
+        yield None
+        return
+    with ExitStack() as pins:
+        root_descriptor: int | None = None
+        for path, expected in captured:
+            root_descriptor = pins.enter_context(
+                _open_windows_private_directory(path, expected)
+            )
+        if root_descriptor is None:
+            raise OSError("private state directory chain is empty")
+        yield root_descriptor
+
+
+@contextmanager
+def _open_windows_private_directory(
+    path: Path,
+    expected: os.stat_result,
+) -> Iterator[int]:
+    """Open one direct Windows directory and prove the handle identity."""
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = (
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        )
+
+    win_dll = getattr(ctypes, "WinDLL")
+    kernel32 = win_dll("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandleEx
+    get_information.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    file_list_directory = 0x00000001
+    file_read_attributes = 0x00000080
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_backup_semantics = 0x02000000
+    file_attribute_directory = 0x00000010
+    file_attribute_reparse_point = 0x00000400
+    file_attribute_tag_info = 9
+    handle = create_file(
+        str(path),
+        file_list_directory | file_read_attributes,
+        share_read_write,
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_backup_semantics,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        get_last_error = getattr(ctypes, "get_last_error")
+        win_error = getattr(ctypes, "WinError")
+        raise win_error(get_last_error())
+    descriptor: int | None = None
+    try:
+        information = _FileAttributeTagInfo()
+        if not get_information(
+            handle,
+            file_attribute_tag_info,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            get_last_error = getattr(ctypes, "get_last_error")
+            win_error = getattr(ctypes, "WinError")
+            raise win_error(get_last_error())
+        if (
+            not information.file_attributes & file_attribute_directory
+            or information.file_attributes & file_attribute_reparse_point
+            or information.reparse_tag
+        ):
+            raise OSError("private state path is not a direct directory")
+        open_osfhandle = getattr(msvcrt, "open_osfhandle")
+        descriptor = open_osfhandle(
+            handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOINHERIT", 0),
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _is_link_or_reparse(opened)
+            or not os.path.samestat(expected, opened)
+        ):
+            raise OSError("private state directory handle identity changed")
+        current = _validate_existing_private_directory(path)
+        if not os.path.samestat(expected, current):
+            raise OSError("private state directory identity changed while pinning")
+        yield descriptor
+    finally:
+        if descriptor is None:
+            close_handle(handle)
+        else:
+            os.close(descriptor)
+
+
+def _plugin_enablement_capture_lock_names(
+    layout: CodingPluginLifecycleStateLayout,
+) -> tuple[str, ...]:
+    """Return the owner lock order for one cross-journal compatibility read."""
+
+    return (
+        f"{layout.coordination_lock.name}.lock",
+        f"{layout.enablement_migration.name}.migration.lock",
+        f"{layout.desired_state.name}.lock",
+        f"{layout.enablement_migration.name}.lock",
+    )
+
+
+def _open_existing_private_state_root(
+    layout: CodingPluginLifecycleStateLayout,
+) -> int | None:
+    base = layout.private_state_base.expanduser().absolute()
+    root = layout.root.expanduser().absolute()
+    try:
+        relative = root.relative_to(base)
+    except ValueError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is outside its private base",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+    try:
+        root.lstat()
+    except FileNotFoundError:
+        # An absent compatibility root is not private state yet.  Do not
+        # require or mutate permissions on an unrelated existing home/base.
+        return None
+    except OSError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    flags = os.O_RDONLY | os.O_DIRECTORY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(base, flags)
+        _validate_private_directory_descriptor(descriptor)
+        for part in relative.parts:
+            child = os.open(part, flags, dir_fd=descriptor)
+            try:
+                _validate_private_directory_descriptor(child)
+            except BaseException:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except FileNotFoundError:
+        if descriptor is not None:
+            os.close(descriptor)
+        return None
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+
+
+def _validate_private_directory_descriptor(descriptor: int) -> None:
+    metadata = os.fstat(descriptor)
+    getuid = getattr(os, "getuid", None)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_mode & 0o077
+        or (callable(getuid) and metadata.st_uid != getuid())
+    ):
+        raise OSError("private root is not a private directory")
+
+
+def _read_private_state_file(directory_fd: int, name: str) -> str:
+    if Path(name).name != name:
+        raise ValueError("Private state filename must be one component")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+        metadata = os.fstat(handle.fileno())
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_mode & 0o077
+            or (callable(getuid) and metadata.st_uid != getuid())
+        ):
+            raise CodingPluginLifecycleError(
+                "Coding Plugin state journal is not private",
+                code="coding_plugin_state_permissions_failed",
+            )
+        return handle.read()
+
+
+@contextmanager
+def _capture_existing_plugin_enablement_state_portable(
+    layout: CodingPluginLifecycleStateLayout,
+) -> Iterator[_CodingPluginEnablementStateCapture | None]:
+    """Capture through lock and journal children rooted at one Windows handle."""
+
+    directory_chain = _capture_existing_private_directory_chain(layout)
+    if directory_chain is None:
+        yield None
+        return
+    try:
+        with _pin_portable_private_directory_chain(directory_chain) as descriptor:
+            if descriptor is None:
+                raise OSError("Windows private state root handle is unavailable")
+            _assert_private_directory_chain_stable(directory_chain)
+            with ExitStack() as locks:
+                for index, name in enumerate(
+                    _plugin_enablement_capture_lock_names(layout)
+                ):
+                    locks.enter_context(
+                        journal_file_lock_at(
+                            descriptor,
+                            name,
+                            "exclusive",
+                            create=index > 0,
+                        )
+                    )
+                _assert_private_directory_chain_stable(directory_chain)
+                capture = _CodingPluginEnablementStateCapture(
+                    desired_raw=read_journal_file_at(
+                        descriptor,
+                        layout.desired_state.name,
+                    ),
+                    migration_raw=read_journal_file_at(
+                        descriptor,
+                        layout.enablement_migration.name,
+                    ),
+                )
+                _assert_private_directory_chain_stable(directory_chain)
+                yield capture
+    except OSError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+
+
+def _validate_existing_private_state_layout(
+    layout: CodingPluginLifecycleStateLayout,
+) -> bool:
+    """Validate an existing state tree without recreating a disposed root."""
+
+    return _capture_existing_private_directory_chain(layout) is not None
+
+
+def _capture_existing_private_directory_chain(
+    layout: CodingPluginLifecycleStateLayout,
+) -> tuple[tuple[Path, os.stat_result], ...] | None:
+    """Capture the exact private directory identities used by portable I/O."""
+
+    base = layout.private_state_base.expanduser().absolute()
+    root = layout.root.expanduser().absolute()
+    try:
+        relative = root.relative_to(base)
+    except ValueError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is outside its private base",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+    try:
+        root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+
+    captured: list[tuple[Path, os.stat_result]] = []
+    current = base
+    for part in (None, *relative.parts):
+        if part is not None:
+            current /= part
+        captured.append((current, _validate_existing_private_directory(current)))
+    return tuple(captured)
+
+
+def _assert_private_directory_chain_stable(
+    captured: tuple[tuple[Path, os.stat_result], ...],
+) -> None:
+    for path, expected in captured:
+        current = _validate_existing_private_directory(path)
+        if not os.path.samestat(expected, current):
+            raise OSError("private root identity changed")
+
+
+def _validate_existing_private_directory(root: Path) -> os.stat_result:
+    try:
+        before = root.lstat()
+        getuid = getattr(os, "getuid", None)
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or _is_link_or_reparse(before)
+            or (os.name == "posix" and before.st_mode & 0o077)
+            or (os.name == "posix" and callable(getuid) and before.st_uid != getuid())
+        ):
+            raise OSError("private root is not a private direct directory")
+        after = root.lstat()
+        if not os.path.samestat(before, after):
+            raise OSError("private root identity changed")
+        return after
+    except OSError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+
+
+def _is_link_or_reparse(metadata: os.stat_result) -> bool:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or getattr(metadata, "st_reparse_tag", 0)
+        or (
+            reparse_attribute
+            and getattr(metadata, "st_file_attributes", 0) & reparse_attribute
+        )
+    )
+
+
+def _prepare_private_tree(
+    path: Path,
+    *,
+    private_base: Path,
+    label: str,
+) -> None:
+    base = private_base.expanduser().absolute()
+    root = path.expanduser().absolute()
+    try:
+        relative = root.relative_to(base)
+    except ValueError:
+        raise CodingPluginLifecycleError(
+            f"Coding Plugin {label} root is outside its private base",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+    current = base
+    _prepare_private_directory(current)
+    for part in relative.parts:
+        current /= part
+        _prepare_private_directory(current)
+
+
+def _prepare_private_directory(root: Path) -> None:
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        before = root.lstat()
+        if (
+            not stat.S_ISDIR(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or bool(getattr(before, "st_reparse_tag", 0))
+        ):
+            raise OSError("private root is not a direct directory")
+        getuid = getattr(os, "getuid", None)
+        if os.name == "posix" and callable(getuid) and before.st_uid != getuid():
+            raise PermissionError("private root belongs to another user")
+        if os.name == "posix":
+            root.chmod(0o700)
+        if not os.path.samestat(before, root.lstat()):
+            raise OSError("private root identity changed")
+    except OSError:
+        raise CodingPluginLifecycleError(
+            "Coding Plugin state root is not private",
+            code="coding_plugin_state_permissions_failed",
+        ) from None
+
+
+def _nonempty(value: str, *, name: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ValueError(f"{name} must be non-empty")
+    return value
+
+
+__all__ = [
+    "build_coding_plugin_management_application",
+    "CodingPluginLifecycle",
+    "CodingPluginLifecycleError",
+    "CodingPluginLifecycleStateLayout",
+    "CodingPluginManagementChange",
+    "CodingPluginSessionLease",
+    "build_coding_plugin_lifecycle",
+    "package_revision_ref",
+    "project_coding_plugin_enablement_compatibility",
+    "resolve_coding_plugin_lifecycle_state_layout",
+    "resolve_ephemeral_coding_plugin_lifecycle_state_layout",
+]

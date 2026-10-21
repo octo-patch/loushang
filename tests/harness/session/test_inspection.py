@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from types import SimpleNamespace
 
+import loushang.harness.session.inspection as inspection_module
 from loushang.agent import Agent
+from loushang.ai.json_codec import serialize_message
 from loushang.ai.model import Capabilities, Model, ModelSelection
 from loushang.ai.types import (
     AssistantMessage,
@@ -15,12 +19,23 @@ from loushang.ai.types import (
 from loushang.harness.conversation import (
     ConversationHeader,
     ConversationKey,
+    ConversationRecord,
     MemoryConversationStore,
 )
 from loushang.harness.session import AgentSessionInspector, AgentSessionState
+from loushang.harness.session.inspection import _build_token_usage_totals
 from loushang.harness.transcript import (
+    AGENT_MESSAGE_KIND,
+    CONTEXT_COMPACTION_CHECKPOINT_KIND,
+    MODEL_CALL_ATTEMPT_USAGE_KIND,
+    MODEL_CALL_OUTCOME_KIND,
+    MODEL_INPUT_PREPARED_KIND,
     AgentTranscriptSession,
     AgentTranscriptUnitOfWork,
+    ModelCallAttemptUsage,
+    ModelCallOutcome,
+    ModelInputComponentReference,
+    ModelInputSnapshot,
 )
 
 
@@ -41,6 +56,7 @@ def _model() -> Model:
 
 def _assistant() -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[
             TextPart(type="text", text="answer"),
@@ -114,7 +130,7 @@ async def _inspector() -> AgentSessionInspector:
         is_compacting=lambda: False,
         get_last_diagnostics=lambda limit: [object()] if limit else [],
         get_model_selection=lambda: ModelSelection(
-            provider="test", model_id="test-model"
+            endpoint_id="test-endpoint", provider="test", model_id="test-model"
         ),
     )
 
@@ -134,7 +150,9 @@ def test_agent_session_inspector_builds_product_neutral_state_and_usage() -> Non
         is_compacting=False,
         is_retrying=True,
         thinking_level="high",
-        model_selection=ModelSelection(provider="test", model_id="test-model"),
+        model_selection=ModelSelection(
+            endpoint_id="test-endpoint", provider="test", model_id="test-model"
+        ),
     )
     assert state.run.status == "idle"
     assert usage.message_count == 3
@@ -144,6 +162,11 @@ def test_agent_session_inspector_builds_product_neutral_state_and_usage() -> Non
     assert usage.tool_result_count == 1
     assert usage.tokens == 7
     assert usage.context_window == 128_000
+    assert usage.authority == "provider_usage"
+    assert usage.accuracy == "projected"
+    assert usage.transcript_revision == 3
+    assert usage.leaf_id == "tool-1"
+    assert usage.estimator_id == "harness.message_chars.v1"
     assert stats.session_id == "inspection-1"
     assert stats.session_name == "Inspection"
     assert stats.entry_count == 3
@@ -160,3 +183,421 @@ def test_agent_session_inspector_reads_fork_candidates_and_assistant_text() -> N
     assert inspector.get_entry_text("user-1") == "hello"
     assert inspector.get_recent_assistant_texts() == ("answer",)
     assert inspector.get_last_assistant_text() == "answer"
+
+
+def test_provider_anchor_surface_requires_the_current_model_projection() -> None:
+    inspector = asyncio.run(_inspector())
+    messages = [UserMessage(role="user", content="raw", timestamp=1.0)]
+    inspector.agent.convert_to_llm = lambda values: [
+        UserMessage(role="user", content="x" * 40, timestamp=1.0)
+    ]
+
+    projected = inspector._measure_current_model_surface(messages)
+
+    assert projected is not None
+    assert projected.tokens == 10
+
+    inspector.agent.transform_context = lambda values, signal: values
+    assert inspector._measure_current_model_surface(messages) is None
+
+
+def test_provider_anchor_does_not_rebuild_input_before_compaction(monkeypatch) -> None:
+    inspector = asyncio.run(_inspector())
+    records = [
+        _record("old-snapshot", MODEL_INPUT_PREPARED_KIND, _snapshot("old", 1)),
+        _record(
+            "old-usage",
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            _attempt_usage("old", 1, input=10, terminal=True),
+        ),
+        _record("checkpoint", CONTEXT_COMPACTION_CHECKPOINT_KIND, object()),
+    ]
+
+    def reject_rebuild(snapshot_id: str) -> None:
+        raise AssertionError(f"rebuilt compacted input {snapshot_id}")
+
+    monkeypatch.setattr(inspector.session, "rebuild_model_input", reject_rebuild)
+
+    assert inspector._derive_provider_context_anchor(records) is None
+
+
+def test_context_usage_reuses_its_replayed_messages_for_counts(monkeypatch) -> None:
+    inspector = asyncio.run(_inspector())
+    build_context = inspector.session.build_context
+    replay_count = 0
+
+    def count_replays():
+        nonlocal replay_count
+        replay_count += 1
+        return build_context()
+
+    monkeypatch.setattr(inspector.session, "build_context", count_replays)
+
+    usage = inspector.get_context_usage()
+
+    assert usage.message_count == 3
+    assert replay_count == 1
+
+
+def test_token_totals_prefer_outcomes_and_keep_uncovered_legacy_usage() -> None:
+    legacy_usage = Usage(1, 2, 3, 4, 10, None)
+    outcome_usage = Usage(10, 5, 2, 1, 18, None)
+    cancelled_usage = Usage(7, 0, 0, 0, 7, None)
+    records = [
+        _record("legacy", AGENT_MESSAGE_KIND, _assistant_with_usage(legacy_usage)),
+        _record(
+            "snapshot",
+            MODEL_INPUT_PREPARED_KIND,
+            SimpleNamespace(snapshot_id="snapshot-1"),
+        ),
+        _record("projected", AGENT_MESSAGE_KIND, _assistant_with_usage(outcome_usage)),
+        _record(
+            "outcome",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="invocation-1",
+                model_input_snapshot_ids=("snapshot-1",),
+                disposition="completed",
+                stop_reason="stop",
+                usage=outcome_usage,
+            ),
+        ),
+        _record(
+            "cancelled",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="invocation-2",
+                model_input_snapshot_ids=(),
+                disposition="cancelled",
+                stop_reason="aborted",
+                usage=cancelled_usage,
+            ),
+        ),
+        _record(
+            "compaction",
+            "context.compaction.checkpoint",
+            SimpleNamespace(tokens_before=999_999),
+        ),
+    ]
+
+    totals = _build_token_usage_totals(records)  # type: ignore[arg-type]
+
+    assert totals.input == 18
+    assert totals.output == 7
+    assert totals.cache_read == 5
+    assert totals.cache_write == 5
+    assert totals.total == 35
+    assert totals.source == "mixed_derived"
+    assert totals.incomplete_attempts is True
+
+
+def test_token_totals_prefer_complete_attempt_facts_across_retries() -> None:
+    records = [
+        _record(
+            "snapshot-1", MODEL_INPUT_PREPARED_KIND, _snapshot("snapshot-1", 1)
+        ),
+        _record(
+            "usage-1",
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            _attempt_usage("snapshot-1", 1, input=10, terminal=True),
+        ),
+        _record(
+            "snapshot-2", MODEL_INPUT_PREPARED_KIND, _snapshot("snapshot-2", 2)
+        ),
+        _record(
+            "usage-2",
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            _attempt_usage(
+                "snapshot-2",
+                2,
+                input=20,
+                output=5,
+                terminal=True,
+            ),
+        ),
+        _record(
+            "outcome",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="invocation-1",
+                model_input_snapshot_ids=("snapshot-1", "snapshot-2"),
+                disposition="completed",
+                stop_reason="stop",
+                usage=Usage(20, 5, 0, 0, 25, None),
+            ),
+        ),
+    ]
+
+    totals = _build_token_usage_totals(records)  # type: ignore[arg-type]
+
+    assert totals.input == 30
+    assert totals.output == 5
+    assert totals.total == 35
+    assert totals.source == "attempt_usage_facts"
+    assert totals.incomplete_attempts is False
+
+
+def test_token_totals_do_not_count_post_outcome_assistant_twice() -> None:
+    usage = Usage(10, 5, 2, 1, 18, None)
+    records = [
+        _record(
+            "snapshot-1", MODEL_INPUT_PREPARED_KIND, _snapshot("snapshot-1", 1)
+        ),
+        _record(
+            "usage-1",
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            ModelCallAttemptUsage(
+                invocation_id="invocation-1",
+                attempt=1,
+                model_input_snapshot_id="snapshot-1",
+                input=10,
+                output=5,
+                cache_read=2,
+                cache_write=1,
+                total_tokens=18,
+                terminal=True,
+            ),
+        ),
+        _record(
+            "outcome",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="invocation-1",
+                model_input_snapshot_ids=("snapshot-1",),
+                disposition="completed",
+                stop_reason="stop",
+                usage=usage,
+            ),
+        ),
+        _record("assistant", AGENT_MESSAGE_KIND, _assistant_with_usage(usage)),
+    ]
+
+    totals = _build_token_usage_totals(records)  # type: ignore[arg-type]
+
+    assert totals.input == 10
+    assert totals.output == 5
+    assert totals.cache_read == 2
+    assert totals.cache_write == 1
+    assert totals.total == 18
+    assert totals.source == "attempt_usage_facts"
+    assert totals.incomplete_attempts is False
+
+
+def test_token_totals_mark_fact_and_outcome_fallback_as_mixed() -> None:
+    records = [
+        _record(
+            "snapshot-1", MODEL_INPUT_PREPARED_KIND, _snapshot("snapshot-1", 1)
+        ),
+        _record(
+            "usage-1",
+            MODEL_CALL_ATTEMPT_USAGE_KIND,
+            _attempt_usage("snapshot-1", 1, input=10, terminal=True),
+        ),
+        _record(
+            "outcome-1",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="invocation-1",
+                model_input_snapshot_ids=("snapshot-1",),
+                disposition="completed",
+                stop_reason="stop",
+                usage=Usage(10, 0, 0, 0, 10, None),
+            ),
+        ),
+        _record(
+            "legacy-snapshot",
+            MODEL_INPUT_PREPARED_KIND,
+            _snapshot("legacy-snapshot", 1, invocation_id="legacy-invocation"),
+        ),
+        _record(
+            "outcome-2",
+            MODEL_CALL_OUTCOME_KIND,
+            ModelCallOutcome(
+                invocation_id="legacy-invocation",
+                model_input_snapshot_ids=("legacy-snapshot",),
+                disposition="completed",
+                stop_reason="stop",
+                usage=Usage(7, 2, 0, 0, 9, None),
+            ),
+        ),
+    ]
+
+    totals = _build_token_usage_totals(records)  # type: ignore[arg-type]
+
+    assert totals.input == 17
+    assert totals.output == 2
+    assert totals.total == 19
+    assert totals.source == "mixed_derived"
+    assert totals.incomplete_attempts is True
+
+
+def test_provider_context_anchor_skips_summary_and_caches_by_revision(
+    monkeypatch,
+) -> None:
+    attempts = (
+        SimpleNamespace(
+            invocation_id="main-invocation",
+            attempt=1,
+            model_input_snapshot_id="main-snapshot",
+            usage=Usage(10, 2, 3, 4, 19, None),
+            terminal=True,
+        ),
+        SimpleNamespace(
+            invocation_id="summary-invocation",
+            attempt=1,
+            model_input_snapshot_id="summary-snapshot",
+            usage=Usage(20, 1, 0, 0, 21, None),
+            terminal=True,
+        ),
+    )
+    projection_calls = 0
+
+    def project(records):
+        nonlocal projection_calls
+        del records
+        projection_calls += 1
+        return SimpleNamespace(attempts=attempts)
+
+    monkeypatch.setattr(inspection_module, "project_model_call_usage", project)
+    rebuild_calls: list[str] = []
+
+    def rebuild(snapshot_id: str):
+        rebuild_calls.append(snapshot_id)
+        purpose = "compaction_summary" if snapshot_id == "summary-snapshot" else "main"
+        return SimpleNamespace(
+            snapshot=SimpleNamespace(
+                purpose=purpose,
+                source_revision=1,
+                commit_revision=2,
+                provider_id="provider-1",
+                endpoint_id="endpoint-1",
+                api_id="api-1",
+                model_id="model-1",
+            ),
+                logical_input={
+                    "system_prompt": "system",
+                    "messages": [
+                    serialize_message(
+                        UserMessage(role="user", content="hello", timestamp=1.0)
+                    )
+                    ],
+                    "tools": [],
+                    "request_options": {},
+                },
+            prepared_payload_hash="sha256:" + "a" * 64,
+        )
+
+    inspector = AgentSessionInspector(
+        agent=SimpleNamespace(),
+        session=SimpleNamespace(rebuild_model_input=rebuild),
+        get_session_id=lambda: "session-1",
+        get_session_name=lambda: None,
+        get_active_tool_names=lambda: [],
+        is_retrying=lambda: False,
+        is_compacting=lambda: False,
+        get_last_diagnostics=lambda limit: [],
+        get_model_selection=lambda: None,
+    )
+
+    first = inspector._get_provider_context_anchor(
+        (), transcript_revision=3, leaf_id="leaf-3"
+    )
+    second = inspector._get_provider_context_anchor(
+        (), transcript_revision=3, leaf_id="leaf-3"
+    )
+
+    assert first is second
+    assert first is not None
+    assert first.invocation_id == "main-invocation"
+    assert first.provider_prompt_tokens == 17
+    assert rebuild_calls == ["summary-snapshot", "main-snapshot"]
+    assert projection_calls == 1
+
+
+def _assistant_with_usage(usage: Usage) -> AssistantMessage:
+    return AssistantMessage(
+        endpoint="test-endpoint",
+        role="assistant",
+        content=[TextPart(type="text", text="answer")],
+        api="responses",
+        provider="test",
+        model="test-model",
+        response_id=None,
+        usage=usage,
+        stop_reason="stop",
+        error_message=None,
+        timestamp=1.0,
+    )
+
+
+def _attempt_usage(
+    snapshot_id: str,
+    attempt: int,
+    *,
+    input: int,
+    output: int = 0,
+    terminal: bool,
+) -> ModelCallAttemptUsage:
+    return ModelCallAttemptUsage(
+        invocation_id="invocation-1",
+        attempt=attempt,
+        model_input_snapshot_id=snapshot_id,
+        input=input,
+        output=output,
+        cache_read=0,
+        cache_write=0,
+        terminal=terminal,
+    )
+
+
+def _snapshot(
+    snapshot_id: str,
+    attempt: int,
+    *,
+    invocation_id: str = "invocation-1",
+) -> ModelInputSnapshot:
+    reference = ModelInputComponentReference(
+        name="messages",
+        record_id="component-record",
+        content_hash="a" * 64,
+    )
+    return ModelInputSnapshot(
+        snapshot_id=snapshot_id,
+        invocation_id=invocation_id,
+        attempt=attempt,
+        purpose="main_turn",
+        product_id="coding",
+        runtime_id="runtime-1",
+        mount_generation=1,
+        profile_fingerprint="b" * 64,
+        registration_revision="c" * 64,
+        conversation_id="conversation-1",
+        source_leaf_id="source-record",
+        source_revision=1,
+        commit_revision=2,
+        provider_id="provider-1",
+        model_id="model-1",
+        api_id="api-1",
+        endpoint_id="endpoint-1",
+        logical_components=tuple(
+            replace(reference, name=name)
+            for name in ("system_prompt", "messages", "tools", "request_options")
+        ),
+        prepared_payload_components=(reference,),
+        model_visible_headers_component=replace(
+            reference, name="model_visible_headers"
+        ),
+        logical_input_hash="d" * 64,
+        prepared_payload_hash="e" * 64,
+    )
+
+
+def _record(record_id: str, kind: str, payload: object) -> ConversationRecord[object]:
+    return ConversationRecord(
+        record_id=record_id,
+        parent_id=None,
+        kind=kind,
+        payload_version=1,
+        created_at="2026-08-26T00:00:00Z",
+        payload=payload,
+    )

@@ -5,7 +5,12 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Literal
 
-from loushang.harness.workspace.truncation import DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES
+from loushang.harness.artifacts.references import RunArtifactRef, SessionBlobRef
+from loushang.harness.workspace.truncation import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES,
+    TruncationKind,
+)
 
 
 def _as_tuple_of_strings(
@@ -61,6 +66,7 @@ class ExecRequest:
     artifact_dir: str | None = None
     capture_full_output: bool = True
     rolling_max_bytes: int = 100 * 1024
+    retain_output_artifacts: bool = True
     effective_environment: tuple[tuple[str, str], ...] | None = field(
         default=None,
         repr=False,
@@ -116,8 +122,11 @@ def materialize_exec_request(
         else os.getcwd()
     )
     if request.effective_environment is None:
-        effective_environment = dict(os.environ if environ is None else environ)
-        effective_environment.update(dict(request.env))
+        effective_environment = _merge_environment(
+            os.environ if environ is None else environ,
+            request.env,
+            case_insensitive=_local_environment_is_case_insensitive(),
+        )
         environment_snapshot = tuple(effective_environment.items())
     else:
         environment_snapshot = request.effective_environment
@@ -130,6 +139,33 @@ def materialize_exec_request(
     )
 
 
+def _merge_environment(
+    inherited: Mapping[str, str],
+    overrides: tuple[tuple[str, str], ...],
+    *,
+    case_insensitive: bool,
+) -> dict[str, str]:
+    if not case_insensitive:
+        merged = dict(inherited)
+        merged.update(dict(overrides))
+        return merged
+
+    insensitive_merged: dict[str, str] = {}
+    spellings: dict[str, str] = {}
+    for key, value in (*inherited.items(), *overrides):
+        normalized = key.casefold()
+        previous = spellings.get(normalized)
+        if previous is not None and previous != key:
+            insensitive_merged.pop(previous, None)
+        insensitive_merged[key] = value
+        spellings[normalized] = key
+    return insensitive_merged
+
+
+def _local_environment_is_case_insensitive() -> bool:
+    return os.name == "nt"
+
+
 @dataclass(frozen=True)
 class ExecOutputChunk:
     stream: Literal["stdout", "stderr"]
@@ -137,6 +173,7 @@ class ExecOutputChunk:
 
 
 ExecUpdateCallback = Callable[[ExecOutputChunk], Awaitable[None] | None]
+StdioDrainReason = Literal["idle_timeout", "hard_timeout"]
 
 
 @dataclass(frozen=True)
@@ -152,15 +189,23 @@ class ExecResult:
     stdout_preview: str = ""
     stderr_preview: str = ""
     stdout_truncated: bool = False
-    stdout_truncated_by: str | None = None
+    stdout_truncated_by: TruncationKind | None = None
     stderr_truncated: bool = False
-    stderr_truncated_by: str | None = None
+    stderr_truncated_by: TruncationKind | None = None
     stdout_artifact_path: str | None = None
     stderr_artifact_path: str | None = None
     stdout_total_lines: int | None = None
     stdout_total_bytes: int | None = None
     stderr_total_lines: int | None = None
     stderr_total_bytes: int | None = None
+    stdio_complete: bool = True
+    stdio_drain_reason: StdioDrainReason | None = None
+    stdout_artifact_ref: RunArtifactRef | SessionBlobRef | None = None
+    stderr_artifact_ref: RunArtifactRef | SessionBlobRef | None = None
+    artifact_retention_error: str | None = None
+    artifact_cleanup_error: Literal["temporary_cleanup_pending"] | None = field(
+        default=None, kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -178,6 +223,24 @@ class ExecResult:
             "output_chunks",
             _as_tuple_of_output_chunks(self.output_chunks, "output_chunks"),
         )
+        if self.stdio_complete and self.stdio_drain_reason is not None:
+            raise ValueError("complete stdio cannot have a drain reason")
+        if not self.stdio_complete and self.stdio_drain_reason is None:
+            raise ValueError("incomplete stdio requires a drain reason")
+        for name, reference in (
+            ("stdout", self.stdout_artifact_ref),
+            ("stderr", self.stderr_artifact_ref),
+        ):
+            if reference is not None and not isinstance(
+                reference, RunArtifactRef | SessionBlobRef
+            ):
+                raise TypeError(f"{name} artifact ref is invalid")
+        if self.artifact_retention_error is not None and not isinstance(
+            self.artifact_retention_error, str
+        ):
+            raise TypeError("artifact retention error must be a string or None")
+        if self.artifact_cleanup_error not in (None, "temporary_cleanup_pending"):
+            raise ValueError("invalid artifact cleanup diagnostic")
 
 
 __all__ = [
@@ -185,5 +248,6 @@ __all__ = [
     "ExecRequest",
     "ExecResult",
     "ExecUpdateCallback",
+    "StdioDrainReason",
     "materialize_exec_request",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import fields
+from threading import Event, Thread
 
 import pytest
 
@@ -17,7 +18,11 @@ def test_settings_manager_loads_global_and_project_settings_with_project_precede
     global_settings_path.write_text(
         json.dumps(
             {
-                "default_model": {"provider": "faux", "model_id": "alpha"},
+                "default_model": {
+                    "provider": "faux",
+                    "endpoint_id": "messages",
+                    "model_id": "alpha",
+                },
                 "thinking_level": "minimal",
                 "compaction": {
                     "enabled": False,
@@ -58,6 +63,7 @@ def test_settings_manager_loads_global_and_project_settings_with_project_precede
 
     assert settings.default_model is not None
     assert settings.default_model.provider == "faux"
+    assert settings.default_model.endpoint_id == "messages"
     assert settings.default_model.model_id == "alpha"
     assert settings.thinking_level == "minimal"
     assert settings.system_prompt == "Use project rules."
@@ -336,6 +342,7 @@ def test_settings_manager_persists_statusline_settings_updates(tmp_path) -> None
             "runtime": True,
             "queue": "true",
             "message": "false",
+            "context": "auto",
             "separator": "dot",
             "style": "plain",
         }
@@ -434,6 +441,8 @@ def test_settings_manager_persists_scoped_updates_and_notifies_subscribers(
             external_tool_policy="never",
             blocked_tools=("bash",),
             ask_tools=("write",),
+            blocked_capabilities=("network.mutate",),
+            ask_capabilities=("workspace.command",),
             blocked_substrings=("rm -rf",),
             ask_substrings=("git push",),
             blocked_path_substrings=("/etc",),
@@ -514,6 +523,8 @@ def test_settings_manager_persists_scoped_updates_and_notifies_subscribers(
         external_tool_policy="never",
         blocked_tools=("bash",),
         ask_tools=("write",),
+        blocked_capabilities=("network.mutate",),
+        ask_capabilities=("workspace.command",),
         blocked_substrings=("rm -rf",),
         ask_substrings=("git push",),
         blocked_path_substrings=("/etc",),
@@ -595,6 +606,241 @@ def test_settings_manager_package_source_add_remove_uses_package_identity(
         is True
     )
     assert manager.get_package_sources() == []
+
+
+def test_package_source_mutation_rollback_restores_exact_scoped_patches(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    existing = "git:https://example.test/existing.git"
+    other = "git:https://example.test/other.git"
+    absent = "git:https://example.test/absent.git"
+    manager = SettingsManager(
+        global_settings_path=tmp_path / "global.json",
+        project_settings_path=tmp_path / "project.json",
+    )
+    manager.set_package_sources((existing, other), scope="global")
+    manager.set_package_sources((other, existing), scope="project")
+    manager.set_resource_roots(("session-root",), scope="session")
+    before = (
+        manager.get_global_settings(),
+        manager.get_project_settings(),
+        manager.get_session_settings(),
+    )
+
+    add_existing = manager.begin_package_source_mutation(
+        existing,
+        scope="project",
+        present=True,
+    )
+    add_existing.rollback()
+    remove_absent = manager.begin_package_source_mutation(
+        absent,
+        scope="session",
+        present=False,
+    )
+    remove_absent.rollback()
+
+    assert (
+        manager.get_global_settings(),
+        manager.get_project_settings(),
+        manager.get_session_settings(),
+    ) == before
+    assert [source.source for source in manager.get_package_sources()] == [
+        other,
+        existing,
+    ]
+
+
+def test_package_source_mutation_rollback_preserves_concurrent_unrelated_settings(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    source = "git:https://example.test/review.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+    mutation = manager.begin_package_source_mutation(
+        source,
+        scope="project",
+        present=True,
+    )
+    manager.set_theme("concurrent-theme", scope="project")
+
+    mutation.rollback()
+
+    assert manager.get_package_sources() == []
+    assert manager.get_settings().theme == "concurrent-theme"
+    assert manager.get_project_settings() == {"theme": "concurrent-theme"}
+
+
+def test_package_source_mutation_rollback_compare_and_replace_is_atomic(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    source = "git:https://example.test/review.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+    mutation = manager.begin_package_source_mutation(
+        source,
+        scope="project",
+        present=True,
+    )
+    runtime = manager._config._runtime  # type: ignore[attr-defined]
+    original_transform = runtime.transform
+    transform_ready = Event()
+    release_transform = Event()
+    concurrent_started = Event()
+    errors: list[BaseException] = []
+
+    def blocking_transform(layer, transform, *, persist=None):  # type: ignore[no-untyped-def]
+        def blocked(current_patch):  # type: ignore[no-untyped-def]
+            replacement = transform(current_patch)
+            transform_ready.set()
+            release_transform.wait(timeout=5)
+            return replacement
+
+        return original_transform(layer, blocked, persist=persist)
+
+    monkeypatch.setattr(runtime, "transform", blocking_transform)
+
+    def rollback() -> None:
+        try:
+            mutation.rollback()
+        except BaseException as error:
+            errors.append(error)
+
+    def update_theme() -> None:
+        concurrent_started.set()
+        try:
+            manager.set_theme("concurrent-theme", scope="project")
+        except BaseException as error:
+            errors.append(error)
+
+    rollback_thread = Thread(target=rollback)
+    rollback_thread.start()
+    assert transform_ready.wait(timeout=5)
+    update_thread = Thread(target=update_theme)
+    update_thread.start()
+    assert concurrent_started.wait(timeout=5)
+    release_transform.set()
+    rollback_thread.join(timeout=5)
+    update_thread.join(timeout=5)
+
+    assert rollback_thread.is_alive() is False
+    assert update_thread.is_alive() is False
+    assert errors == []
+    assert manager.get_package_sources() == []
+    assert manager.get_project_settings() == {"theme": "concurrent-theme"}
+
+
+def test_package_source_mutation_rollback_rejects_same_key_concurrent_write(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    first = "git:https://example.test/first.git"
+    second = "git:https://example.test/second.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+    mutation = manager.begin_package_source_mutation(
+        first,
+        scope="project",
+        present=True,
+    )
+    manager.add_package_source(second, scope="project")
+
+    with pytest.raises(RuntimeError, match="changed concurrently: packages"):
+        mutation.rollback()
+
+    assert [source.source for source in manager.get_package_sources()] == [
+        first,
+        second,
+    ]
+
+
+def test_package_source_mutation_compensates_post_commit_listener_failure(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    source = "git:https://example.test/review.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+
+    def fail(_settings) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("listener failed")
+
+    manager.subscribe(fail)
+
+    with pytest.raises(RuntimeError, match="listener failed"):
+        manager.begin_package_source_mutation(
+            source,
+            scope="project",
+            present=True,
+        )
+
+    assert manager.get_package_sources() == []
+    assert manager.get_project_settings() == {}
+    assert json.loads((tmp_path / "project.json").read_text(encoding="utf-8")) == {}
+
+
+def test_package_source_mutation_commit_rejects_listener_same_key_drift(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    source = "git:https://example.test/review.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+    unsubscribe_callbacks = [lambda: None]
+
+    def remove_again(_settings) -> None:  # type: ignore[no-untyped-def]
+        unsubscribe_callbacks[0]()
+        manager.remove_package_source(source, scope="project")
+
+    unsubscribe_callbacks[0] = manager.subscribe(remove_again)
+    mutation = manager.begin_package_source_mutation(
+        source,
+        scope="project",
+        present=True,
+    )
+
+    assert manager.get_package_sources() == []
+    with pytest.raises(RuntimeError, match="changed concurrently: packages"):
+        mutation.commit()
+    assert mutation.state == "active"
+
+    with pytest.raises(RuntimeError, match="changed concurrently: packages"):
+        mutation.rollback()
+    assert mutation.state == "active"
+    assert manager.get_project_settings() == {"packages": []}
+
+
+def test_noop_package_source_mutation_still_validates_operation_key(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    source = "git:https://example.test/review.git"
+    manager = SettingsManager(project_settings_path=tmp_path / "project.json")
+    manager.set_package_sources((), scope="project")
+    unsubscribe_callbacks = [lambda: None]
+
+    def add_during_publication(_settings) -> None:  # type: ignore[no-untyped-def]
+        unsubscribe_callbacks[0]()
+        manager.add_package_source(source, scope="project")
+
+    unsubscribe_callbacks[0] = manager.subscribe(add_during_publication)
+    mutation = manager.begin_package_source_mutation(
+        source,
+        scope="project",
+        present=False,
+    )
+
+    assert mutation.changed is False
+    assert [item.source for item in manager.get_package_sources()] == [source]
+    with pytest.raises(RuntimeError, match="changed concurrently: packages"):
+        mutation.commit()
+    assert mutation.state == "active"
 
 
 def test_settings_manager_exposes_standard_control_getters_and_setters(
@@ -722,6 +968,39 @@ def test_settings_manager_reports_persisted_removed_transport_setting(tmp_path) 
     assert len(errors) == 1
     assert errors[0].scope == "global"
     assert "transport setting has been removed" in errors[0].message
+
+
+def test_settings_patch_preserves_omitted_null_and_package_wire_contract() -> None:
+    from loushang.harness.config.agent._settings_patch import (
+        AgentSettingsUpdate,
+        build_settings_patch,
+    )
+
+    assert build_settings_patch(AgentSettingsUpdate()) == {}
+    assert build_settings_patch(
+        AgentSettingsUpdate(
+            theme=None,
+            enabled_models=None,
+            package_sources=("/tmp/shared-package",),
+        )
+    ) == {
+        "theme": None,
+        "enabled_models": None,
+        "packages": ["/tmp/shared-package"],
+    }
+
+
+def test_prepare_override_patch_drops_removed_keys_without_rewriting_storage() -> None:
+    from loushang.harness.config.agent._settings_patch import prepare_override_patch
+
+    patch, messages = prepare_override_patch(
+        {"transport": "websocket", "theme": "night"}
+    )
+
+    assert patch == {"theme": "night"}
+    assert messages == (
+        "transport setting has been removed; use provider/contrib-specific configuration instead",
+    )
 
 
 def test_settings_manager_control_getters_apply_standard_defaults_and_bounds(
@@ -885,3 +1164,154 @@ def test_settings_manager_reload_preserves_previous_scope_when_reload_fails(
     errors = manager.drain_errors()
     assert len(errors) == 1
     assert errors[0].scope == "project"
+
+
+def test_persistent_settings_update_refreshes_a_preloaded_peer(tmp_path) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    settings_path = tmp_path / "project-settings.json"
+    first = SettingsManager(project_settings_path=settings_path)
+    peer = SettingsManager(project_settings_path=settings_path)
+
+    first.set_disabled_plugins(("managed-pack",), scope="project")
+    peer.set_theme("night", scope="project")
+
+    reloaded = SettingsManager(project_settings_path=settings_path)
+    assert reloaded.get_settings().disabled_plugins == ("managed-pack",)
+    assert reloaded.get_settings().theme == "night"
+
+
+def test_preloaded_settings_rmw_helpers_preserve_peer_mutations(tmp_path) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    global_path = tmp_path / "global.json"
+    project_path = tmp_path / "project.json"
+    first = SettingsManager(
+        global_settings_path=global_path,
+        project_settings_path=project_path,
+    )
+    peer = SettingsManager(
+        global_settings_path=global_path,
+        project_settings_path=project_path,
+    )
+
+    first.add_plugin_source("plugins/first", scope="project")
+    peer.add_plugin_source("plugins/peer", scope="project")
+    first.add_package_source("pypi:first-pack==1.0.0", scope="project")
+    peer.add_package_source("git:example.com/peer-pack@v1", scope="project")
+    first.disable_skill("first-skill", scope="project")
+    peer.disable_skill("peer-skill", scope="project")
+    first.set_image_width_cells(77, scope="global")
+    peer.set_show_terminal_progress(True, scope="global")
+
+    reloaded = SettingsManager(
+        global_settings_path=global_path,
+        project_settings_path=project_path,
+    )
+    settings = reloaded.get_settings()
+    assert settings.plugin_sources == ("plugins/first", "plugins/peer")
+    assert [source.source for source in settings.package_sources] == [
+        "pypi:first-pack==1.0.0",
+        "git:example.com/peer-pack@v1",
+    ]
+    assert settings.disabled_skills == ("first-skill", "peer-skill")
+    assert settings.terminal.image_width_cells == 77
+    assert settings.terminal.show_terminal_progress is True
+
+
+def test_settings_manager_accepts_one_plugin_compatibility_authority(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+    from loushang.harness.config.agent.manager import (
+        LegacyPluginCompatibilityProjectionV1,
+    )
+
+    manager = SettingsManager(project_settings_path=tmp_path / "settings.json")
+    authority = object()
+    guarded: list[str] = []
+    publish = manager.bind_plugin_enablement_legacy_mutation_guard(
+        authority,
+        guarded.append,
+    )
+    assert (
+        manager.bind_plugin_enablement_legacy_mutation_guard(
+            authority,
+            lambda _plugin_id: None,
+        )
+        is publish
+    )
+    with pytest.raises(RuntimeError, match="authority already bound"):
+        manager.bind_plugin_enablement_legacy_mutation_guard(
+            object(),
+            lambda _plugin_id: None,
+        )
+
+    publish(
+        LegacyPluginCompatibilityProjectionV1(
+            disabled_plugin_ids=("managed-pack",),
+            migrated_plugin_ids=("managed-pack",),
+            desired_inventory_revision=1,
+            migration_journal_revision=1,
+        )
+    )
+    assert manager.get_settings().disabled_plugins == ("managed-pack",)
+
+    manager.disable_plugin("unmigrated-pack", scope="project")
+    assert guarded == ["unmigrated-pack"]
+
+
+def test_persistent_settings_transaction_publishes_after_unlock(tmp_path) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    settings_path = tmp_path / "project-settings.json"
+    manager = SettingsManager(project_settings_path=settings_path)
+    seen: list[tuple[str, ...]] = []
+    errors: list[BaseException] = []
+
+    def mutate_again(settings) -> None:  # type: ignore[no-untyped-def]
+        seen.append(settings.disabled_plugins)
+        if settings.disabled_plugins == ("outer",):
+            manager.disable_plugin("nested", scope="project")
+
+    manager.subscribe(mutate_again)
+
+    def mutate() -> None:
+        try:
+            manager.set_disabled_plugins(("outer",), scope="project")
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = Thread(target=mutate, daemon=True)
+    worker.start()
+    worker.join(timeout=3)
+
+    assert worker.is_alive() is False
+    assert errors == []
+    assert seen == [("outer",), ("outer", "nested")]
+    assert manager.get_settings().disabled_plugins == ("outer", "nested")
+    assert SettingsManager(
+        project_settings_path=settings_path
+    ).get_settings().disabled_plugins == ("outer", "nested")
+
+
+def test_persistent_settings_update_fails_closed_on_corrupt_peer_state(
+    tmp_path,
+) -> None:
+    from loushang.harness.config.agent import SettingsManager
+
+    settings_path = tmp_path / "project-settings.json"
+    manager = SettingsManager(project_settings_path=settings_path)
+    settings_path.write_text("{not-json", encoding="utf-8")
+
+    with pytest.raises(json.JSONDecodeError):
+        manager.set_theme("night", scope="project")
+
+    assert settings_path.read_text(encoding="utf-8") == "{not-json"
+
+    seen: list[str] = []
+    manager.subscribe(lambda settings: seen.append(settings.theme))
+    settings_path.write_text("{}", encoding="utf-8")
+    manager.set_theme("recovered", scope="project")
+
+    assert seen == ["recovered"]

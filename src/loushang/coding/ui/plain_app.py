@@ -49,7 +49,13 @@ def build_plain_coding_tui_app(
         runtime=runtime,
         session=session,
         verbose=verbose,
+        plugin_workspace=cwd,
     )
+
+    def current_hotkeys() -> str:
+        settings_manager = getattr(session, "settings_manager", None)
+        get_keybindings = getattr(settings_manager, "get_keybindings", None)
+        return format_hotkeys(get_keybindings() if callable(get_keybindings) else None)
 
     return build_agent_plain_conversation_app(
         ports=build_agent_plain_conversation_ports(
@@ -62,12 +68,13 @@ def build_plain_coding_tui_app(
             trace=trace,
             now=now,
             controller=controller,
+            get_operations=controller.get_operations,
             select_model=lambda query, chooser: select_available_model(
                 session,
                 query=query,
                 choose=chooser,
             ),
-            hotkeys=format_hotkeys,
+            hotkeys=current_hotkeys,
             debug_status=lambda debug_path, scopes: debug_status_text(
                 debug_path,
                 scopes=scopes,

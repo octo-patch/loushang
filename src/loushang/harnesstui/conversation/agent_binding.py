@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import time
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import replace
@@ -9,7 +11,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Protocol, TextIO, TypeAlias
 
-from loushang.agent.types import AgentToolResult
+from loushang.agent.types import AgentToolResult, ImagePart
 from loushang.harness.events import normalize_event_select
 from loushang.harness.host.mode import ModeConfig
 from loushang.harness.host.rpc import run_rpc_host
@@ -32,11 +34,16 @@ from loushang.harness.transcript import (
     CONTEXT_COMPACTION_CHECKPOINT_KIND,
     CONVERSATION_METADATA_PATCH_KIND,
     EXTENSION_DATA_KIND,
+    MODEL_CALL_ATTEMPT_USAGE_KIND,
+    MODEL_CALL_OUTCOME_KIND,
+    MODEL_INPUT_COMPONENT_KIND,
+    MODEL_INPUT_PREPARED_KIND,
     MODEL_SELECTION_KIND,
     RECORD_ANNOTATION_PATCH_KIND,
     STANDARD_AGENT_TRANSCRIPT_KINDS,
     THINKING_SELECTION_KIND,
 )
+from loushang.harnesstui.conversation.attachments import PromptImageAttachment
 from loushang.harnesstui.conversation.history import (
     ConversationHistoryProjector,
     HistoryRecordDisposition,
@@ -73,6 +80,7 @@ from loushang.harnesstui.conversation.projection import (
 from loushang.harnesstui.conversation.runtime_view import StringQueueReader
 from loushang.harnesstui.conversation.screen_target import (
     ScreenConversationProjectionPort,
+    ScreenConversationProjectionTarget,
     ScreenProjectionStatusCopy,
     StandardScreenProjectionStatusCopy,
     build_screen_conversation_projection,
@@ -84,11 +92,33 @@ from loushang.harnesstui.conversation.tool_transcript import (
     build_mapping_tool_transcript_projection,
     tool_block_to_record,
 )
+from loushang.tui.markdown.renderer import (
+    analyze_large_markdown_delta,
+    render_prepared_atomic_markdown,
+    split_independent_flat_bullet_delta,
+)
 from loushang.tui.transcript import DisplayRecord, ToolExecutionRecord
 
 AgentToolTranscriptProjection: TypeAlias = ToolTranscriptProjectionBinding[
     Mapping[str, Any], object
 ]
+
+
+def agent_image_parts_from_prompt_attachments(
+    attachments: tuple[PromptImageAttachment, ...],
+) -> tuple[ImagePart, ...] | None:
+    """Convert neutral TUI attachments at the standard Agent boundary."""
+
+    if not attachments:
+        return None
+    return tuple(
+        ImagePart(
+            type="image",
+            data=base64.b64encode(attachment.bytes).decode("ascii"),
+            mime_type=attachment.mime_type,
+        )
+        for attachment in attachments
+    )
 
 
 class AgentPlainPromptRenderer(PlainConversationProjectionPort, Protocol):
@@ -105,8 +135,6 @@ class AgentPlainPromptSession(Protocol):
         listener: Callable[[dict[str, Any]], None],
     ) -> Callable[[], None]: ...
 
-    def wait_for_idle(self) -> Awaitable[None]: ...
-
 
 STANDARD_AGENT_HISTORY_DISPOSITIONS: dict[str, HistoryRecordDisposition] = {
     AGENT_MESSAGE_KIND: "render",
@@ -119,6 +147,10 @@ STANDARD_AGENT_HISTORY_DISPOSITIONS: dict[str, HistoryRecordDisposition] = {
     EXTENSION_DATA_KIND: "hidden",
     RECORD_ANNOTATION_PATCH_KIND: "metadata-only",
     CONVERSATION_METADATA_PATCH_KIND: "metadata-only",
+    MODEL_CALL_OUTCOME_KIND: "hidden",
+    MODEL_CALL_ATTEMPT_USAGE_KIND: "hidden",
+    MODEL_INPUT_COMPONENT_KIND: "hidden",
+    MODEL_INPUT_PREPARED_KIND: "hidden",
 }
 if set(STANDARD_AGENT_HISTORY_DISPOSITIONS) != set(STANDARD_AGENT_TRANSCRIPT_KINDS):
     raise RuntimeError("Agent history dispositions must cover every standard kind")
@@ -144,6 +176,7 @@ def build_agent_tool_transcript_projection(
     )
     return build_mapping_tool_transcript_projection(
         result_text=_agent_result_text,
+        expanded_result_text=_agent_expanded_result_text,
         result_details=_agent_result_details,
         result_terminated=lambda result: (
             isinstance(result, AgentToolResult) and result.terminate
@@ -206,12 +239,48 @@ def agent_session_history_records(
         tool_definition_resolver=tool_definition_resolver,
         max_body_lines=max_tool_body_lines,
     )
+    tool_calls = _agent_history_tool_call_snapshots(
+        transcript_items,
+        tool_projector=tool_projector,
+    )
     return project_agent_conversation_history(
         transcript_items,
         tool_result_projector=lambda message: agent_tool_block_to_record(
-            tool_projector.project_tool_result_message(message)
+            tool_projector.project_tool_result_message(
+                message,
+                tool_calls.get(tool_projector.message_id(message)),
+            )
         ),
     )
+
+
+def _agent_history_tool_call_snapshots(
+    items: Sequence[object],
+    *,
+    tool_projector: AgentToolTranscriptProjection,
+) -> dict[str, ToolCallSnapshot]:
+    snapshots: dict[str, ToolCallSnapshot] = {}
+    for item in items:
+        message = getattr(item, "payload", item)
+        if getattr(message, "role", None) != "assistant":
+            continue
+        content = getattr(message, "content", None)
+        if not isinstance(content, Sequence) or isinstance(content, str):
+            continue
+        for part in content:
+            tool_call_id = getattr(part, "id", None)
+            tool_name = getattr(part, "name", None)
+            if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+                continue
+            snapshots[tool_call_id] = tool_projector.remember_call(
+                {
+                    "type": "tool_execution_start",
+                    "tool_call_id": tool_call_id,
+                    "tool_name": tool_name,
+                    "args": getattr(part, "arguments", None),
+                }
+            )
+    return snapshots
 
 
 async def load_agent_session_history_records(
@@ -525,7 +594,6 @@ async def run_agent_plain_prompt(
                 prepare=prepare,
                 subscribe=lambda: session.subscribe(event_projection.handle),
                 submit=submit,
-                wait_for_idle=session.wait_for_idle,
                 capture_failure_state=lambda: event_projection.last_error_message,
                 resolve_failure=resolve_failure,
                 render_user=renderer.render_user,
@@ -634,6 +702,127 @@ def build_agent_screen_conversation_projection(
     )
 
 
+def cooperative_agent_screen_event_listener(
+    projection: ConversationProjectionBinding[dict[str, Any]],
+    *,
+    pause: Callable[[], Awaitable[None]] | None = None,
+) -> Callable[[dict[str, Any]], Awaitable[None] | None]:
+    """Keep input and Working frames live during large assistant deltas."""
+
+    async def pause_between_chunks() -> None:
+        await asyncio.sleep(0.016)
+
+    pause_frame = pause or pause_between_chunks
+
+    async def prepare_unrendered_draft() -> None:
+        target = projection.projector.target
+        if not isinstance(target, ScreenConversationProjectionTarget):
+            return
+        captured = target.unrendered_assistant_markdown_spec()
+        if captured is None:
+            return
+        markdown, spec = captured
+        try:
+            result = await asyncio.to_thread(
+                render_prepared_atomic_markdown, markdown, None, spec
+            )
+        except Exception:
+            return
+        target.prepare_assistant_markdown_render(markdown, spec, result)
+
+    def handle(event: dict[str, Any]) -> Awaitable[None] | None:
+        if event.get("type") == "message_end" and getattr(
+            event.get("message"), "role", None
+        ) == "assistant":
+            target = projection.projector.target
+            if (
+                isinstance(target, ScreenConversationProjectionTarget)
+                and target.unrendered_assistant_markdown_spec() is not None
+            ):
+
+                async def finish_assistant() -> None:
+                    await prepare_unrendered_draft()
+                    projection.handle(event)
+
+                return finish_assistant()
+
+        update = event.get("assistant_message_event")
+        message = event.get("message")
+        if (
+            event.get("type") != "message_update"
+            or getattr(message, "role", None) != "assistant"
+            or not isinstance(update, Mapping)
+            or update.get("type") != "text_delta"
+            or not isinstance(update.get("delta"), str)
+        ):
+            projection.handle(event)
+            return None
+
+        async def project_chunks(chunks: tuple[str, ...]) -> None:
+            for index, chunk in enumerate(chunks):
+                projection.handle(
+                    {
+                        **event,
+                        "assistant_message_event": {**update, "delta": chunk},
+                    }
+                )
+                if index + 1 < len(chunks):
+                    await pause_frame()
+            if len(delta) >= 16_384:
+                await prepare_unrendered_draft()
+
+        delta = update["delta"]
+        chunks = split_independent_flat_bullet_delta(delta)
+        if chunks is not None:
+            return project_chunks(chunks)
+        if len(delta) < 16_384:
+            projection.handle(event)
+            return None
+
+        async def project_large_markdown() -> None:
+            target = projection.projector.target
+            analysis = await asyncio.to_thread(
+                analyze_large_markdown_delta, delta
+            )
+            if analysis.chunks is None:
+                rendered = None
+                spec = (
+                    target.atomic_markdown_render_spec(delta)
+                    if analysis.prepared_table_blocks is not None
+                    and isinstance(target, ScreenConversationProjectionTarget)
+                    else None
+                )
+                if analysis.prepared_table_blocks is not None and spec is not None:
+                    try:
+                        result = await asyncio.to_thread(
+                            render_prepared_atomic_markdown,
+                            delta,
+                            analysis.prepared_table_blocks,
+                            spec,
+                        )
+                    except Exception:
+                        # Keep the parsed handoff; the normal renderer remains
+                        # authoritative if speculative preparation fails.
+                        pass
+                    else:
+                        rendered = (spec, result)
+                projection.handle(event)
+                if (
+                    analysis.prepared_table_blocks is not None
+                    and isinstance(target, ScreenConversationProjectionTarget)
+                ):
+                    target.prepare_assistant_markdown(
+                        delta, analysis.prepared_table_blocks, rendered=rendered
+                    )
+                await prepare_unrendered_draft()
+            else:
+                await project_chunks(analysis.chunks)
+
+        return project_large_markdown()
+
+    return handle
+
+
 def _agent_tool_result_message_event(message: object) -> Mapping[str, Any]:
     tool_name = str(getattr(message, "tool_name", "tool"))
     tool_call_id = getattr(message, "tool_call_id", None)
@@ -662,6 +851,16 @@ def _agent_result_text(result: object, max_lines: int) -> str:
         _agent_result_details(result),
         max_collapsed_lines=max_lines,
     ).collapsed
+
+
+def _agent_expanded_result_text(result: object, max_lines: int) -> str:
+    del max_lines
+    if not isinstance(result, AgentToolResult):
+        return ""
+    return render_tool_result_presentation(
+        result.content,
+        _agent_result_details(result),
+    ).expanded
 
 
 def _agent_result_details(result: object) -> Mapping[str, Any]:
@@ -717,6 +916,10 @@ def _render_agent_tool_event(
 
 
 def _standard_tool_title(snapshot: ToolCallSnapshot) -> str:
+    if snapshot.tool_name == "spawn_agent" and isinstance(snapshot.args, Mapping):
+        name = snapshot.args.get("name")
+        if isinstance(name, str) and name:
+            return f"spawn_agent {name}"
     if snapshot.rendered_call_text:
         return snapshot.rendered_call_text.splitlines()[0].strip()
     return snapshot.tool_name
@@ -728,10 +931,12 @@ __all__ = [
     "AgentPlainPromptRenderer",
     "AgentPlainPromptSession",
     "STANDARD_AGENT_HISTORY_DISPOSITIONS",
+    "agent_image_parts_from_prompt_attachments",
     "agent_tool_block_to_record",
     "build_agent_plain_conversation_projection",
     "build_agent_plain_event_projection",
     "build_agent_screen_conversation_projection",
+    "cooperative_agent_screen_event_listener",
     "build_agent_tool_transcript_projection",
     "project_agent_conversation_history",
     "run_agent_plain_prompt",

@@ -12,6 +12,7 @@ from loushang.harness.conversation import (
 )
 from loushang.harness.events import BranchSummaryCompleted, BranchSummaryStarted
 from loushang.harness.transcript import (
+    CONTEXT_BRANCH_SUMMARY_KIND,
     AgentTranscriptInspector,
     AgentTranscriptNavigationRuntime,
     AgentTranscriptRecord,
@@ -40,6 +41,7 @@ def _model(model_id: str = "one", *, reasoning: bool = True) -> Model:
 
 def _assistant(text: str) -> AssistantMessage:
     return AssistantMessage(
+        endpoint="test-endpoint",
         role="assistant",
         content=[TextPart(type="text", text=text)],
         api="responses",
@@ -173,6 +175,53 @@ def test_navigation_runtime_owns_branch_selection_summary_and_events() -> None:
     asyncio.run(scenario())
 
 
+def test_navigation_runtime_cancel_and_wait_joins_active_summary() -> None:
+    async def scenario() -> None:
+        session = await _session()
+        await session.append_message(
+            UserMessage(role="user", content="root", timestamp=1.0)
+        )
+        target_id = await session.append_message(_assistant("target"))
+        await session.append_message(
+            UserMessage(role="user", content="divergent", timestamp=2.0)
+        )
+        await session.append_message(_assistant("leaf"))
+        runtime = AgentTranscriptNavigationRuntime(
+            session=session,
+            apply_context=lambda: None,
+        )
+        plan = runtime.prepare(target_id)
+        assert plan is not None
+        started = asyncio.Event()
+
+        async def summarize(records, signal):
+            assert records
+            started.set()
+            while not signal.aborted:
+                await asyncio.sleep(0)
+            return BranchSummaryOutput(summary="must not commit")
+
+        task = asyncio.create_task(
+            runtime.navigate(plan, summarize=True, summary_runner=summarize)
+        )
+        await started.wait()
+
+        await runtime.cancel_and_wait()
+
+        assert task.done()
+        result = await task
+        assert result.cancelled is True
+        assert result.aborted is True
+        assert runtime.is_summarizing is False
+        assert session.get_leaf_id() != target_id
+        assert all(
+            record.kind != CONTEXT_BRANCH_SUMMARY_KIND
+            for record in session.get_entries()
+        )
+
+    asyncio.run(scenario())
+
+
 def test_selection_runtime_uses_product_catalog_but_owns_persisted_state() -> None:
     class Catalog:
         def __init__(self, models: list[Model]) -> None:
@@ -180,7 +229,11 @@ def test_selection_runtime_uses_product_catalog_but_owns_persisted_state() -> No
 
         def list_models(self) -> list[ModelSelection]:
             return [
-                ModelSelection(provider=model.provider_id, model_id=model.id)
+                ModelSelection(
+                    endpoint_id=model.endpoint_id,
+                    provider=model.provider_id,
+                    model_id=model.id,
+                )
                 for model in self.models
             ]
 
@@ -216,7 +269,9 @@ def test_selection_runtime_uses_product_catalog_but_owns_persisted_state() -> No
             active_thinking = level
 
         selection = runtime.cycle_model_selection()
-        assert selection == ModelSelection(provider="test", model_id="two")
+        assert selection == ModelSelection(
+            endpoint_id="responses", provider="test", model_id="two"
+        )
         assert selection is not None
         await runtime.apply_model(runtime.resolve_model(selection))
         await runtime.set_thinking_level("high")
@@ -224,7 +279,11 @@ def test_selection_runtime_uses_product_catalog_but_owns_persisted_state() -> No
         assert active_model == second
         assert active_thinking == "high"
         context = session.build_context()
-        assert context.model == {"provider": "test", "model_id": "two"}
+        assert context.model == {
+            "provider": "test",
+            "endpoint_id": "responses",
+            "model_id": "two",
+        }
         assert context.thinking_level == "high"
 
     asyncio.run(scenario())

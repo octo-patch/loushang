@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import date
+from pathlib import Path
+
+import pytest
 
 from loushang.agent.types import AgentToolResult
-from loushang.harness.tools.workspace import ToolContext
+from loushang.harness.tools.execution import direct_execution
+from loushang.harness.tools.workspace import ToolContext, direct_tool
 
 
 def _runtime_footer(cwd: str) -> str:
@@ -31,7 +35,7 @@ def test_session_materialized_decorated_tool_receives_session_cwd(tmp_path) -> N
         SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
     )
     registry = ToolRegistry()
-    registry.register_tool(show_session_cwd)
+    registry.register_tool(direct_tool(show_session_cwd))
     model = Model(
         id="faux-model",
         name="Faux",
@@ -67,7 +71,7 @@ def test_session_materialized_decorated_tool_receives_session_cwd(tmp_path) -> N
     assert result.content[0].text == "/tmp/project"
 
 
-def test_session_get_all_tools_without_registry_supports_raw_runtime_tools(
+def test_session_without_registry_rejects_raw_runtime_tools(
     tmp_path,
 ) -> None:
     from loushang.agent import Agent
@@ -123,11 +127,33 @@ def test_session_get_all_tools_without_registry_supports_raw_runtime_tools(
         convert_to_llm=lambda messages: [],
     )
 
-    session = AgentSession(agent=agent, session_manager=manager)
+    with pytest.raises(TypeError, match="explicitly bound ToolDefinitions"):
+        AgentSession(agent=agent, session_manager=manager)
 
-    assert [definition.name for definition in session.get_all_tools()] == [
-        "runtime_tool"
-    ]
+
+def test_coding_default_profile_keeps_unpublished_base_tools_pending(tmp_path) -> None:
+    from loushang.agent import Agent
+    from loushang.coding import SessionManager
+    from loushang.coding.session import AgentSession
+    from loushang.coding.tool_pack import CODING_DEFAULT_ACTIVE_TOOL_NAMES
+    from loushang.harness.tools.workspace.registry import (
+        WorkspaceToolRegistry as ToolRegistry,
+    )
+
+    session = AgentSession(
+        agent=Agent(initial_state={"system_prompt": "Base prompt.", "tools": []}),
+        session_manager=asyncio.run(
+            SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+        ),
+        tool_registry=ToolRegistry(),
+        active_tool_names=(),
+        base_prompt="Base prompt.",
+    )
+
+    profile = session._composition.tool_controller.default_tool_profile
+    assert profile is not None
+    assert profile.static_default_names == CODING_DEFAULT_ACTIVE_TOOL_NAMES
+    assert session.get_active_tool_names() == []
 
 
 def test_agent_session_tracks_active_tool_names_and_runtime_tools(tmp_path) -> None:
@@ -475,7 +501,7 @@ def test_agent_session_extension_context_register_tool_refreshes_active_tools_an
                     "required": [],
                     "additionalProperties": False,
                 },
-                execute=execute_dynamic,
+                execution=direct_execution(execute_dynamic),
                 prompt_snippet="- dynamic_tool: Run dynamic test behavior",
                 prompt_guidelines=(
                     "Use dynamic_tool when the user asks for dynamic behavior tests.",
@@ -531,6 +557,430 @@ def test_agent_session_extension_context_register_tool_refreshes_active_tools_an
     }
 
 
+@pytest.mark.parametrize(
+    ("slot", "expected_capability"),
+    (
+        ("prompt.sections", "harness.resources"),
+        ("interaction.side_question", "harness.session"),
+    ),
+)
+def test_agent_session_rejects_extension_graph_provider_change_before_reload(
+    tmp_path,
+    slot: str,
+    expected_capability: str,
+) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.resource_runtime import CodingResourceLoader
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.diagnostics import DiagnosticsService
+    from loushang.harness.extensions.agent import ExtensionRunner, LoadedExtension
+    from loushang.harness.extensions.declarations import (
+        ExtensionCapabilityDeclarationSnapshot,
+        ExtensionRuntimeCapabilityDeclaration,
+    )
+    from loushang.harness.resources.types import ResourceBundle
+
+    events: list[str] = []
+    candidate_snapshot = ExtensionCapabilityDeclarationSnapshot(
+        declarations=(
+            ExtensionRuntimeCapabilityDeclaration(
+                extension_id="demo",
+                slot=slot,
+                name="replacement",
+                implementation_version=2,
+                priority=10,
+                granted_permissions=(slot,),
+            ),
+        )
+    )
+
+    class Candidate:
+        capability_declarations = candidate_snapshot
+
+        async def discover_resources_async(self, bundle, *, reason):
+            del bundle, reason
+            events.append("discover")
+            raise AssertionError("preflight must run before discovery")
+
+        async def activate(self, bindings) -> None:
+            del bindings
+            events.append("activate")
+
+        async def rollback(self) -> None:
+            events.append("rollback")
+
+    class Runner(ExtensionRunner):
+        def prepare_generation(self, extensions):
+            del extensions
+            return Candidate()
+
+    class Loader(CodingResourceLoader):
+        def reload_resources(self, cwd):
+            return ResourceBundle(cwd=Path(cwd))
+
+    diagnostics = DiagnosticsService()
+    runner = Runner([LoadedExtension(name="demo", source_path=tmp_path / "demo.py")])
+    session = AgentSession(
+        agent=Agent(initial_state={"system_prompt": "Base prompt.", "tools": []}),
+        session_manager=asyncio.run(
+            SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
+        ),
+        extension_runner=runner,
+        resource_loader=Loader(),
+        resource_bundle=ResourceBundle(cwd=tmp_path),
+        diagnostics_service=diagnostics,
+    )
+
+    asyncio.run(session.prepare_model_call_runtime())
+    before_view = session.get_effective_runtime_view()
+    before_mount = before_view.clocks.mount
+    before_registration = before_view.clocks.registration
+    before_resource_revision = (
+        session._composition.resource_refresh_runtime.resource_revision
+    )
+
+    asyncio.run(session.reload_extension_runtime())
+
+    after_mount = session.get_effective_runtime_view().clocks.mount
+    assert events == ["rollback"]
+    assert runner.generation == 1
+    assert before_resource_revision == 1
+    assert session._composition.resource_refresh_runtime.resource_revision == 1
+    assert after_mount == before_mount
+    assert session.get_effective_runtime_view().clocks.registration == (
+        before_registration
+    )
+    records = [
+        record
+        for record in diagnostics.get_diagnostics()
+        if record.code == "extension_graph_provider_restart_required"
+    ]
+    assert len(records) == 1
+    assert records[0].type == "error"
+    assert records[0].details["restartRequired"] is True
+    assert records[0].details["capabilityIds"] == [expected_capability]
+    asyncio.run(session.dispose())
+
+
+def test_agent_session_content_only_extension_reload_keeps_mount_generation(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from loushang.agent import Agent
+    from loushang.coding.resource_runtime import CodingResourceLoader
+    from loushang.coding.session import AgentSession
+    from loushang.coding.session_manager import SessionManager
+    from loushang.harness.extensions.agent import ExtensionRunner
+    from loushang.harness.resources.types import ExtensionDescriptor, ResourceBundle
+
+    source = tmp_path / "demo.py"
+    source.write_text(
+        "def _on_start(event, context):\n"
+        "    del event, context\n"
+        "\n"
+        "def register(api):\n"
+        "    api.on('session_start', _on_start)\n",
+        encoding="utf-8",
+    )
+    descriptor = ExtensionDescriptor(
+        name="demo",
+        source_path=source,
+        entry_path=source,
+    )
+
+    class Loader(CodingResourceLoader):
+        def reload_resources(self, cwd):
+            return ResourceBundle(cwd=Path(cwd), extensions=[descriptor])
+
+    runner = ExtensionRunner([descriptor])
+    session = AgentSession(
+        agent=Agent(initial_state={"system_prompt": "Base prompt.", "tools": []}),
+        session_manager=asyncio.run(
+            SessionManager.new(session_dir=tmp_path, cwd=str(tmp_path), persist=False)
+        ),
+        extension_runner=runner,
+        resource_loader=Loader(),
+        resource_bundle=ResourceBundle(cwd=tmp_path, extensions=[descriptor]),
+    )
+    asyncio.run(session.prepare_model_call_runtime())
+    before_mount = session.get_effective_runtime_view().clocks.mount
+    before_resource_revision = (
+        session._composition.resource_refresh_runtime.resource_revision
+    )
+    graph_bind_calls = 0
+    original_graph_bind = session._capability_graph_binder.bind
+
+    async def count_graph_bind(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal graph_bind_calls
+        graph_bind_calls += 1
+        return await original_graph_bind(*args, **kwargs)
+
+    monkeypatch.setattr(session._capability_graph_binder, "bind", count_graph_bind)
+
+    source.write_text(
+        "def _on_start(event, context):\n"
+        "    del event, context\n"
+        "    marker = 'content-v2'\n"
+        "    del marker\n"
+        "\n"
+        "def register(api):\n"
+        "    api.on('session_start', _on_start)\n",
+        encoding="utf-8",
+    )
+    asyncio.run(session.reload_extension_runtime())
+
+    assert runner.generation == 2
+    assert session._composition.resource_refresh_runtime.resource_revision == (
+        before_resource_revision + 1
+    )
+    assert session.get_effective_runtime_view().clocks.mount == before_mount
+    assert graph_bind_calls == 0
+    asyncio.run(session.dispose())
+
+
+def test_agent_session_extension_registers_explicit_tool_routes_live(
+    tmp_path,
+) -> None:
+    from loushang.agent import Agent
+    from loushang.coding import SessionManager
+    from loushang.coding.session import AgentSession
+    from loushang.harness.extensions.agent import ExtensionRunner, LoadedExtension
+    from loushang.harness.tools import (
+        FilesystemActionAdapter,
+        authorized_tool,
+        direct_tool,
+        tool,
+    )
+    from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
+
+    @tool(prompt_snippet="- runtime_ping: Ping the live extension")
+    async def runtime_ping() -> str:
+        """Return one direct runtime result."""
+
+        return "pong"
+
+    @tool(prompt_snippet="- runtime_save: Save an authorized runtime note")
+    async def runtime_save(
+        path: str,
+        content: str,
+        context: ToolContext,
+    ) -> str:
+        """Save one runtime note through the authorization Gateway."""
+
+        del content
+        return str(context.cwd or "") + "/" + path
+
+    def _session_start(event, ctx) -> None:
+        del event
+        ctx.register_tool(direct_tool(runtime_ping))
+        ctx.register_tool(
+            authorized_tool(
+                runtime_save,
+                action=FilesystemActionAdapter(
+                    "write",
+                    authorization_fields=("content",),
+                ),
+            )
+        )
+        with pytest.raises(
+            TypeError,
+            match=r"direct_tool\(\.\.\.\) or authorized_tool",
+        ):
+            ctx.register_tool(runtime_ping)
+
+    session = AgentSession(
+        agent=Agent(initial_state={"system_prompt": "Base prompt.", "tools": []}),
+        session_manager=asyncio.run(
+            SessionManager.new(
+                session_dir=tmp_path,
+                cwd=str(tmp_path),
+                persist=False,
+            )
+        ),
+        tool_registry=WorkspaceToolRegistry(),
+        extension_runner=ExtensionRunner(
+            [
+                LoadedExtension(
+                    name="explicit-authoring",
+                    source_path=tmp_path / "extension.py",
+                    source="inline",
+                    hooks={"session_start": [_session_start]},
+                )
+            ]
+        ),
+        base_prompt="Base prompt.",
+    )
+
+    asyncio.run(session.reload_extension_runtime())
+
+    assert [definition.name for definition in session.get_all_tools()] == [
+        "runtime_ping",
+        "runtime_save",
+    ]
+    assert session.get_active_tool_names() == ["runtime_ping", "runtime_save"]
+    assert [tool.name for tool in session.agent.tools] == [
+        "runtime_ping",
+        "runtime_save",
+    ]
+    assert "runtime_ping" in session.agent.system_prompt
+    assert "runtime_save" in session.agent.system_prompt
+
+
+def test_live_extension_authorized_tool_runs_through_session_gateway(
+    tmp_path,
+) -> None:
+    import json
+    from pathlib import Path
+
+    from loushang.agent import Agent
+    from loushang.coding import SessionManager
+    from loushang.coding.session import AgentSession
+    from loushang.harness.approval import (
+        HeadlessApprovalResolver,
+        InteractiveApprovalResolver,
+    )
+    from loushang.harness.extensions.agent import ExtensionRunner, LoadedExtension
+    from loushang.harness.policy import PolicyDecision
+    from loushang.harness.tools import (
+        FilesystemActionAdapter,
+        authorized_tool,
+        tool,
+    )
+    from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
+
+    class AskForRuntimeWrite:
+        def evaluate(self, _subject: object) -> PolicyDecision:
+            return PolicyDecision.ask(
+                "Confirm the runtime extension write",
+                code="runtime_extension_write",
+            )
+
+    handler_calls = 0
+
+    @tool(prompt_snippet="- extension_save: Save one approved extension note")
+    async def extension_save(
+        path: str,
+        content: str,
+        context: ToolContext,
+    ) -> str:
+        nonlocal handler_calls
+        handler_calls += 1
+        target = Path(context.cwd or ".") / path
+        target.write_text(content, encoding="utf-8")
+        return str(target.resolve())
+
+    def _session_start(event, ctx) -> None:
+        del event
+        ctx.register_tool(
+            authorized_tool(
+                extension_save,
+                action=FilesystemActionAdapter(
+                    "write",
+                    authorization_fields=("content",),
+                ),
+            )
+        )
+
+    resolver = InteractiveApprovalResolver(
+        fallback=HeadlessApprovalResolver(mode="deny")
+    )
+    presented = asyncio.Event()
+    approval_payloads: list[dict[str, object]] = []
+
+    def present(payload: dict[str, object]) -> None:
+        approval_payloads.append(dict(payload))
+        presented.set()
+
+    session = AgentSession(
+        agent=Agent(initial_state={"system_prompt": "Base prompt.", "tools": []}),
+        session_manager=asyncio.run(
+            SessionManager.new(
+                session_dir=tmp_path,
+                cwd=str(tmp_path),
+                persist=False,
+            )
+        ),
+        tool_registry=WorkspaceToolRegistry(),
+        extension_runner=ExtensionRunner(
+            [
+                LoadedExtension(
+                    name="authorized-runtime",
+                    source_path=tmp_path / "extension.py",
+                    source="inline",
+                    hooks={"session_start": [_session_start]},
+                )
+            ]
+        ),
+        approval_resolver=resolver,
+        tool_policy_evaluator=AskForRuntimeWrite(),
+        base_prompt="Base prompt.",
+    )
+    session.set_approval_presenter(present)
+    product_events: list[dict[str, object]] = []
+    session.subscribe(product_events.append)
+
+    async def scenario() -> object:
+        await session.reload_extension_runtime()
+        tool = next(
+            item for item in session.agent.tools if item.name == "extension_save"
+        )
+        pending = asyncio.create_task(
+            tool.execute(
+                "runtime-extension-call",
+                {
+                    "path": "runtime-note.txt",
+                    "content": "private-runtime-content",
+                },
+            )
+        )
+        await presented.wait()
+        assert handler_calls == 0
+        assert not (tmp_path / "runtime-note.txt").exists()
+        action_id = approval_payloads[0]["action_id"]
+        assert isinstance(action_id, str)
+        assert await session.handle_screen_approval(
+            {
+                "action_id": action_id,
+                "outcome": "allow_once",
+            }
+        )
+        return await pending
+
+    result = asyncio.run(scenario())
+    audit_events = [
+        event
+        for event in product_events
+        if str(event.get("type", "")).startswith("tool_")
+    ]
+
+    assert result.details == str((tmp_path / "runtime-note.txt").resolve())
+    assert handler_calls == 1
+    assert (tmp_path / "runtime-note.txt").read_text(encoding="utf-8") == (
+        "private-runtime-content"
+    )
+    assert [event["type"] for event in audit_events] == [
+        "tool_action_frozen",
+        "tool_policy_evaluated",
+        "tool_approval_requested",
+        "tool_approval_resolved",
+        "tool_execution_started",
+        "tool_execution_completed",
+    ]
+    assert {event["tool_call_id"] for event in audit_events} == {
+        "runtime-extension-call"
+    }
+    assert len({event["action_fingerprint"] for event in audit_events}) == 1
+    assert audit_events[1]["policy_code"] == "runtime_extension_write"
+    action_id = audit_events[2]["action_id"]
+    assert audit_events[3]["action_id"] == action_id
+    assert audit_events[4]["approval_action_id"] == action_id
+    assert audit_events[5]["approval_action_id"] == action_id
+    serialized = json.dumps(audit_events)
+    assert "private-runtime-content" not in serialized
+    assert str(tmp_path / "runtime-note.txt") not in serialized
+
+
 def test_agent_session_extension_api_register_tool_after_runtime_bind_updates_session_tools(
     tmp_path,
 ) -> None:
@@ -539,9 +989,6 @@ def test_agent_session_extension_api_register_tool_after_runtime_bind_updates_se
     from loushang.coding.session import AgentSession
     from loushang.harness.extensions.agent import ExtensionAPI, ExtensionRunner
     from loushang.harness.tools.workspace import ToolDefinition
-    from loushang.harness.tools.workspace.registry import (
-        WorkspaceToolRegistry as ToolRegistry,
-    )
 
     async def execute_dynamic(
         tool_call_id: str, params: dict[str, object], signal=None, on_update=None
@@ -566,7 +1013,7 @@ def test_agent_session_extension_api_register_tool_after_runtime_bind_updates_se
                     "required": [],
                     "additionalProperties": False,
                 },
-                execute=execute_dynamic,
+                execution=direct_execution(execute_dynamic),
                 prompt_snippet="- api_dynamic_tool: Run api dynamic behavior",
             )
         )
@@ -577,7 +1024,6 @@ def test_agent_session_extension_api_register_tool_after_runtime_bind_updates_se
         session_manager=asyncio.run(
             SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
         ),
-        tool_registry=ToolRegistry(),
         extension_runner=ExtensionRunner([api.build_loaded_extension()]),
         base_prompt="Base prompt.",
     )
@@ -589,6 +1035,27 @@ def test_agent_session_extension_api_register_tool_after_runtime_bind_updates_se
     ]
     assert session.get_active_tool_names() == ["api_dynamic_tool"]
     assert "- api_dynamic_tool: Run api dynamic behavior" in session.agent.system_prompt
+    assert session._extension_tool_registration_leases == []
+    assert session._tool_registry is session._composition.tool_controller.tool_registry
+    runner = session._extension_runner
+    assert isinstance(runner, ExtensionRunner)
+    inventory = runner.registration_inventory
+    assert len(inventory) == 1
+    owner, identity, state = inventory[0]
+    assert owner.owner_kind == "extension"
+    assert owner.owner_id == "demo"
+    assert owner.runtime_id
+    assert owner.generation == 1
+    assert identity.public_key == "api_dynamic_tool"
+    assert state == "active"
+
+    asyncio.run(session.dispose())
+    assert session.get_all_tools() == []
+    assert session.get_active_tool_names() == []
+    assert [tool.name for tool in session.agent.tools] == []
+    assert "- api_dynamic_tool: Run api dynamic behavior" not in (
+        session.agent.system_prompt
+    )
 
 
 def test_agent_session_dynamic_extension_tools_respect_allowed_tool_names(
@@ -625,7 +1092,7 @@ def test_agent_session_dynamic_extension_tools_respect_allowed_tool_names(
                     "required": [],
                     "additionalProperties": False,
                 },
-                execute=execute_dynamic,
+                execution=direct_execution(execute_dynamic),
                 prompt_snippet="- dynamic_tool: Run dynamic test behavior",
             )
         )
@@ -719,7 +1186,7 @@ def test_agent_session_get_all_tools_projects_sdk_source_info(tmp_path) -> None:
                 "required": [],
                 "additionalProperties": False,
             },
-            execute=execute_custom_tool,
+            execution=direct_execution(execute_custom_tool),
         )
     )
     model = Model(
@@ -829,11 +1296,11 @@ def test_agent_session_tracks_multiple_builtin_tool_names(tmp_path) -> None:
     assert session.get_active_tool_names() == ["bash", "read", "grep"]
     assert [tool.name for tool in session.agent.tools] == ["bash", "read", "grep"]
     assert (
-        "read: Read text files and images from the coding workspace."
+        "read: Read text files and images from the workspace."
         in session.agent.system_prompt
     )
     assert (
-        "grep: Search file contents for patterns in the coding workspace."
+        "grep: Search file contents for patterns in the workspace."
         in session.agent.system_prompt
     )
 
@@ -896,11 +1363,11 @@ def test_agent_session_tracks_mutation_builtin_tool_names(tmp_path) -> None:
     assert session.get_active_tool_names() == ["write", "edit"]
     assert [tool.name for tool in session.agent.tools] == ["write", "edit"]
     assert (
-        "write: Write a text file in the coding workspace."
+        "write: Write a text file in the workspace."
         in session.agent.system_prompt
     )
     assert (
-        "edit: Apply exact text replacements to a file in the coding workspace."
+        "edit: Apply exact text replacements to a file in the workspace."
         in session.agent.system_prompt
     )
 
@@ -923,9 +1390,11 @@ def test_session_active_tools_still_materialize_after_substrate_migration(
         return ctx.cwd or ""
 
     registry = ToolRegistry()
-    registry.register_tool(show_session_cwd)
+    registry.register_tool(direct_tool(show_session_cwd))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     manager = asyncio.run(
-        SessionManager.new(session_dir=tmp_path, cwd="/tmp/project", persist=False)
+        SessionManager.new(session_dir=tmp_path, cwd=str(workspace), persist=False)
     )
     model = Model(
         id="faux-model",
@@ -943,21 +1412,76 @@ def test_session_active_tools_still_materialize_after_substrate_migration(
     session = create_agent_session(
         session_manager=manager,
         model=model,
-        tools=registry.list_enabled_tools(),
+        tools=registry.list_enabled_definitions(),
     )
 
     result = asyncio.run(session.agent.tools[0].execute("call-1", {}))
 
     assert session.get_active_tool_names() == ["show_session_cwd"]
     assert [tool.name for tool in session.agent.tools] == ["show_session_cwd"]
-    assert result.content[0].text == "/tmp/project"
+    assert result.content[0].text == str(workspace)
+
+
+def test_bash_partial_output_preserves_truncation_across_chunk_boundaries() -> None:
+    import random
+
+    from loushang.harness.tools.workspace.bash import _BashPartialOutput
+    from loushang.harness.tools.workspace.truncate import truncate_tail
+    from loushang.harness.workspace.exec import ExecOutputChunk
+
+    chunks = [
+        "prefix\r",
+        "\n" + "x" * 110_000,
+        "\n" + "word\n" * 2_200,
+        "\u2028suffix",
+    ]
+    chunks.extend(
+        random.Random(798).choices(
+            ("x" * 900, "a\nb\n", "\r\n", "é" * 200, "🙂" * 120, "u\n" * 40),
+            k=256,
+        )
+    )
+    partial = _BashPartialOutput()
+    complete = ""
+    for chunk in chunks:
+        complete += chunk
+        update = partial.append(ExecOutputChunk(stream="stdout", text=chunk))
+        expected = truncate_tail(complete)
+        assert update.content[0].text == expected.content
+        assert update.details["truncation"] == (
+            {
+                "content": expected.content,
+                "truncated": expected.truncated,
+                "truncatedBy": expected.truncated_by,
+                "totalLines": expected.total_lines,
+                "totalBytes": expected.total_bytes,
+                "outputLines": expected.output_lines,
+                "outputBytes": expected.output_bytes,
+                "lastLinePartial": expected.last_line_partial,
+                "firstLineExceedsLimit": expected.first_line_exceeds_limit,
+                "maxLines": expected.max_lines,
+                "maxBytes": expected.max_bytes,
+            }
+            if expected.truncated
+            else None
+        )
+
+    for _ in range(2_000):
+        chunk = "x" * 1_023 + "\n"
+        complete += chunk
+        update = partial.append(ExecOutputChunk(stream="stdout", text=chunk))
+        assert len(partial.preview.encode("utf-8")) <= 100 * 1024
+    expected = truncate_tail(complete)
+    assert update.content[0].text == expected.content
+    assert update.details["truncation"]["totalBytes"] == expected.total_bytes
+    assert update.details["truncation"]["totalLines"] == expected.total_lines
 
 
 def test_bash_tool_forwards_exec_updates_and_preview_metadata(tmp_path) -> None:
     import asyncio
 
-    from loushang.harness.policy_engine import PolicyEngine
     from loushang.harness.tools.workspace import create_bash_tool_definition
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
     from loushang.harness.workspace.exec import ExecOutputChunk, ExecRequest, ExecResult
 
     seen_updates: list[AgentToolResult[dict[str, object]]] = []
@@ -984,12 +1508,13 @@ def test_bash_tool_forwards_exec_updates_and_preview_metadata(tmp_path) -> None:
             )
 
     async def scenario() -> None:
-        definition = create_bash_tool_definition(
-            policy_engine=PolicyEngine(),
-            exec_service=FakeExecService(),
+        runtime_tool = wrap_tool_definition(
+            create_bash_tool_definition(
+                exec_service=FakeExecService(),
+            )
         )
 
-        result = await definition.execute(
+        result = await runtime_tool.execute(
             "tool-call-1",
             {"command": ["/bin/sh", "-c", "echo hi"]},
             None,
@@ -1016,11 +1541,48 @@ def test_bash_tool_forwards_exec_updates_and_preview_metadata(tmp_path) -> None:
     ]
 
 
+def test_bash_large_output_coalesces_intermediate_events_without_losing_result() -> None:
+    import asyncio
+
+    from loushang.harness.tools.workspace import create_bash_tool_definition
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
+    from loushang.harness.workspace.exec import ExecOutputChunk, ExecRequest, ExecResult
+
+    chunks = ["x" * 4_095 + "\n" for _ in range(100)]
+    output = "".join(chunks)
+    updates: list[AgentToolResult[dict[str, object]]] = []
+
+    class FakeExecService:
+        async def execute(self, request: ExecRequest, signal=None, on_update=None) -> ExecResult:
+            del request, signal
+            for chunk in chunks:
+                await on_update(ExecOutputChunk(stream="stdout", text=chunk))
+            return ExecResult(exit_code=0, stdout=output)
+
+    async def scenario() -> AgentToolResult[dict[str, object]]:
+        tool = wrap_tool_definition(
+            create_bash_tool_definition(exec_service=FakeExecService())
+        )
+        return await tool.execute(
+            "tool-call-1",
+            {"command": ["/bin/sh", "-c", "echo hi"]},
+            None,
+            updates.append,
+        )
+
+    result = asyncio.run(scenario())
+
+    assert len(updates) < len(chunks) // 2
+    assert updates[0].content == []
+    assert result.details["stdout_total_bytes"] == len(output)
+    assert result.details["stdout_total_lines"] == len(chunks)
+
+
 def test_bash_tool_details_include_pi_style_truncation_schema(tmp_path) -> None:
     import asyncio
 
-    from loushang.harness.policy_engine import PolicyEngine
     from loushang.harness.tools.workspace import create_bash_tool_definition
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
     from loushang.harness.workspace.exec import ExecRequest, ExecResult
 
     stdout_artifact_path = str(tmp_path / "stdout.log")
@@ -1040,10 +1602,12 @@ def test_bash_tool_details_include_pi_style_truncation_schema(tmp_path) -> None:
             )
 
     async def scenario() -> None:
-        result = await create_bash_tool_definition(
-            policy_engine=PolicyEngine(),
-            exec_service=FakeExecService(),
-        ).execute("tool-call-1", {"command": ["/bin/sh", "-c", "echo hi"]})
+        runtime_tool = wrap_tool_definition(
+            create_bash_tool_definition(exec_service=FakeExecService())
+        )
+        result = await runtime_tool.execute(
+            "tool-call-1", {"command": ["/bin/sh", "-c", "echo hi"]}
+        )
 
         assert result.details["stdout_artifact_path"] == stdout_artifact_path
         assert result.details["full_output_path"] == stdout_artifact_path
@@ -1062,8 +1626,8 @@ def test_bash_tool_full_output_path_uses_stderr_artifact_when_stdout_is_present(
 ) -> None:
     import asyncio
 
-    from loushang.harness.policy_engine import PolicyEngine
     from loushang.harness.tools.workspace import create_bash_tool_definition
+    from loushang.harness.tools.workspace.wrapper import wrap_tool_definition
     from loushang.harness.workspace.exec import ExecRequest, ExecResult
 
     stderr_artifact_path = str(tmp_path / "stderr.log")
@@ -1084,10 +1648,12 @@ def test_bash_tool_full_output_path_uses_stderr_artifact_when_stdout_is_present(
             )
 
     async def scenario() -> None:
-        result = await create_bash_tool_definition(
-            policy_engine=PolicyEngine(),
-            exec_service=FakeExecService(),
-        ).execute("tool-call-1", {"command": ["/bin/sh", "-c", "echo hi"]})
+        runtime_tool = wrap_tool_definition(
+            create_bash_tool_definition(exec_service=FakeExecService())
+        )
+        result = await runtime_tool.execute(
+            "tool-call-1", {"command": ["/bin/sh", "-c", "echo hi"]}
+        )
 
         assert result.details["stdout_artifact_path"] is None
         assert result.details["stderr_artifact_path"] == stderr_artifact_path
@@ -1137,7 +1703,6 @@ def test_agent_session_execute_bash_records_command_execution(tmp_path) -> None:
     exec_service = RecordingExecService()
     register_builtin_tools(
         registry,
-        policy_engine=AllowingPolicyEngine(),
         exec_service=exec_service,
     )
     model = Model(
@@ -1165,6 +1730,7 @@ def test_agent_session_execute_bash_records_command_execution(tmp_path) -> None:
         session_manager=manager,
         tool_registry=registry,
         active_tool_names=["bash"],
+        tool_policy_evaluator=AllowingPolicyEngine(),
     )
 
     async def scenario() -> None:
@@ -1186,6 +1752,83 @@ def test_agent_session_execute_bash_records_command_execution(tmp_path) -> None:
     assert isinstance(record.payload, CommandExecutionRecord)
     assert record.payload.output == "hi\n"
     assert session.agent.state.messages[-1].role == "user"
+
+
+def test_agent_session_execute_bash_compatibility_uses_windows_shell_tool(
+    tmp_path,
+) -> None:
+    import asyncio
+    import base64
+
+    from loushang.agent import Agent
+    from loushang.coding import SessionManager
+    from loushang.coding.session import AgentSession
+    from loushang.harness.environment import HostEnvironment
+    from loushang.harness.policy import PolicyDecision
+    from loushang.harness.tools.workspace import create_shell_tool_definition
+    from loushang.harness.tools.workspace.registry import WorkspaceToolRegistry
+    from loushang.harness.workspace.exec import ExecResult
+    from loushang.harness.workspace.shell import ResolvedShell
+
+    class AllowingPolicy:
+        def evaluate(self, subject):
+            del subject
+            return PolicyDecision.allow()
+
+    class Resolver:
+        def resolve(self, selection=None):
+            del selection
+            return ResolvedShell(
+                kind="powershell",
+                executable=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                flavor="windows-powershell",
+                target_id="windows-local",
+                target_os_family="windows",
+                source="system",
+                version="5.1",
+                edition="Desktop",
+            )
+
+    class Operations:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def execute(self, request, *, signal=None, on_update=None):
+            del signal, on_update
+            self.requests.append(request)
+            return ExecResult(exit_code=0, stdout="windows\n")
+
+    operations = Operations()
+    registry = WorkspaceToolRegistry()
+    registry.register_tool(
+        create_shell_tool_definition(
+            operations=operations,
+            environment=HostEnvironment(
+                os_family="windows",
+                platform_name="win32",
+                architecture="amd64",
+            ),
+            resolver_factory=lambda environment, environ, cwd: Resolver(),
+        )
+    )
+    manager = asyncio.run(
+        SessionManager.new(session_dir=tmp_path, cwd=r"C:\workspace", persist=False)
+    )
+    session = AgentSession(
+        agent=Agent(),
+        session_manager=manager,
+        tool_registry=registry,
+        active_tool_names=["shell"],
+        tool_policy_evaluator=AllowingPolicy(),
+    )
+
+    result = asyncio.run(session.execute_bash("Get-Location"))
+
+    assert result["output"] == "windows\n"
+    request = operations.requests[0]
+    assert request.command[0].endswith("powershell.exe")
+    decoded = base64.b64decode(request.command[-1]).decode("utf-16le")
+    assert "Get-Location" in decoded
 
 
 def test_agent_session_abort_bash_cancels_active_execution_and_records_command(
@@ -1235,7 +1878,6 @@ def test_agent_session_abort_bash_cancels_active_execution_and_records_command(
     exec_service = BlockingExecService()
     register_builtin_tools(
         registry,
-        policy_engine=AllowingPolicyEngine(),
         exec_service=exec_service,
     )
     model = Model(
@@ -1263,6 +1905,7 @@ def test_agent_session_abort_bash_cancels_active_execution_and_records_command(
         session_manager=manager,
         tool_registry=registry,
         active_tool_names=["bash"],
+        tool_policy_evaluator=AllowingPolicyEngine(),
     )
 
     async def scenario() -> None:

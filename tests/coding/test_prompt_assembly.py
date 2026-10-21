@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from datetime import date
 
+from loushang.harness.tools.execution import direct_execution
+
 
 def _runtime_footer(cwd: str) -> str:
     return f"Current date: {date.today().isoformat()}\nCurrent working directory: {cwd}"
@@ -30,6 +32,30 @@ def test_default_system_prompt_includes_exploration_progress_guidelines() -> Non
         in system_prompt
     )
     assert "多步骤任务阶段结束时说明结果、验证和下一步或阻塞。" in system_prompt
+
+
+def test_plc6_kernel_prompt_has_no_unmounted_standard_tool_claims() -> None:
+    from loushang.coding.prompt import (
+        CODING_KERNEL_SYSTEM_PROMPT,
+        CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT,
+        DEFAULT_CODING_SYSTEM_PROMPT,
+    )
+
+    for tool_claim in ("execute commands", "write new files", "bash"):
+        assert tool_claim not in CODING_KERNEL_SYSTEM_PROMPT
+        assert tool_claim not in CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT
+
+    assert "Tool definitions exposed for this Session" in (
+        CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT
+    )
+    assert "command or shell Tool" in CODING_STANDARD_SYSTEM_PROMPT_FRAGMENT
+
+    # The byte-stable compatibility string remains the explicit legacy-authority
+    # default; Catalog-owned standard Sessions select Kernel + coding.base.
+    assert DEFAULT_CODING_SYSTEM_PROMPT.startswith(
+        "You are an expert coding assistant operating inside loushang"
+    )
+    assert "You help users by reading files" in DEFAULT_CODING_SYSTEM_PROMPT
 
 
 def test_assemble_prompt_returns_prompt_assembly() -> None:
@@ -61,16 +87,16 @@ def test_assemble_prompt_returns_prompt_assembly() -> None:
         "- bash: Execute shell commands. Prefer a single command string; use cwd for the working directory.\n"
         "- Use bash for shell pipelines, redirects, and commands that are easier to express through the user's shell.\n"
         "- Prefer read, grep, find, ls, write, and edit for file operations when those tools are more precise.\n"
-        "- read: Read text files and images from the coding workspace.\n"
-        "- ls: List directory entries in the coding workspace.\n"
-        "- find: Find file paths by glob pattern in the coding workspace.\n"
+        "- read: Read text files and images from the workspace.\n"
+        "- ls: List directory entries in the workspace.\n"
+        "- find: Find file paths by glob pattern in the workspace.\n"
         "- Use find to locate files by path pattern instead of shelling out to find/fd.\n"
         "- Patterns with glob metacharacters are matched as globs; plain patterns match path substrings.\n"
-        "- grep: Search file contents for patterns in the coding workspace.\n"
+        "- grep: Search file contents for patterns in the workspace.\n"
         "- Use grep to search file contents instead of shelling out to grep or rg.\n"
         "- Use literal=true for exact text searches and glob to narrow file types.\n"
-        "- write: Write a text file in the coding workspace.\n"
-        "- edit: Apply exact text replacements to a file in the coding workspace."
+        "- write: Write a text file in the workspace.\n"
+        "- edit: Apply exact text replacements to a file in the workspace."
     )
     assert (
         assembly.system_prompt
@@ -244,7 +270,7 @@ def test_assemble_prompt_uses_tool_prompt_snippets_and_hides_tools_without_snipp
                 label="Visible Tool",
                 description="visible description should not be used",
                 parameters={"type": "object"},
-                execute=execute,
+                execution=direct_execution(execute),
                 prompt_snippet="Run visible behavior",
                 prompt_guidelines=("Use visible_tool when asked.",),
             ),
@@ -253,7 +279,7 @@ def test_assemble_prompt_uses_tool_prompt_snippets_and_hides_tools_without_snipp
                 label="Formatted Tool",
                 description="formatted description should not be used",
                 parameters={"type": "object"},
-                execute=execute,
+                execution=direct_execution(execute),
                 prompt_snippet="- formatted_tool: Keep formatted snippet",
             ),
             ToolDefinition(
@@ -261,7 +287,7 @@ def test_assemble_prompt_uses_tool_prompt_snippets_and_hides_tools_without_snipp
                 label="Hidden Tool",
                 description="hidden description should not appear",
                 parameters={"type": "object"},
-                execute=execute,
+                execution=direct_execution(execute),
             ),
         ],
     )
@@ -296,7 +322,7 @@ def test_tuple_backed_inputs_snapshot_mutable_constructors() -> None:
         label="Tool",
         description="Tool description",
         parameters={"type": "object"},
-        execute=execute,
+        execution=direct_execution(execute),
         prompt_guidelines=prompt_guidelines,
     )
     prompt_assembly = PromptAssembly(
@@ -339,7 +365,7 @@ def test_tuple_backed_constructors_reject_bare_strings() -> None:
             label="Tool",
             description="Tool description",
             parameters={"type": "object"},
-            execute=execute,
+            execution=direct_execution(execute),
             prompt_guidelines="keep edits narrow",
         )
     except TypeError as exc:
@@ -387,7 +413,7 @@ def test_tool_definition_prompt_guidelines_reject_non_strings() -> None:
                 label="Tool",
                 description="Tool description",
                 parameters={"type": "object"},
-                execute=execute,
+                execution=direct_execution(execute),
                 prompt_guidelines=bad_prompt_guidelines,
             )
         except TypeError as exc:
@@ -442,7 +468,9 @@ def test_preflight_user_input_expands_prompt_templates_and_skill_references() ->
         "/plan focus on retries", resource_bundle=resource_bundle
     )
     skill_result = preflight_user_input(
-        "/skill:debugging inspect the failing branch", resource_bundle=resource_bundle
+        "/skill:debugging inspect the failing branch",
+        resource_bundle=resource_bundle,
+        allow_legacy_skill_body=True,
     )
 
     assert (
@@ -478,15 +506,6 @@ def test_prompt_template_args_parse_quotes_and_substitute_pi_placeholders() -> N
         "Pair: first feature second\n"
         "All: component first feature second third\n"
         "Again: component first feature second third"
-    )
-
-
-def test_prompt_template_args_do_not_recursively_substitute_argument_values() -> None:
-    from loushang.harness.capabilities.prompt import substitute_prompt_template_args
-
-    assert (
-        substitute_prompt_template_args("$ARGUMENTS", ["$1", "$ARGUMENTS", "${@:2}"])
-        == "$1 $ARGUMENTS ${@:2}"
     )
 
 
@@ -583,10 +602,14 @@ def test_preflight_user_input_rejects_disabled_skills_but_allows_explicit_only_s
     )
 
     disabled_result = preflight_user_input(
-        "/skill:debugging inspect", resource_bundle=resource_bundle
+        "/skill:debugging inspect",
+        resource_bundle=resource_bundle,
+        allow_legacy_skill_body=True,
     )
     explicit_result = preflight_user_input(
-        "/skill:deploy ship", resource_bundle=resource_bundle
+        "/skill:deploy ship",
+        resource_bundle=resource_bundle,
+        allow_legacy_skill_body=True,
     )
     assembly = assemble_prompt(base_prompt="Base", resource_bundle=resource_bundle)
 

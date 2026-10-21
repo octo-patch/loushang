@@ -6,6 +6,7 @@ from loushang.harness.session.model_resolution import (
     resolve_default_model,
     resolve_session_model,
     scoped_models_from_patterns,
+    split_model_thinking_pattern,
 )
 
 
@@ -18,7 +19,9 @@ def _model() -> Model:
 
 
 def test_resolve_default_model_reports_failure_through_product_callback() -> None:
-    selection = ModelSelection(provider="provider", model_id="missing")
+    selection = ModelSelection(
+        endpoint_id="test-endpoint", provider="provider", model_id="missing"
+    )
     failures: list[tuple[ModelSelection, str]] = []
 
     result = resolve_default_model(
@@ -37,7 +40,9 @@ def test_resolve_default_model_reports_failure_through_product_callback() -> Non
 def test_resolve_default_model_keeps_successful_model() -> None:
     model = _model()
     result = resolve_default_model(
-        ModelSelection(provider="provider", model_id="chat"),
+        ModelSelection(
+            endpoint_id="test-endpoint", provider="provider", model_id="chat"
+        ),
         build_model=lambda _: model,
     )
 
@@ -48,22 +53,30 @@ def test_resolve_default_model_keeps_successful_model() -> None:
 def test_resolve_session_model_keeps_explicit_model() -> None:
     model = _model()
 
-    assert resolve_session_model(
-        model,
-        default_selection=None,
-        build_model=lambda _selection: (_ for _ in ()).throw(AssertionError()),
-    ) is model
+    assert (
+        resolve_session_model(
+            model,
+            default_selection=None,
+            build_model=lambda _selection: (_ for _ in ()).throw(AssertionError()),
+        )
+        is model
+    )
 
 
 def test_resolve_session_model_builds_explicit_selection() -> None:
     model = _model()
-    selection = ModelSelection(provider="provider", model_id="chat")
+    selection = ModelSelection(
+        endpoint_id="test-endpoint", provider="provider", model_id="chat"
+    )
 
-    assert resolve_session_model(
-        selection,
-        default_selection=None,
-        build_model=lambda selected: model if selected == selection else None,
-    ) is model
+    assert (
+        resolve_session_model(
+            selection,
+            default_selection=None,
+            build_model=lambda selected: model if selected == selection else None,
+        )
+        is model
+    )
 
 
 def test_classify_explicit_endpoint_failure_is_stable() -> None:
@@ -101,3 +114,15 @@ def test_scoped_models_from_patterns_is_product_neutral() -> None:
             "thinkingLevel": "high",
         }
     ]
+
+
+def test_thinking_pattern_parsing_is_owned_by_model_resolution() -> None:
+    from loushang.harness.session.bootstrap_utils import (
+        split_model_thinking_pattern as compatibility_split,
+    )
+
+    assert split_model_thinking_pattern("provider/chat:high") == (
+        "provider/chat",
+        "high",
+    )
+    assert compatibility_split is split_model_thinking_pattern

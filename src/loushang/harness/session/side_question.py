@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from typing import Protocol, cast
 
 from loushang.agent import Agent, BeforeToolCallResult
 from loushang.ai.types import AssistantMessage
@@ -11,7 +12,7 @@ from loushang.harness.runtime.side_question import (
     SideQuestionAnswer,
     SideQuestionUpdate,
 )
-from loushang.harness.transcript import assistant_message_text
+from loushang.harness.transcript import AgentTranscriptContext, assistant_message_text
 
 SIDE_QUESTION_BOUNDARY_PROMPT = """\
 You are answering a one-shot side question that is separate from the main task.
@@ -57,6 +58,7 @@ class AgentSideQuestionProvider:
             transform_context=parent.transform_context,
             stream_fn=parent.stream_fn,
             call_options=parent.call_options,
+            prepare_model_call=parent.prepare_model_call,
             before_tool_call=_block_side_question_tool_call,
             steering_mode=parent.steering_mode,
             follow_up_mode=parent.follow_up_mode,
@@ -71,7 +73,8 @@ class AgentSideQuestionProvider:
         )
         try:
             await child.prompt(
-                _side_question_prompt(self._boundary_prompt, question)
+                _side_question_prompt(self._boundary_prompt, question),
+                model_call_purpose="side_question",
             )
             message = _last_assistant_message(child)
             if message.stop_reason in {"aborted", "error"}:
@@ -108,11 +111,17 @@ def _require_agent(session: object) -> Agent:
     return agent
 
 
-def _require_session_manager(session: object) -> object:
+class _SessionContextProvider(Protocol):
+    def build_session_context(self) -> AgentTranscriptContext: ...
+
+    def get_leaf_id(self) -> str | None: ...
+
+
+def _require_session_manager(session: object) -> _SessionContextProvider:
     manager = getattr(session, "session_manager", None)
     if manager is None or not callable(getattr(manager, "build_session_context", None)):
         raise TypeError("Side questions require a session context provider.")
-    return manager
+    return cast(_SessionContextProvider, manager)
 
 
 def _context_revision(manager: object) -> str | None:

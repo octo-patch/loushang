@@ -445,7 +445,7 @@ def test_screen_coding_tui_summarizes_long_tool_output_with_head_and_tail() -> N
     assert "  └ line 1" in plain
     assert "    line 2" in plain
     assert "    line 3" in plain
-    assert "    ... (6 hidden lines)" in plain
+    assert "    … +6 lines (ctrl + t to view transcript)" in plain
     assert "    line 10" in plain
     assert "    line 11" in plain
     assert "    line 12" in plain
@@ -453,9 +453,316 @@ def test_screen_coding_tui_summarizes_long_tool_output_with_head_and_tail() -> N
     assert "    line 9" not in plain
 
     collapsed_line = next(
-        line for line in raw if "hidden lines" in strip_control_sequences(line)
+        line for line in raw if "view transcript" in strip_control_sequences(line)
     )
-    assert "\x1b[2;90m... (6 hidden lines)\x1b[22;39m" in collapsed_line
+    assert (
+        "\x1b[2;90m… +6 lines (ctrl + t to view transcript)\x1b[22;39m"
+        in collapsed_line
+    )
+
+
+def test_screen_coding_tui_previews_multiline_command_with_head_and_tail() -> None:
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 1.0,
+    )
+    command = "\n".join(f"command {index}" for index in range(1, 13))
+    app.state.records.append(
+        ToolExecutionRecord(
+            name="bash command 1",
+            tool_name="bash",
+            state="completed",
+            elapsed_seconds=0.6,
+            command="bash command 1",
+            expanded_command=command,
+            output="done",
+            expanded_output="done",
+        )
+    )
+
+    plain = tuple(
+        strip_control_sequences(line) for line in _raw_lines(app, width=120, height=30)
+    )
+
+    assert "• Ran bash took 0.60s" in plain
+    assert "  │ $ command 1" in plain
+    assert "  │ command 2" in plain
+    assert "  │ command 3" in plain
+    assert "  │ … +6 lines (ctrl + t to view transcript)" in plain
+    assert "  │ command 10" in plain
+    assert "  │ command 12" in plain
+    assert "  └ done" in plain
+    assert not any("command 4" in line for line in plain)
+
+
+def test_screen_coding_tui_cache_distinguishes_expanded_commands() -> None:
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 1.0,
+    )
+    app.state.records.extend(
+        (
+            ToolExecutionRecord(
+                name="bash same",
+                tool_name="bash",
+                state="completed",
+                elapsed_seconds=0.1,
+                command="bash same",
+                expanded_command="same\nalpha",
+            ),
+            ToolExecutionRecord(
+                name="bash same",
+                tool_name="bash",
+                state="completed",
+                elapsed_seconds=0.1,
+                command="bash same",
+                expanded_command="same\nbeta",
+            ),
+        )
+    )
+
+    plain = tuple(
+        strip_control_sequences(line) for line in _raw_lines(app, width=80, height=30)
+    )
+
+    assert "  │ alpha" in plain
+    assert "  │ beta" in plain
+
+
+def test_screen_coding_tui_previews_materialized_multiline_command() -> None:
+    from types import SimpleNamespace
+
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+    from loushang.harnesstui.conversation.history import (
+        project_command_execution_payload,
+    )
+
+    command = "\n".join(f"command {index}" for index in range(1, 13))
+    record = project_command_execution_payload(
+        SimpleNamespace(
+            command=command,
+            output="done",
+            cancelled=False,
+            exit_code=0,
+        )
+    )
+    assert record is not None
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 1.0,
+    )
+    app.state.records.append(record)
+
+    plain = tuple(
+        strip_control_sequences(line) for line in _raw_lines(app, width=120, height=30)
+    )
+
+    assert "  │ command 3" in plain
+    assert "  │ … +6 lines (ctrl + t to view transcript)" in plain
+    assert "  │ command 10" in plain
+    assert not any("command 4" in line for line in plain)
+
+
+@pytest.mark.parametrize("width", (40, 15, 12, 10, 8))
+def test_screen_coding_tui_caps_wrapped_tool_preview_by_screen_rows(
+    width: int,
+) -> None:
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 1.0,
+    )
+    app.state.records.append(
+        ToolExecutionRecord(
+            name="bash long-command",
+            tool_name="bash",
+            state="completed",
+            elapsed_seconds=0.1,
+            command="bash long-command",
+            expanded_command="x" * 240,
+        )
+    )
+
+    plain = tuple(
+        strip_control_sequences(line) for line in _raw_lines(app, width=width, height=30)
+    )
+    command_lines = tuple(line for line in plain if line.startswith("  │"))
+
+    assert len(command_lines) <= 7
+    command_payload = "".join(line[len("  │ ") :] for line in command_lines)
+    assert "ctrl+t" in command_payload.replace(" ", "")
+
+
+@pytest.mark.parametrize(
+    ("source", "width", "rows"),
+    (
+        ("", 8, 3),
+        ("abc\n\nxyz", 4, 3),
+        ("a" * 40 + "\n" + "b" * 17, 7, 5),
+        ("汉字🙂e\u0301\n\x1b[31mred\x1b[0m\tend", 8, 5),
+        ("one\r\ntwo\u2028three\n", 10, 4),
+    ),
+)
+def test_coding_tool_preview_keeps_wrapped_row_semantics(
+    source: str, width: int, rows: int
+) -> None:
+    from loushang.coding.ui.screen_app import _collapse_coding_tool_preview
+    from loushang.tui.cell_width import TAB_WIDTH, truncate_to_width, wrap_cells
+
+    def original(tail: bool) -> str:
+        wrapped = wrap_cells(source.replace("\t", " " * TAB_WIDTH), width=width)
+        if len(wrapped) <= rows:
+            return "\n".join(wrapped)
+        marker_rows = 1
+        while True:
+            visible_budget = max(0, rows - marker_rows)
+            head_budget = visible_budget if not tail else visible_budget // 2
+            tail_budget = 0 if not tail else visible_budget - head_budget
+            hidden = max(0, len(wrapped) - head_budget - tail_budget)
+            marker = f"… +{hidden} lines (ctrl + t to view transcript)"
+            updated = len(wrap_cells(marker, width=width))
+            if updated <= marker_rows:
+                break
+            marker_rows = updated
+        if marker_rows > rows:
+            compact = truncate_to_width(
+                f"ctrl+t · +{len(wrapped)}", max_width=width * rows, ellipsis="…"
+            )
+            return "\n".join(wrap_cells(compact, width=width))
+        if marker_rows == rows:
+            return "\n".join(wrap_cells(marker, width=width))
+        head = wrapped[:head_budget]
+        end = wrapped[-tail_budget:] if tail_budget else []
+        return "\n".join([*head, *wrap_cells(marker, width=width), *end])
+
+    for tail in (False, True):
+        assert _collapse_coding_tool_preview(
+            source, width=width, max_rows=rows, tail=tail
+        ) == original(tail)
+
+
+def test_coding_tool_preview_does_not_wrap_full_large_ascii_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import loushang.coding.ui.screen_app as screen_app
+
+    original_wrap = screen_app.wrap_cells
+
+    def bounded_wrap(value: str, *, width: int) -> list[str]:
+        assert len(value) < 1_000
+        return original_wrap(value, width=width)
+
+    monkeypatch.setattr(screen_app, "wrap_cells", bounded_wrap)
+    output = "a" * 2_000_000
+
+    preview = screen_app._collapse_coding_tool_preview(
+        output, width=80, max_rows=7, tail=True
+    )
+
+    assert "a" * 80 in preview
+    assert "+24994 lines" in preview
+    assert len(preview.splitlines()) <= 7
+
+
+def test_coding_tool_preview_counts_many_short_lines_without_per_line_wrapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import loushang.coding.ui.screen_app as screen_app
+
+    def unexpected_strip(_value: str) -> str:
+        raise AssertionError("short printable lines must use the bounded preview path")
+
+    monkeypatch.setattr(screen_app, "strip_control_sequences", unexpected_strip)
+    output = "ok\n" * 100_000
+    count, head, tail = screen_app._preview_wrapped_rows(
+        output, width=80, limit=7
+    )
+
+    assert count == 100_001
+    assert head == ["ok"] * 7
+    assert tail == ["ok"] * 6 + [""]
+
+
+def test_worked_frame_keeps_large_tool_result_out_of_full_wrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import loushang.coding.ui.screen_app as screen_app
+
+    original_wrap = screen_app.wrap_cells
+
+    def bounded_wrap(value: str, *, width: int) -> list[str]:
+        assert len(value) < 1_000
+        return original_wrap(value, width=width)
+
+    monkeypatch.setattr(screen_app, "wrap_cells", bounded_wrap)
+    app = screen_app.ScreenCodingTuiApp(
+        model_label="test", cwd="/repo", branch="main", session_label="session"
+    )
+    app.begin_run(started_at=1.0)
+    app.state.records.append(
+        ToolExecutionRecord(
+            name="bash",
+            tool_name="bash",
+            state="completed",
+            elapsed_seconds=1.0,
+            output="preview",
+            expanded_output="x" * 2_000_000,
+        )
+    )
+    app.state.mark_records_changed()
+    app.complete_run(elapsed_seconds=1.0)
+
+    rendered = "\n".join(_lines(app))
+
+    assert "Worked for" in rendered
+    assert "ctrl+t" in rendered.replace(" ", "")
+
+
+def test_screen_coding_tui_expands_tabs_before_preview_layout() -> None:
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 1.0,
+    )
+    app.state.records.append(
+        ToolExecutionRecord(
+            name="bash tabbed-command",
+            tool_name="bash",
+            state="completed",
+            elapsed_seconds=0.1,
+            command="bash tabbed-command",
+            expanded_command="segment\t" * 20,
+        )
+    )
+
+    plain = tuple(
+        strip_control_sequences(line) for line in _raw_lines(app, width=40, height=30)
+    )
+    command_lines = tuple(line for line in plain if line.startswith("  │"))
+
+    assert len(command_lines) <= 7
+    assert all("\t" not in line for line in command_lines)
 
 
 def test_screen_coding_tui_keeps_restyled_tool_output_within_screen_width() -> None:
@@ -797,6 +1104,82 @@ def test_screen_coding_tui_rerenders_current_streaming_table_block(monkeypatch) 
     _lines(app, width=80, height=100)
 
     assert rendered_tables == 3
+
+
+@pytest.mark.tui_render_contract
+def test_screen_coding_tui_repaints_table_when_late_row_widens_column() -> None:
+    from loushang.coding.ui.screen_app import ScreenCodingTuiApp
+    from loushang.tui import FakeTerminalPort, RenderLoop, TerminalSize, TuiRuntime
+
+    app = ScreenCodingTuiApp(
+        model_label="kimi",
+        cwd="/repo",
+        branch="main",
+        session_label="abcd1234",
+        now=lambda: 10.0,
+        active_transcript_line_budget=10_000,
+    )
+    app.start_prompt("stream table", started_at=9.0)
+    app.begin_assistant()
+
+    runtime = TuiRuntime(
+        render_loop=RenderLoop(app),
+        terminal=FakeTerminalPort(size=TerminalSize(columns=120, rows=40)),
+    )
+    short_table = "| 子包 | 文件数 | 行数 |\n| --- | --- | --- |\n" + "".join(
+        f"| package_{index:04d} | {index} | {index * 10:,} |\n"
+        for index in range(1, 1_000)
+    )
+    wide_package_name = "agent_transcript_" + ("x" * 63)
+    late_row = f"| {wide_package_name} | 1,000 | 100,000 |\n"
+
+    app.append_assistant_chunk(short_table)
+    runtime.render_now()
+    app.append_assistant_chunk(late_row)
+    step = runtime.render_now()
+
+    actual = tuple(
+        strip_control_sequences(line).rstrip()
+        for line in step.diagnostics.current_logical_lines
+    )
+    screen = (
+        tuple(
+            strip_control_sequences(line).rstrip()
+            for line in step.frame.screen_after.visible_lines
+        )
+        if step.frame is not None
+        else ()
+    )
+    expected = _fresh_flat_streaming_oracle_lines(
+        short_table + late_row,
+        records=(UserPromptRecord("stream table"),),
+        theme=app.transcript_theme,
+        width=120,
+        max_height=10_000,
+    )
+
+    def table_block(lines: tuple[str, ...]) -> tuple[str, ...]:
+        start = next(index for index, line in enumerate(lines) if "┌" in line)
+        end = start + next(
+            offset for offset, line in enumerate(lines[start:], start=1) if "└" in line
+        )
+        return lines[start:end]
+
+    expected_table = table_block(tuple(line.rstrip() for line in expected))
+    actual_table = table_block(actual)
+
+    assert actual_table == expected_table
+    assert len(actual_table) == 2_003
+    assert wide_package_name in actual_table[-2]
+    assert step.diagnostics.changed_line_range is not None
+    table_start = next(index for index, line in enumerate(actual) if "┌" in line)
+    assert step.diagnostics.changed_line_range[0] == table_start
+    viewport_top = step.diagnostics.viewport_top
+    expected_screen = tuple(actual[viewport_top : viewport_top + len(screen)])
+    assert screen == expected_screen
+    assert table_start == next(
+        index for index, line in enumerate(actual) if "┌" in line
+    )
 
 
 @pytest.mark.tui_render_contract

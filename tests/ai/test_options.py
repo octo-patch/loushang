@@ -10,7 +10,7 @@ import loushang.ai as ai
 import loushang.ai.options as options_module
 from loushang.ai import ApiKeyAuth, OAuthBearerAuth
 from loushang.ai import CallOptions as PublicCallOptions
-from loushang.ai.advanced.registry import ApiProviderRegistry
+from loushang.ai.advanced.registry import APIRegistry
 from loushang.ai.options import (
     CallOptions,
     ReasoningOptions,
@@ -62,9 +62,10 @@ def test_call_options_is_the_single_public_call_contract() -> None:
 
 
 def test_call_options_fields_are_canonical_and_consumed() -> None:
-    field_names = {field.name for field in fields(CallOptions)}
+    field_order = tuple(field.name for field in fields(CallOptions))
+    field_names = set(field_order)
 
-    assert field_names == {
+    assert field_order == (
         "cancellation",
         "auth",
         "credential",
@@ -82,6 +83,30 @@ def test_call_options_fields_are_canonical_and_consumed() -> None:
         "reasoning",
         "tool_choice",
         "output",
+        "request_limits",
+        "prepared_request_committer",
+    )
+
+    assert field_names == {
+        "cancellation",
+        "auth",
+        "credential",
+        "credential_file",
+        "headers",
+        "cache_retention",
+        "cache_key",
+        "max_output_tokens",
+        "temperature",
+        "timeout_seconds",
+        "idle_timeout_seconds",
+        "retry",
+        "trace",
+        "prepared_request_committer",
+        "pairing_mode",
+        "reasoning",
+        "tool_choice",
+        "output",
+        "request_limits",
     }
     assert {
         "signal",
@@ -111,6 +136,8 @@ def test_call_options_rejects_invalid_non_auth_fields() -> None:
         CallOptions(cache_key="   ")
     with pytest.raises(ValueError, match="control characters"):
         CallOptions(cache_key="cache\nkey")
+    with pytest.raises(TypeError, match="request_limits"):
+        CallOptions(request_limits=object())  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -275,7 +302,7 @@ def test_call_options_reject_non_canonical_reasoning() -> None:
 
 def test_provider_specific_options_are_removed_from_core() -> None:
     assert importlib.util.find_spec("loushang.ai.advanced.options") is None
-    assert ApiProviderRegistry.__module__ == "loushang.ai.api_registry"
+    assert APIRegistry.__module__ == "loushang.ai.api_registry"
 
     for module in (ai, options_module):
         for name in REMOVED_PROVIDER_OPTIONS:

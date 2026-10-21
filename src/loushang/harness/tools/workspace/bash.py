@@ -1,39 +1,51 @@
 import inspect
 import os
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
-from typing import Any, NotRequired, Protocol, TypedDict
+import time
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
+from typing import Any, NotRequired, Protocol, TypedDict, cast
 
 from loushang.agent.types import AgentToolResult, TextPart
-from loushang.harness.approval import ApprovalResolver
-from loushang.harness.authorization import EffectiveExecutionProfile
+from loushang.ai.types import ToolCall
+from loushang.harness.artifacts import SessionBlobRef
 from loushang.harness.diagnostics.service import DiagnosticsService
+from loushang.harness.effects import ProcessEffect
 from loushang.harness.policy import (
+    ToolPolicySubject,
     build_tool_policy_subject,
     executable_search_path_from_env,
     normalize_command_subject,
+)
+from loushang.harness.tools.execution import (
+    AuthorizedExecution,
+    AuthorizedToolAction,
+    AuthorizedToolContext,
+    PreparedToolAction,
+    ToolCallContext,
 )
 from loushang.harness.workspace.exec import (
     ExecOutputChunk,
     ExecRequest,
     ExecResult,
     ExecService,
+    ExecUpdateCallback,
     materialize_exec_request,
 )
 
-from .authorization import (
-    AuthorizedWorkspaceAction,
-    execute_workspace_tool_action,
-)
 from .builtin_renderers import render_bash_call, render_bash_result
-from .context import ToolContextProvider, context_approval_resolver
-from .policy import ToolPolicyEvaluator
 from .runtime import (
     emit_tool_update,
     pi_truncation_details,
     resolve_tool_argument_alias,
 )
-from .truncate import TruncationResult, truncate_tail, truncation_details
+from .truncate import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES,
+    TruncationKind,
+    TruncationResult,
+    truncate_tail,
+    truncation_details,
+)
 from .types import PiTruncationDetails, ToolDefinition
 
 
@@ -95,25 +107,29 @@ class BashToolDetails(TypedDict, total=False):
     truncation: PiTruncationDetails | None
     full_output_path: str | None
     stream: str
+    stdio_complete: bool
+    stdio_drain_reason: str | None
+    stdout_blob: dict[str, object]
+    stderr_blob: dict[str, object]
+    artifact_retention_error: str
+    artifact_cleanup_error: str
 
 
 class BashOperations(Protocol):
     """Execute a request using its materialized cwd and environment."""
 
-    async def execute(
+    def execute(
         self,
         request: ExecRequest,
         *,
         signal: object | None = None,
-        on_update: object | None = None,
-    ) -> ExecResult: ...
+        on_update: ExecUpdateCallback | None = None,
+    ) -> Awaitable[ExecResult] | ExecResult: ...
 
 
 @dataclass(frozen=True)
 class BashToolOptions:
     operations: BashOperations | None = None
-    policy_engine: ToolPolicyEvaluator | None = None
-    approval_resolver: ApprovalResolver | None = None
     exec_service: ExecService | None = None
     diagnostics_service: DiagnosticsService | None = None
     command_prefix: str | None = None
@@ -130,7 +146,7 @@ class ExecServiceBashOperations:
         request: ExecRequest,
         *,
         signal: object | None = None,
-        on_update: object | None = None,
+        on_update: ExecUpdateCallback | None = None,
     ) -> ExecResult:
         return await _execute_exec_service(
             self.exec_service,
@@ -225,116 +241,127 @@ def _build_exec_request(
 
 
 @dataclass(frozen=True)
-class _BashToolExecute:
-    bash_operations: BashOperations
-    policy_engine: ToolPolicyEvaluator | None
-    approval_resolver: ApprovalResolver | None
+class _BashActionAdapter:
     command_prefix: str | None
     shell_path: str | None
     spawn_hook: BashSpawnHook | None
-    context_provider: ToolContextProvider | None = None
 
-    def bind_context_provider(
-        self, context_provider: ToolContextProvider | None
-    ) -> "_BashToolExecute":
-        return replace(self, context_provider=context_provider)
+    def prepare(
+        self,
+        call: ToolCall,
+        context: ToolCallContext,
+    ) -> PreparedToolAction:
+        arguments = dict(getattr(call, "arguments"))
+        exec_request = materialize_exec_request(
+            _build_exec_request(
+                arguments,
+                default_cwd=context.cwd,
+                command_prefix=self.command_prefix,
+                shell_path=self.shell_path,
+                spawn_hook=self.spawn_hook,
+            )
+        )
+        effective_arguments, policy_subject = _bash_policy_facts(
+            exec_request,
+            arguments=arguments,
+            assume_shell=isinstance(arguments.get("command"), str),
+        )
+        effect = ProcessEffect(exec_request.command)
+        return PreparedToolAction(
+            tool_name="bash",
+            authorization_arguments=effective_arguments,
+            execution_arguments={"request": exec_request},
+            cwd=exec_request.cwd,
+            policy_subject=policy_subject,
+            effects=(effect,),
+            execution_environment=exec_request.effective_environment,
+        )
+
+
+@dataclass(frozen=True)
+class _BashAuthorizedHandler:
+    bash_operations: BashOperations
 
     async def __call__(
         self,
-        tool_call_id: str,
-        params: dict[str, Any],
-        signal: object | None = None,
-        on_update: object | None = None,
+        action: AuthorizedToolAction,
+        context: AuthorizedToolContext,
     ) -> AgentToolResult[dict[str, Any]]:
-        context = None
-        default_cwd = None
-        if self.context_provider is not None:
-            context = self.context_provider(tool_call_id=tool_call_id)
-            default_cwd = context.cwd
-
-        request_params = dict(params)
-        runtime_operations = request_params.pop("__operations", None)
-        runtime_operations = request_params.pop("_operations", runtime_operations)
-        selected_bash_operations = runtime_operations
-        if selected_bash_operations is None and context is not None:
-            context_exec_service = getattr(context, "exec_service", None)
-            if context_exec_service is not None:
-                selected_bash_operations = ExecServiceBashOperations(
-                    exec_service=context_exec_service
-                )
+        exec_request = action.execution_arguments.get("request")
+        if not isinstance(exec_request, ExecRequest):
+            raise TypeError("authorized Bash action requires an ExecRequest")
+        selected_bash_operations = context.operation_bindings.get("bash_operations")
+        if selected_bash_operations is None and isinstance(
+            context.exec_service, ExecService
+        ):
+            selected_bash_operations = ExecServiceBashOperations(context.exec_service)
         if selected_bash_operations is None:
             selected_bash_operations = self.bash_operations
-        exec_request = _build_exec_request(
-            request_params,
-            default_cwd=default_cwd,
-            command_prefix=self.command_prefix,
-            shell_path=self.shell_path,
-            spawn_hook=self.spawn_hook,
-        )
-        exec_request = materialize_exec_request(exec_request)
+        elif not callable(getattr(selected_bash_operations, "execute", None)):
+            raise TypeError("bash_operations binding must expose execute()")
+        selected_operations = cast(BashOperations, selected_bash_operations)
         partial_output = _BashPartialOutput()
+        last_preview_at: float | None = None
+        last_preview_bytes = 0
 
         async def _forward_exec_update(update: ExecOutputChunk) -> None:
+            nonlocal last_preview_at, last_preview_bytes
             partial_result = partial_output.append(update)
+            now = time.monotonic()
+            if (
+                partial_output.total_bytes > DEFAULT_MAX_BYTES
+                and last_preview_at is not None
+                and now - last_preview_at < 0.1
+                and partial_output.total_bytes - last_preview_bytes < 64 * 1024
+            ):
+                return
             await emit_tool_update(
-                on_update,
+                context.on_update,
                 partial_result,
             )
+            last_preview_at = now
+            last_preview_bytes = partial_output.total_bytes
 
-        async def on_authorized(_action: AuthorizedWorkspaceAction) -> None:
-            await emit_tool_update(
-                on_update,
-                AgentToolResult(content=[], details=None),
-            )
-
-        def execute(action: AuthorizedWorkspaceAction) -> Awaitable[ExecResult]:
-            authorized_request = exec_request
-            if action.execution_profile is not None:
-                authorized_request = replace(
-                    authorized_request,
-                    execution_profile=action.execution_profile,
-                )
-            return _execute_bash_operations(
-                selected_bash_operations,
-                authorized_request,
-                signal=signal,
-                on_update=_forward_exec_update,
-            )
-
-        result = await _execute_bash_action(
-            self.policy_engine,
-            tool_call_id=tool_call_id,
-            exec_request=exec_request,
-            arguments=request_params,
-            approval_resolver=context_approval_resolver(
-                context,
-                self.approval_resolver,
-            ),
-            executor=execute,
-            on_authorized=on_authorized,
-            audit_sink=getattr(context, "event_sink", None),
-            assume_shell=isinstance(request_params.get("command"), str),
-            execution_profile_ceiling=getattr(
-                getattr(context, "exec_service", None),
-                "execution_profile",
-                None,
-            ),
+        await emit_tool_update(
+            context.on_update,
+            AgentToolResult(content=[], details=None),
         )
+        authorized_request = (
+            replace(exec_request, execution_profile=action.execution_profile)
+            if action.execution_profile is not None
+            else exec_request
+        )
+        result = await _execute_bash_operations(
+            selected_operations,
+            authorized_request,
+            signal=context.signal,
+            on_update=_forward_exec_update,
+        )
+        tool_result = _exec_result_to_tool_result(result)
         if result.timed_out:
-            raise TimeoutError(
-                _exec_result_error_message(
-                    result, _timeout_error_message(exec_request.timeout_seconds)
-                )
+            raise _exec_result_exception(
+                TimeoutError(
+                    _exec_result_error_message(
+                        result, _timeout_error_message(exec_request.timeout_seconds)
+                    )
+                ),
+                tool_result,
             )
         if result.cancelled:
-            raise RuntimeError(_exec_result_error_message(result, "Command aborted"))
-        if result.exit_code != 0 and not result.cancelled:
-            raise RuntimeError(
-                _exec_result_error_message(
-                    result, f"Command exited with code {result.exit_code}"
-                )
+            raise _exec_result_exception(
+                RuntimeError(_exec_result_error_message(result, "Command aborted")),
+                tool_result,
             )
-        return _exec_result_to_tool_result(result)
+        if result.exit_code != 0 and not result.cancelled:
+            raise _exec_result_exception(
+                RuntimeError(
+                    _exec_result_error_message(
+                        result, f"Command exited with code {result.exit_code}"
+                    )
+                ),
+                tool_result,
+            )
+        return tool_result
 
 
 def _optional_number(value: object, *, field_name: str) -> float | int | None:
@@ -391,26 +418,12 @@ def _shell_command(
     return (shell, "-lc", command)
 
 
-async def _execute_bash_action(
-    policy_engine: ToolPolicyEvaluator | None,
-    *,
-    tool_call_id: str,
+def _bash_policy_facts(
     exec_request: ExecRequest,
+    *,
     arguments: dict[str, Any],
-    approval_resolver: ApprovalResolver | None,
-    executor: Callable[
-        [AuthorizedWorkspaceAction],
-        ExecResult | Awaitable[ExecResult],
-    ],
-    on_authorized: Callable[
-        [AuthorizedWorkspaceAction],
-        object | Awaitable[object],
-    ]
-    | None = None,
-    audit_sink: object | None = None,
     assume_shell: bool = False,
-    execution_profile_ceiling: EffectiveExecutionProfile | None = None,
-) -> ExecResult:
+) -> tuple[dict[str, Any], ToolPolicySubject]:
     execution_environment = exec_request.effective_environment
     assert execution_environment is not None
     command_subject = normalize_command_subject(
@@ -440,24 +453,13 @@ async def _execute_bash_action(
         effective_arguments["env"] = exec_request.env
     policy_subject = build_tool_policy_subject(
         tool_name="bash",
+        capability_id="workspace.command",
         arguments=effective_arguments,
         cwd=exec_request.cwd,
         command=command_subject,
+        effects=(ProcessEffect(exec_request.command),),
     )
-    return await execute_workspace_tool_action(
-        policy_engine,
-        tool_name="bash",
-        arguments=effective_arguments,
-        executor=executor,
-        on_authorized=on_authorized,
-        cwd=exec_request.cwd,
-        policy_subject=policy_subject,
-        approval_resolver=approval_resolver,
-        tool_call_id=tool_call_id,
-        audit_sink=audit_sink,
-        execution_environment=execution_environment,
-        execution_profile_ceiling=execution_profile_ceiling,
-    )
+    return effective_arguments, policy_subject
 
 
 def _bash_parameters() -> dict[str, Any]:
@@ -513,8 +515,6 @@ def _bash_provider_parameters() -> dict[str, Any]:
 
 def create_bash_tool_definition(
     *,
-    policy_engine: ToolPolicyEvaluator | None = None,
-    approval_resolver: ApprovalResolver | None = None,
     exec_service: ExecService | None = None,
     diagnostics_service: DiagnosticsService | None = None,
     operations: BashOperations | None = None,
@@ -523,12 +523,6 @@ def create_bash_tool_definition(
     spawn_hook: BashSpawnHook | None = None,
     options: BashToolOptions | None = None,
 ) -> ToolDefinition:
-    resolved_policy_engine = policy_engine or (
-        options.policy_engine if options is not None else None
-    )
-    resolved_approval_resolver = approval_resolver or (
-        options.approval_resolver if options is not None else None
-    )
     resolved_exec_service = (
         exec_service
         or (options.exec_service if options is not None else None)
@@ -553,22 +547,20 @@ def create_bash_tool_definition(
     bash_operations = resolved_operations or ExecServiceBashOperations(
         exec_service=resolved_exec_service
     )
-    execute = _BashToolExecute(
-        bash_operations=bash_operations,
-        policy_engine=resolved_policy_engine,
-        approval_resolver=resolved_approval_resolver,
-        command_prefix=resolved_command_prefix,
-        shell_path=resolved_shell_path,
-        spawn_hook=resolved_spawn_hook,
-    )
-
     return ToolDefinition(
         name="bash",
         label="Bash",
         description="Execute a shell command through the workspace exec service.",
         parameters=_bash_parameters(),
         provider_parameters=_bash_provider_parameters(),
-        execute=execute,
+        execution=AuthorizedExecution(
+            action_adapter=_BashActionAdapter(
+                command_prefix=resolved_command_prefix,
+                shell_path=resolved_shell_path,
+                spawn_hook=resolved_spawn_hook,
+            ),
+            handler=_BashAuthorizedHandler(bash_operations=bash_operations),
+        ),
         prompt_snippet="- bash: Execute shell commands. Prefer a single command string; use cwd for the working directory.",
         prompt_guidelines=(
             "Use bash for shell pipelines, redirects, and commands that are easier to express through the user's shell.",
@@ -576,16 +568,43 @@ def create_bash_tool_definition(
         ),
         render_call=render_bash_call,
         render_result=render_bash_result,
+        operation_binding_key="bash_operations",
     )
 
 
 @dataclass
 class _BashPartialOutput:
-    chunks: list[str] = field(default_factory=list)
+    preview: str = ""
+    total_bytes: int = 0
+    total_lines: int = 0
+    last_character: str = ""
 
     def append(self, update: ExecOutputChunk) -> AgentToolResult[dict[str, Any]]:
-        self.chunks.append(update.text)
-        truncation = truncate_tail("".join(self.chunks))
+        text = update.text
+        if text:
+            lines = len(text.splitlines())
+            if self.last_character and (
+                self.last_character not in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029"
+                or (self.last_character == "\r" and text.startswith("\n"))
+            ):
+                lines -= 1
+            self.total_lines += lines
+            self.total_bytes += len(text.encode("utf-8", errors="surrogateescape"))
+            self.last_character = text[-1]
+        combined = self.preview + text
+        truncation = truncate_tail(combined)
+        truncation = replace(
+            truncation,
+            total_lines=self.total_lines,
+            total_bytes=self.total_bytes,
+        )
+        # Keep one extra window so the next update can still choose the exact
+        # line/byte boundary without rescanning the complete command output.
+        self.preview = truncate_tail(
+            combined,
+            max_lines=2 * DEFAULT_MAX_LINES + 1,
+            max_bytes=2 * DEFAULT_MAX_BYTES,
+        ).content
         return AgentToolResult(
             content=[TextPart(type="text", text=truncation.content)],
             details={
@@ -603,24 +622,33 @@ async def _execute_exec_service(
     exec_request: ExecRequest,
     *,
     signal: object | None,
-    on_update: object | None,
+    on_update: ExecUpdateCallback | None,
 ) -> ExecResult:
-    execute = exec_service.execute
+    execute = cast(Callable[..., object], exec_service.execute)
     try:
         signature = inspect.signature(execute)
     except (TypeError, ValueError):
-        return await execute(exec_request, signal=signal, on_update=on_update)
-
-    accepts_var_kwargs = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in signature.parameters.values()
-    )
-    kwargs: dict[str, object | None] = {}
-    if accepts_var_kwargs or "signal" in signature.parameters:
-        kwargs["signal"] = signal
-    if accepts_var_kwargs or "on_update" in signature.parameters:
-        kwargs["on_update"] = on_update
-    return await execute(exec_request, **kwargs)
+        result = execute(exec_request, signal=signal, on_update=on_update)
+    else:
+        accepts_var_kwargs = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        accepts_signal = accepts_var_kwargs or "signal" in signature.parameters
+        accepts_update = accepts_var_kwargs or "on_update" in signature.parameters
+        if accepts_signal and accepts_update:
+            result = execute(exec_request, signal=signal, on_update=on_update)
+        elif accepts_signal:
+            result = execute(exec_request, signal=signal)
+        elif accepts_update:
+            result = execute(exec_request, on_update=on_update)
+        else:
+            result = execute(exec_request)
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, ExecResult):
+        raise TypeError("exec service must return ExecResult")
+    return result
 
 
 async def _execute_bash_operations(
@@ -628,24 +656,37 @@ async def _execute_bash_operations(
     exec_request: ExecRequest,
     *,
     signal: object | None,
-    on_update: object | None,
+    on_update: ExecUpdateCallback | None,
 ) -> ExecResult:
     execute = operations.execute
     try:
         signature = inspect.signature(execute)
     except (TypeError, ValueError):
-        return await execute(exec_request, signal=signal, on_update=on_update)
+        fallback_result = execute(
+            exec_request,
+            signal=signal,
+            on_update=on_update,
+        )
+        if inspect.isawaitable(fallback_result):
+            fallback_result = await fallback_result
+        if not isinstance(fallback_result, ExecResult):
+            raise TypeError("bash operations must return ExecResult")
+        return fallback_result
 
     accepts_var_kwargs = any(
         parameter.kind is inspect.Parameter.VAR_KEYWORD
         for parameter in signature.parameters.values()
     )
-    kwargs: dict[str, object | None] = {}
-    if accepts_var_kwargs or "signal" in signature.parameters:
-        kwargs["signal"] = signal
-    if accepts_var_kwargs or "on_update" in signature.parameters:
-        kwargs["on_update"] = on_update
-    result = execute(exec_request, **kwargs)
+    accepts_signal = accepts_var_kwargs or "signal" in signature.parameters
+    accepts_update = accepts_var_kwargs or "on_update" in signature.parameters
+    if accepts_signal and accepts_update:
+        result = execute(exec_request, signal=signal, on_update=on_update)
+    elif accepts_signal:
+        result = execute(exec_request, signal=signal)
+    elif accepts_update:
+        result = execute(exec_request, on_update=on_update)
+    else:
+        result = execute(exec_request)
     if inspect.isawaitable(result):
         result = await result
     if not isinstance(result, ExecResult):
@@ -680,7 +721,21 @@ def _exec_result_to_tool_result(result: ExecResult) -> AgentToolResult[dict[str,
         if result.stdout
         else stderr_preview
     )
-    full_output_path = result.stdout_artifact_path or result.stderr_artifact_path
+    stdout_blob = (
+        result.stdout_artifact_ref
+        if isinstance(result.stdout_artifact_ref, SessionBlobRef)
+        else None
+    )
+    stderr_blob = (
+        result.stderr_artifact_ref
+        if isinstance(result.stderr_artifact_ref, SessionBlobRef)
+        else None
+    )
+    full_output_path = (
+        None
+        if stdout_blob is not None or stderr_blob is not None
+        else result.stdout_artifact_path or result.stderr_artifact_path
+    )
     content = output_preview.content or "(no output)"
     truncated = (
         output_preview.truncated or stdout_preview.truncated or stderr_preview.truncated
@@ -700,8 +755,30 @@ def _exec_result_to_tool_result(result: ExecResult) -> AgentToolResult[dict[str,
             **_prefixed_truncation_details("stdout", stdout_preview),
             **_prefixed_truncation_details("stderr", stderr_preview),
             "stderr_artifact_path": result.stderr_artifact_path,
+            **(
+                {"stdout_blob": stdout_blob.manifest_entry()}
+                if stdout_blob is not None
+                else {}
+            ),
+            **(
+                {"stderr_blob": stderr_blob.manifest_entry()}
+                if stderr_blob is not None
+                else {}
+            ),
+            **(
+                {"artifact_retention_error": result.artifact_retention_error}
+                if result.artifact_retention_error is not None
+                else {}
+            ),
+            **(
+                {"artifact_cleanup_error": result.artifact_cleanup_error}
+                if result.artifact_cleanup_error is not None
+                else {}
+            ),
             "timed_out": result.timed_out,
             "cancelled": result.cancelled,
+            "stdio_complete": result.stdio_complete,
+            "stdio_drain_reason": result.stdio_drain_reason,
             "truncated": truncated,
             "truncated_by": truncation_preview.truncated_by
             if truncated
@@ -740,6 +817,21 @@ def _exec_result_error_message(result: ExecResult, message: str) -> str:
         parts.append(output_preview.content.rstrip("\n"))
     parts.append(message)
     return "\n\n".join(parts)
+
+
+def _exec_result_exception(
+    error: RuntimeError | TimeoutError,
+    tool_result: AgentToolResult[dict[str, Any]],
+) -> RuntimeError | TimeoutError:
+    """Attach the same pathless details used by successful tool results."""
+
+    details = tool_result.details
+    setattr(
+        error,
+        "tool_result_details",
+        dict(details) if isinstance(details, Mapping) else {},
+    )
+    return error
 
 
 def _timeout_error_message(timeout_seconds: float | int | None) -> str:
@@ -786,7 +878,7 @@ def _resolve_preview(
     raw: str,
     preview: str,
     truncated: bool,
-    truncated_by: str | None,
+    truncated_by: TruncationKind | None,
     total_lines: int | None = None,
     total_bytes: int | None = None,
 ) -> TruncationResult:

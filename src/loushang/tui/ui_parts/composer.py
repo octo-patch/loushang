@@ -95,6 +95,7 @@ class _CompletionRefreshRequest:
 
 @dataclass(slots=True)
 class Composer:
+    max_undo_depth: int | None = field(default=None, kw_only=True)
     prompt: str = "> "
     continuation_prompt: str = "  "
     large_paste_line_threshold: int = 8
@@ -126,6 +127,8 @@ class Composer:
     _completion_last_started_at: float | None = None
 
     def __post_init__(self) -> None:
+        if self.max_undo_depth is not None:
+            self._buffer = ComposerEditBuffer(max_undo_depth=self.max_undo_depth)
         self._selection_controller = SelectionController(
             length=lambda: len(self._buffer),
             cursor=lambda: self._buffer.cursor,
@@ -940,24 +943,12 @@ class BottomFrame:
     working_line: WorkingLine | None = None
     pending_queue: PendingQueueView | None = None
     surface: Any | None = None
-    _completion_height_floor: int = field(default=0, init=False, repr=False)
 
     def render(self, constraints: RenderConstraints) -> RenderResult:
         if constraints.max_height == 1:
             composer_result = self.composer.render(RenderConstraints(width=constraints.width, max_height=1))
             return _frame_result([line.text for line in composer_result.lines][-1:], constraints, composer_result.cursor, cursor_offset=0)
-        result = ScreenRegionStack(self.regions()).render(constraints)
-        if self.composer.has_completions:
-            self._completion_height_floor = max(self._completion_height_floor, len(result.lines))
-            return result
-        return self._pad_to_completion_height_floor(result, constraints)
-
-    def _pad_to_completion_height_floor(self, result: RenderResult, constraints: RenderConstraints) -> RenderResult:
-        if self._completion_height_floor <= len(result.lines) or len(result.lines) >= constraints.max_height:
-            return result
-        target_height = min(self._completion_height_floor, constraints.max_height)
-        padded_lines = [*result.lines, *(RenderLine("") for _ in range(target_height - len(result.lines)))]
-        return RenderResult.from_lines(padded_lines, constraints=constraints, cursor=result.cursor)
+        return ScreenRegionStack(self.regions()).render(constraints)
 
     def regions(self) -> tuple[ScreenRegion, ...]:
         regions: list[ScreenRegion] = []

@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Protocol
 
 from loushang.harness.cli.agent_args import AgentCliArgs
+from loushang.harness.runtime import SessionOperationResult
 from loushang.harness.session import require_session_operation_session
+from loushang.harness.transcript import SessionQuery
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +19,29 @@ class SessionResolutionRequest:
     resume: bool | str = False
     fork: str | None = None
     cwd: str | Path = "."
+    all_sessions: bool = False
+
+
+class SessionResolutionRuntime(Protocol):
+    async def restore_session_operation(
+        self,
+        session: str,
+    ) -> SessionOperationResult[Any, Any]: ...
+
+    async def new_session_operation(
+        self,
+        *,
+        cwd: str,
+    ) -> SessionOperationResult[Any, Any]: ...
+
+    async def fork_session_operation(
+        self,
+        entry_id: str,
+        *,
+        position: str,
+    ) -> SessionOperationResult[Any, Any]: ...
+
+    def list_sessions(self) -> list[object]: ...
 
 
 def agent_session_resolution_request(
@@ -29,10 +55,14 @@ def agent_session_resolution_request(
         resume=args.resume,
         fork=args.fork,
         cwd=cwd,
+        all_sessions=bool(getattr(args, "all_sessions", False)),
     )
 
 
-async def resolve_session(runtime: object, request: SessionResolutionRequest) -> object:
+async def resolve_session(
+    runtime: SessionResolutionRuntime,
+    request: SessionResolutionRequest,
+) -> object:
     """Resolve a new, resumed, continued, or forked session."""
 
     if isinstance(request.resume, str):
@@ -40,7 +70,11 @@ async def resolve_session(runtime: object, request: SessionResolutionRequest) ->
             await runtime.restore_session_operation(request.resume)
         )
     elif request.continue_ or request.resume:
-        latest_session_file = resolve_latest_session_file(runtime)
+        latest_session_file = resolve_latest_session_file(
+            runtime,
+            cwd=None if request.all_sessions else request.cwd,
+            discovered=request.all_sessions,
+        )
         if latest_session_file is None:
             raise RuntimeError(
                 "No existing session found. Use --session or --resume <session> "
@@ -70,7 +104,7 @@ async def resolve_session(runtime: object, request: SessionResolutionRequest) ->
 
 async def resolve_agent_cli_session(
     args: AgentCliArgs,
-    runtime: object,
+    runtime: SessionResolutionRuntime,
     project_root: str | Path,
 ) -> object:
     """Resolve one standard Agent CLI session request."""
@@ -81,9 +115,30 @@ async def resolve_agent_cli_session(
     )
 
 
-def resolve_latest_session_file(runtime: object) -> str | None:
+def resolve_latest_session_file(
+    runtime: SessionResolutionRuntime,
+    *,
+    cwd: str | Path | None = None,
+    discovered: bool = False,
+) -> str | None:
+    """Return the newest resumable transcript, scoped to ``cwd`` when possible."""
+
     try:
-        sessions = runtime.list_sessions()
+        finder = getattr(runtime, "find_discovered_session_summaries", None)
+        if not callable(finder):
+            finder = getattr(runtime, "find_session_summaries", None)
+        sessions = (
+            finder(
+                SessionQuery(
+                    cwd=str(Path(cwd).expanduser().resolve(strict=False)),
+                    sort_by="recent",
+                )
+            )
+            if cwd is not None and callable(finder)
+            else finder(SessionQuery(sort_by="recent"))
+            if discovered and callable(finder)
+            else runtime.list_sessions()
+        )
     except Exception as error:
         raise RuntimeError(f"Failed to list sessions: {error}") from error
     if not isinstance(sessions, list):
@@ -99,6 +154,7 @@ def resolve_latest_session_file(runtime: object) -> str | None:
 
 __all__ = [
     "SessionResolutionRequest",
+    "SessionResolutionRuntime",
     "agent_session_resolution_request",
     "resolve_agent_cli_session",
     "resolve_latest_session_file",
