@@ -87,10 +87,26 @@ def test_curated_catalog_tracks_current_primary_model_roster() -> None:
             "deepseek-v4-flash",
             "deepseek-v4-pro",
         },
-        ("minimax", "anthropic-messages"): {"MiniMax-M3", "MiniMax-M2.7"},
-        ("minimax", "openai-completions"): {"MiniMax-M3", "MiniMax-M2.7"},
-        ("minimax", "anthropic-messages-cn"): {"MiniMax-M3", "MiniMax-M2.7"},
-        ("minimax", "openai-completions-cn"): {"MiniMax-M3", "MiniMax-M2.7"},
+        ("minimax", "anthropic-messages"): {
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+        },
+        ("minimax", "openai-completions"): {
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+        },
+        ("minimax", "anthropic-messages-cn"): {
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+        },
+        ("minimax", "openai-completions-cn"): {
+            "MiniMax-M3.1-Flash",
+            "MiniMax-M3",
+            "MiniMax-M2.7",
+        },
         ("moonshot", "openai-completions"): {
             "kimi-k2.6",
             "kimi-k2.7-code",
@@ -181,13 +197,18 @@ def test_minimax_catalog_exposes_global_and_cn_routes_with_pricing() -> None:
     openai_global = registry.get_endpoint("minimax", "openai-completions")
     assert isinstance(openai_global.adapter, OpenAICompletionsConfig)
 
-    m3 = registry.get_model("minimax", "anthropic-messages", "MiniMax-M3")
-    assert m3.pricing is not None
-    assert m3.pricing.currency == "USD"
-    assert m3.pricing.input == 0.6
-    assert m3.pricing.output == 2.4
-    assert m3.pricing.cache_read == 0.12
-    assert m3.pricing.cache_write is None
+    flash = registry.get_model("minimax", "anthropic-messages", "MiniMax-M3.1-Flash")
+    assert flash.pricing is not None
+    assert flash.pricing.currency == "USD"
+    assert flash.pricing.input == 0.15
+    assert flash.pricing.output == 0.6
+    assert flash.pricing.cache_read == 0.015
+    assert flash.pricing.cache_write is None
+    # M3 has tiered pricing, which the flat Pricing contract cannot represent.
+    assert (
+        registry.get_model("minimax", "anthropic-messages", "MiniMax-M3").pricing
+        is None
+    )
 
     m27 = registry.get_model("minimax", "openai-completions-cn", "MiniMax-M2.7")
     assert m27.pricing is not None
@@ -257,10 +278,7 @@ def test_curated_catalog_keeps_key_model_defaults() -> None:
     assert kimi.supports_temperature is False
     assert kimi_code.defaults["maxOutputTokens"] == 32000
     assert kimi_code.defaults["reasoningEffort"] == "medium"
-    assert minimax.pricing is not None
-    assert minimax.pricing.input == 0.6
-    assert minimax.pricing.output == 2.4
-    assert minimax.pricing.cache_read == 0.12
+    assert minimax.pricing is None
     assert gpt.capabilities.context_window == 1050000
     assert sol.capabilities.context_window == 1050000
     assert coding.capabilities.context_window == 400000

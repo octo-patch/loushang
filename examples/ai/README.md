@@ -43,6 +43,31 @@ OpenAI 的 `openai-responses` 与 `coding-responses` catalog 路由均列出
 `get_model("openai", "openai-responses", "gpt-6.1-sol")` 获取标准 API 模型。
 `coding-responses` 使用 ChatGPT OAuth，实际可用模型仍由账号权限决定。
 
+MiniMax 的普通模型列表在每个 endpoint 内按 `MiniMax-M3.1-Flash`、`MiniMax-M3`
+排序，Flash 的 catalog alias 为 `default-chat`。例如：
+
+```python
+model = get_model("minimax", "anthropic-messages", "MiniMax-M3.1-Flash")
+```
+
+Flash 强制开启 thinking，默认 effort 为 `max`；可通过 `ReasoningOptions(effort=...)`
+选择 `low`、`medium`、`high`、`xhigh` 或 `max`（通用 `minimal` 映射到 `low`）。
+`enabled=False` 会在发送请求前报错。Anthropic 使用 `output_config.effort`，
+OpenAI Chat Completions 使用 `reasoning_effort`。M3 保持可选 thinking，不发送深度档位。
+
+Catalog 的可选字段 `listed: false` 只隐藏普通列表项；显式 `get_model`、完整
+`ModelSelection` 和 `list_models(model_id=...)` 仍能读取旧模型。`listOrder` 只控制
+endpoint 内排序，默认值为 0；自定义文件可以显式覆盖整个模型定义。
+因此旧 MiniMax-M2.7 配置保持原 ID，不会被静默迁移。
+
+Flash 的 1M context / 524288 output 上限用于文本与 SDK 已支持的图片输入；此 SDK
+没有 video 消息类型，因此不声明视频能力。全球路由记录 Flash 的 USD 单价；未推断
+国内路由价格。M3 分档价格无法由当前 flat `Pricing` 表达，因此保持未知，避免误算。
+来源：[模型说明](https://platform.minimax.io/docs/guides/models-intro.md)、
+[价格](https://platform.minimax.io/docs/pricing/overview)、
+[OpenAI 兼容接口](https://platform.minimax.io/docs/api-reference/text-openai-api.md)、
+[Anthropic 兼容接口](https://platform.minimaxi.com/docs/api-reference/text-anthropic-api.md)。
+
 运行全部离线示例：
 
 ```bash

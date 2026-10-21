@@ -101,7 +101,9 @@ def _build_anthropic_message_payloads(
                             )
                         continue
                     payload = (
-                        AnthropicMessagesProtocol.assistant_block_to_anthropic_payload(p)
+                        AnthropicMessagesProtocol.assistant_block_to_anthropic_payload(
+                            p
+                        )
                     )
                     if payload is not None:
                         assistant_blocks.append(payload)
@@ -318,6 +320,10 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
                     if isinstance(thinking_budget_tokens, int)
                     else 1024,
                 }
+        elif resolved.reasoning_enabled is False and self.supports_adaptive_thinking(
+            adapter_config
+        ):
+            thinking_cfg = {"type": "disabled"}
 
         params: dict[str, Any] = {
             "model": upstream_model_id,

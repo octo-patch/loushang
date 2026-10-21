@@ -623,9 +623,10 @@ def _apply_reasoning_params(
             "type": "enabled" if reasoning_enabled else "disabled"
         }
         return
-    if thinking_format == "deepseek":
+    if thinking_format in {"deepseek", "adaptive"}:
+        enabled_type = "adaptive" if thinking_format == "adaptive" else "enabled"
         extra_body["thinking"] = {
-            "type": "enabled" if reasoning_enabled else "disabled"
+            "type": enabled_type if reasoning_enabled else "disabled"
         }
         _apply_reasoning_effort_if_supported(
             params,

@@ -261,10 +261,49 @@
             "longCacheRetention": false
           },
           "models": {
+            "MiniMax-M3.1-Flash": {
+              "displayName": "MiniMax-M3.1-Flash",
+              "pricing": {
+                "currency": "USD",
+                "input": 0.15,
+                "output": 0.6,
+                "cacheRead": 0.015
+              },
+              "adapter": {
+                "thinkingMode": "adaptive",
+                "interleavedThinking": false,
+                "reasoningEffortMap": {
+                  "minimal": "low",
+                  "low": "low",
+                  "medium": "medium",
+                  "high": "high",
+                  "xhigh": "xhigh",
+                  "max": "max"
+                }
+              },
+              "family": "MiniMax-M3.1",
+              "alias": "default-chat",
+              "listOrder": -1,
+              "reasoningRequired": true,
+              "defaults": {"reasoningEffort": "max"},
+              "capabilities": {
+                "contextWindow": 1000000,
+                "maxTokens": 524288,
+                "input": ["text", "image"],
+                "output": ["text"],
+                "reasoning": true,
+                "stream": true,
+                "toolUse": true,
+                "structuredOutput": false,
+                "attachment": false,
+                "temperature": false
+              }
+            },
             "MiniMax-M3": {
               "displayName": "MiniMax-M3",
+              "adapter": {"thinkingMode": "adaptive"},
               "family": "MiniMax-M3",
-              "alias": "default-chat",
+              "alias": "balanced-chat",
               "capabilities": {
                 "contextWindow": 1000000,
                 "input": [
@@ -279,19 +318,13 @@
                 "toolUse": true,
                 "structuredOutput": false,
                 "attachment": false,
-                "temperature": true
-              },
-              "pricing": {
-                "currency": "USD",
-                "input": 0.6,
-                "output": 2.4,
-                "cacheRead": 0.12
+                "temperature": false
               }
             },
             "MiniMax-M2.7": {
               "displayName": "MiniMax-M2.7",
               "family": "MiniMax-M2.7",
-              "alias": "balanced-chat",
+              "listed": false,
               "capabilities": {
                 "contextWindow": 204800,
                 "maxTokens": 131072,
@@ -337,10 +370,45 @@
             "strictSchema": false
           },
           "models": {
+            "MiniMax-M3.1-Flash": {
+              "displayName": "MiniMax-M3.1-Flash",
+              "pricing": {
+                "currency": "USD",
+                "input": 0.15,
+                "output": 0.6,
+                "cacheRead": 0.015
+              },
+              "adapter": {
+                "assistantReasoningContent": true,
+                "reasoningFormat": "adaptive",
+                "reasoningEffortMap": {"minimal": "low"}
+              },
+              "family": "MiniMax-M3.1",
+              "alias": "default-chat",
+              "listOrder": -1,
+              "reasoningRequired": true,
+              "defaults": {"reasoningEffort": "max"},
+              "capabilities": {
+                "contextWindow": 1000000,
+                "maxTokens": 524288,
+                "input": ["text", "image"],
+                "output": ["text"],
+                "reasoning": true,
+                "stream": true,
+                "toolUse": true,
+                "structuredOutput": false,
+                "attachment": false,
+                "temperature": false
+              }
+            },
             "MiniMax-M3": {
               "displayName": "MiniMax-M3",
+              "adapter": {
+                "reasoningFormat": "adaptive",
+                "reasoningEffort": false
+              },
               "family": "MiniMax-M3",
-              "alias": "default-chat",
+              "alias": "balanced-chat",
               "capabilities": {
                 "contextWindow": 1000000,
                 "input": [
@@ -355,19 +423,13 @@
                 "toolUse": true,
                 "structuredOutput": false,
                 "attachment": false,
-                "temperature": true
-              },
-              "pricing": {
-                "currency": "USD",
-                "input": 0.6,
-                "output": 2.4,
-                "cacheRead": 0.12
+                "temperature": false
               }
             },
             "MiniMax-M2.7": {
               "displayName": "MiniMax-M2.7",
               "family": "MiniMax-M2.7",
-              "alias": "balanced-chat",
+              "listed": false,
               "capabilities": {
                 "contextWindow": 204800,
                 "maxTokens": 131072,
@@ -404,10 +466,43 @@
             "longCacheRetention": false
           },
           "models": {
+            "MiniMax-M3.1-Flash": {
+              "displayName": "MiniMax-M3.1-Flash",
+              "adapter": {
+                "thinkingMode": "adaptive",
+                "interleavedThinking": false,
+                "reasoningEffortMap": {
+                  "minimal": "low",
+                  "low": "low",
+                  "medium": "medium",
+                  "high": "high",
+                  "xhigh": "xhigh",
+                  "max": "max"
+                }
+              },
+              "family": "MiniMax-M3.1",
+              "alias": "default-chat",
+              "listOrder": -1,
+              "reasoningRequired": true,
+              "defaults": {"reasoningEffort": "max"},
+              "capabilities": {
+                "contextWindow": 1000000,
+                "maxTokens": 524288,
+                "input": ["text", "image"],
+                "output": ["text"],
+                "reasoning": true,
+                "stream": true,
+                "toolUse": true,
+                "structuredOutput": false,
+                "attachment": false,
+                "temperature": false
+              }
+            },
             "MiniMax-M3": {
               "displayName": "MiniMax-M3",
+              "adapter": {"thinkingMode": "adaptive"},
               "family": "MiniMax-M3",
-              "alias": "default-chat",
+              "alias": "balanced-chat",
               "capabilities": {
                 "contextWindow": 1000000,
                 "input": [
@@ -422,19 +517,13 @@
                 "toolUse": true,
                 "structuredOutput": false,
                 "attachment": false,
-                "temperature": true
-              },
-              "pricing": {
-                "currency": "USD",
-                "input": 0.6,
-                "output": 2.4,
-                "cacheRead": 0.12
+                "temperature": false
               }
             },
             "MiniMax-M2.7": {
               "displayName": "MiniMax-M2.7",
               "family": "MiniMax-M2.7",
-              "alias": "balanced-chat",
+              "listed": false,
               "capabilities": {
                 "contextWindow": 204800,
                 "maxTokens": 131072,
@@ -480,10 +569,39 @@
             "strictSchema": false
           },
           "models": {
+            "MiniMax-M3.1-Flash": {
+              "displayName": "MiniMax-M3.1-Flash",
+              "adapter": {
+                "assistantReasoningContent": true,
+                "reasoningFormat": "adaptive",
+                "reasoningEffortMap": {"minimal": "low"}
+              },
+              "family": "MiniMax-M3.1",
+              "alias": "default-chat",
+              "listOrder": -1,
+              "reasoningRequired": true,
+              "defaults": {"reasoningEffort": "max"},
+              "capabilities": {
+                "contextWindow": 1000000,
+                "maxTokens": 524288,
+                "input": ["text", "image"],
+                "output": ["text"],
+                "reasoning": true,
+                "stream": true,
+                "toolUse": true,
+                "structuredOutput": false,
+                "attachment": false,
+                "temperature": false
+              }
+            },
             "MiniMax-M3": {
               "displayName": "MiniMax-M3",
+              "adapter": {
+                "reasoningFormat": "adaptive",
+                "reasoningEffort": false
+              },
               "family": "MiniMax-M3",
-              "alias": "default-chat",
+              "alias": "balanced-chat",
               "capabilities": {
                 "contextWindow": 1000000,
                 "input": [
@@ -498,19 +616,13 @@
                 "toolUse": true,
                 "structuredOutput": false,
                 "attachment": false,
-                "temperature": true
-              },
-              "pricing": {
-                "currency": "USD",
-                "input": 0.6,
-                "output": 2.4,
-                "cacheRead": 0.12
+                "temperature": false
               }
             },
             "MiniMax-M2.7": {
               "displayName": "MiniMax-M2.7",
               "family": "MiniMax-M2.7",
-              "alias": "balanced-chat",
+              "listed": false,
               "capabilities": {
                 "contextWindow": 204800,
                 "maxTokens": 131072,
