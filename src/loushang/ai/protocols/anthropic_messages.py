@@ -379,7 +379,7 @@ class AnthropicMessagesAdapter(AnthropicMessagesProtocol):
                             lb.setdefault("cache_control", cache_control)
                     break
         # temperature：仅在未启用思考时设置
-        if not thinking_cfg and resolved.temperature is not None:
+        if not want_thinking and resolved.temperature is not None:
             params["temperature"] = resolved.temperature
         # Clamp max_tokens by remaining context if capability provides window
         remaining = compute_remaining_context(

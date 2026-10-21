@@ -55,6 +55,12 @@ Flash 强制开启 thinking，默认 effort 为 `max`；可通过 `ReasoningOpti
 `enabled=False` 会在发送请求前报错。Anthropic 使用 `output_config.effort`，
 OpenAI Chat Completions 使用 `reasoning_effort`。M3 保持可选 thinking，不发送深度档位。
 
+两个 Anthropic Flash 路由默认请求预算为 8192 tokens，与模型的 524288 输出能力上限
+分开记录，以兼容 Anthropic SDK 的非流式超时检查。显式 `max_output_tokens` 和自定义
+模型默认值仍优先使用，不会被静默截断。较大预算（例如 32000）请使用 `stream()`；
+Anthropic 0.89.0 的默认客户端会在发送 HTTP 前拒绝这样的非流式请求。自定义 adaptive
+模型在关闭 thinking 时保留显式 temperature，开启 thinking 时仍省略 temperature。
+
 Catalog 的可选字段 `listed: false` 只隐藏普通列表项；显式 `get_model`、完整
 `ModelSelection` 和 `list_models(model_id=...)` 仍能读取旧模型。`listOrder` 只控制
 endpoint 内排序，默认值为 0；自定义文件可以显式覆盖整个模型定义。

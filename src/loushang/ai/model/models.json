@@ -285,7 +285,7 @@
               "alias": "default-chat",
               "listOrder": -1,
               "reasoningRequired": true,
-              "defaults": {"reasoningEffort": "max"},
+              "defaults": {"reasoningEffort": "max", "maxTokens": 8192},
               "capabilities": {
                 "contextWindow": 1000000,
                 "maxTokens": 524288,
@@ -484,7 +484,7 @@
               "alias": "default-chat",
               "listOrder": -1,
               "reasoningRequired": true,
-              "defaults": {"reasoningEffort": "max"},
+              "defaults": {"reasoningEffort": "max", "maxTokens": 8192},
               "capabilities": {
                 "contextWindow": 1000000,
                 "maxTokens": 524288,
