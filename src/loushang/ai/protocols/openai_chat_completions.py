@@ -186,6 +186,7 @@ class OpenAIChatCompletionsAdapter:
             active_tool_call_indexes: dict[str, int] = {}
             tool_call_ids_by_index: dict[int, str] = {}
             received_finish_reason = False
+            reasoning_field: str | None = None
             while True:
                 try:
                     chunk = await stream_ctx.__anext__()  # type: ignore[attr-defined]
@@ -246,6 +247,14 @@ class OpenAIChatCompletionsAdapter:
                                     "len": len(reasoning_value),
                                 },
                             )
+                            if reasoning_field is None:
+                                # Emit the replay-field marker once per block,
+                                # not once per SDK chunk (signatures concatenate).
+                                yield {
+                                    "type": "thinking_signature_delta",
+                                    "signature": candidate,
+                                }
+                                reasoning_field = candidate
                             yield {"type": "thinking_delta", "text": reasoning_value}
                             break
                     reasoning_details = getattr(delta, "reasoning_details", None)
@@ -286,6 +295,7 @@ class OpenAIChatCompletionsAdapter:
                                 }
                     text = getattr(delta, "content", None)
                     if isinstance(text, str) and text:
+                        reasoning_field = None
                         emitted_any_text = True
                         _debug(
                             "event",
@@ -344,6 +354,7 @@ class OpenAIChatCompletionsAdapter:
                                 }
                                 if tool_call_index is not None:
                                     start_part["index"] = tool_call_index
+                                reasoning_field = None
                                 yield _raw_part(start_part)
                             elif (
                                 isinstance(tool_call_id, str)
@@ -489,6 +500,7 @@ def _iter_complete_message_parts(message: object) -> Iterator[RawPart]:
     ):
         reasoning_value = getattr(message, candidate, None)
         if isinstance(reasoning_value, str) and reasoning_value:
+            yield {"type": "thinking_signature_delta", "signature": candidate}
             yield {"type": "thinking_delta", "text": reasoning_value}
             break
     reasoning_details = getattr(message, "reasoning_details", None)

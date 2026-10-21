@@ -61,6 +61,11 @@ OpenAI Chat Completions 使用 `reasoning_effort`。M3 保持可选 thinking，�
 Anthropic 0.89.0 的默认客户端会在发送 HTTP 前拒绝这样的非流式请求。自定义 adaptive
 模型在关闭 thinking 时保留显式 temperature，开启 thinking 时仍省略 temperature。
 
+OpenAI Chat Completions 的 JSON 和 SSE 响应保留 reasoning 文本及来源字段名。
+将返回的 `AssistantMessage` 连同 `ToolResultMessage` 传入下一次调用时，MiniMax 的
+`reasoning_content` 按原值回传；其他兼容服务的 `reasoning` / `reasoning_text` 也保留
+各自字段语义，不需要手动重建 thinking 内容。
+
 Catalog 的可选字段 `listed: false` 只隐藏普通列表项；显式 `get_model`、完整
 `ModelSelection` 和 `list_models(model_id=...)` 仍能读取旧模型。`listOrder` 只控制
 endpoint 内排序，默认值为 0；自定义文件可以显式覆盖整个模型定义。
